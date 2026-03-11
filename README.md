@@ -198,11 +198,8 @@ device.firewire_guid    # GUID for hash computation
 Fine-grained control over binary output format.
 
 ```python
-# Default config - matches pygpod's own output
+# Default config - libgpod-compatible with auto date_added
 config = pygpod.DatabaseConfig()
-
-# libgpod-compatible config - binary-identical to libgpod output
-config = pygpod.DatabaseConfig.libgpod_compat()
 
 # Custom config
 config = pygpod.DatabaseConfig(random_seed=42, track_id_start=1000)

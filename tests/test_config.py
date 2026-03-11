@@ -12,22 +12,12 @@ def test_default_config():
     assert cfg.generate_album_list is True
     assert cfg.generate_artist_list is True
     assert cfg.filename_prefix == "pygpod"
-    assert cfg.filename_rand_len == 8
-    assert cfg.filename_charset == "alnum"
-    assert cfg.random_seed is None
-
-
-def test_libgpod_compat():
-    cfg = DatabaseConfig.libgpod_compat()
-    assert cfg.filename_prefix == "libgpod"
     assert cfg.filename_rand_len == 6
     assert cfg.filename_charset == "digits"
-    assert cfg.mhod_order is not None
-    assert len(cfg.mhod_order) == 6
-    # Order: title=1, artist=4, album=3, filetype=6, path=2, genre=5
-    assert cfg.mhod_order[0] == 1
-    assert cfg.mhod_order[1] == 4
-    assert cfg.mhod_order[2] == 3
+    assert cfg.random_seed is None
+    assert cfg.mhod_order == (1, 4, 3, 6, 2, 5)
+    assert cfg.set_time_fields_zero is False
+
 
 
 def test_deterministic_seed():

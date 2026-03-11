@@ -1142,6 +1142,7 @@ class Database:
             now = 0
         else:
             now = now_mac()
+
         put32lint(header, 0x20, now)  # time_modified
         put32lint(header, 0x24, file_size)
         put32lint(header, 0x28, tags.get("duration_ms", 0))
