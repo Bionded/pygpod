@@ -10,6 +10,7 @@ import os
 import pathlib
 import random
 import struct
+import tempfile
 from typing import Any, Dict, List, Optional
 
 from ..db.constants import (
@@ -344,18 +345,17 @@ class Database:
             if not art_data:
                 return
 
-            # Save artwork image to iPod_Control/Artwork/ for later processing
-            artwork_dir = os.path.join(self._mountpoint, "iPod_Control", "Artwork")
-            os.makedirs(artwork_dir, exist_ok=True)
-
+            # Save artwork image to system temp dir for later processing
             # Determine image format from magic bytes
             ext = ".jpg"
             if art_data[:8] == b"\x89PNG\r\n\x1a\n":
                 ext = ".png"
 
-            img_path = os.path.join(artwork_dir, f"_art_{dbid}{ext}")
-            with open(img_path, "wb") as f:
-                f.write(art_data)
+            fd, img_path = tempfile.mkstemp(suffix=ext, prefix=f"_art_{dbid}_")
+            try:
+                os.write(fd, art_data)
+            finally:
+                os.close(fd)
 
             if not hasattr(self, "_pending_artwork"):
                 self._pending_artwork = []
