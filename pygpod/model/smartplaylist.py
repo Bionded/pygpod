@@ -563,23 +563,14 @@ SPL_RULE_SIZE = 136  # Each rule is 136 bytes
 def parse_spl_rules(data: bytes) -> Tuple[SPLMatch, List[SPLRule]]:
     """Parse SPL rules from MHOD type 51 raw body.
 
-    The format is big-endian:
-    - 4 bytes: magic "SLst"
-    - 4 bytes: unknown
-    - 4 bytes: number of rules
-    - 4 bytes: match operator (0=AND, 1=OR)
-    - For each rule (136 bytes):
-      - 4 bytes: field ID
-      - 4 bytes: action
-      - 4 bytes: padding
-      - 4 bytes: string length (bytes)
-      - 4 bytes: fromvalue (BE int)
-      - 4 bytes: fromdate (BE int)
-      - 8 bytes: padding
-      - 4 bytes: tovalue (BE int)
-      - 4 bytes: todate (BE int)
-      - 4 bytes: tounits
-      - string data (UTF-16BE) follows rules section
+    Matches libgpod format: variable-length rules, big-endian throughout.
+
+    Layout:
+    - 136 bytes: header (SLst magic + unk + numrules + match_op + 120 zeros)
+    - For each rule:
+      - 52 bytes: field(4) + action(4) + 44 zeros
+      - String rule: string_len(4) + utf16be string data
+      - Non-string rule: data_len(4=0x44) + 6x int64 values + 5x int32 unknowns
 
     Args:
         data: Raw bytes of the MHOD type 51 body.
@@ -599,32 +590,51 @@ def parse_spl_rules(data: bytes) -> Tuple[SPLMatch, List[SPLRule]]:
     match = SPLMatch(match_op) if match_op in (0, 1) else SPLMatch.AND
 
     rules = []
-    offset = 136  # Rules start after the 136-byte header block
-    string_offset = 136 + num_rules * 136
+    offset = 136  # Rules start after the 136-byte header
 
     for i in range(num_rules):
-        if offset + 136 > len(data):
+        if offset + 52 > len(data):
             break
 
         field = struct.unpack_from(">I", data, offset)[0]
         action = struct.unpack_from(">I", data, offset + 4)[0]
-        str_len = struct.unpack_from(">I", data, offset + 12)[0]
-        fromvalue = struct.unpack_from(">i", data, offset + 16)[0]
-        fromdate = struct.unpack_from(">i", data, offset + 20)[0]
-        fromunits = struct.unpack_from(">I", data, offset + 24)[0]
-        tovalue = struct.unpack_from(">i", data, offset + 36)[0]
-        todate = struct.unpack_from(">i", data, offset + 40)[0]
-        tounits = struct.unpack_from(">I", data, offset + 44)[0]
+        offset += 52  # field(4) + action(4) + 44 zeros
 
-        # Extract string if present
+        ft = get_field_type(field)
         string = ""
-        if str_len > 0 and string_offset + str_len <= len(data):
-            try:
-                string = data[string_offset : string_offset + str_len].decode("utf-16-be")
-            except (UnicodeDecodeError, ValueError):
-                logger.debug("Failed to decode SPL rule string at offset %d", string_offset, exc_info=True)
-                string = ""
-            string_offset += str_len
+        fromvalue = 0
+        tovalue = 0
+        fromdate = 0
+        todate = 0
+        fromunits = 0
+        tounits = 0
+
+        if ft == SPLFieldType.STRING:
+            if offset + 4 > len(data):
+                break
+            str_len = struct.unpack_from(">I", data, offset)[0]
+            offset += 4
+            if str_len > 0 and offset + str_len <= len(data):
+                try:
+                    string = data[offset : offset + str_len].decode("utf-16-be")
+                except (UnicodeDecodeError, ValueError):
+                    logger.debug(
+                        "Failed to decode SPL rule string at offset %d", offset, exc_info=True
+                    )
+                offset += str_len
+        else:
+            if offset + 4 > len(data):
+                break
+            data_len = struct.unpack_from(">I", data, offset)[0]
+            offset += 4
+            if offset + data_len <= len(data) and data_len >= 48:
+                fromvalue = struct.unpack_from(">q", data, offset)[0]
+                fromdate = struct.unpack_from(">q", data, offset + 8)[0]
+                fromunits = struct.unpack_from(">Q", data, offset + 16)[0]
+                tovalue = struct.unpack_from(">q", data, offset + 24)[0]
+                todate = struct.unpack_from(">q", data, offset + 32)[0]
+                tounits = struct.unpack_from(">Q", data, offset + 40)[0]
+            offset += data_len
 
         rule = SPLRule(
             field=field,
@@ -638,7 +648,6 @@ def parse_spl_rules(data: bytes) -> Tuple[SPLMatch, List[SPLRule]]:
             string=string,
         )
         rules.append(rule)
-        offset += 136
 
     return match, rules
 
@@ -646,65 +655,48 @@ def parse_spl_rules(data: bytes) -> Tuple[SPLMatch, List[SPLRule]]:
 def write_spl_rules(match: SPLMatch, rules: List[SPLRule], version: int = 1) -> bytes:
     """Write SPL rules to binary format for MHOD type 51.
 
+    Matches libgpod itdb_itunesdb.c format exactly. All values are big-endian.
+
     Args:
         match: Match operator (AND/OR).
         rules: List of rules.
-        version: SLst version (1=32-bit values/136-byte rules,
-                 2=padded 32-bit values/180-byte rules for libgpod compat).
+        version: Unused, kept for API compat.
 
     Returns:
         Raw bytes for MHOD type 51 body.
     """
-    # Header: magic + unk + version_or_numrules + match_operator
-    header = struct.pack(">4sIII", b"SLst", 0, len(rules), int(match))
-    header += b"\x00" * (136 - 16)  # Pad header to 136 bytes
+    data = bytearray()
 
-    # Rules section
-    rule_data = bytearray()
-    string_data = bytearray()
+    # SLst header: magic(4) + unk(4) + numrules(4) + match_op(4) + 120 zeros
+    data += struct.pack(">4sIII", b"SLst", 0, len(rules), int(match))
+    data += b"\x00" * 120  # 30 x 4-byte zeros
 
+    # Rules
     for rule in rules:
-        encoded_str = rule.string.encode("utf-16-be") if rule.string else b""
-        str_len = len(encoded_str)
+        ft = get_field_type(rule.field)
 
-        if version >= 2:
-            # v2 format: 180-byte rules with 56-byte prefix + 8-byte value slots
-            entry = bytearray(180)
-            # 56-byte prefix: unk markers + 48 bytes padding
-            struct.pack_into(">I", entry, 0, 4)  # prefix field marker
-            struct.pack_into(">I", entry, 4, 0x01000002)  # prefix action marker
-            # +0x08-0x37: zeros (already)
-            # Standard fields at +0x38
-            struct.pack_into(">I", entry, 0x38, rule.field)
-            struct.pack_into(">I", entry, 0x3C, rule.action)
-            # +0x40: padding, +0x44: string_length
-            struct.pack_into(">I", entry, 0x44, str_len)
-            # +0x48-0x6B: padding (zeros)
-            struct.pack_into(">I", entry, 0x6C, 0x44)  # unk marker
-            # Values in 8-byte slots (4 value + 4 pad)
-            struct.pack_into(">i", entry, 0x74, rule.fromvalue)
-            struct.pack_into(">i", entry, 0x7C, rule.fromdate)
-            struct.pack_into(">I", entry, 0x84, rule.fromunits)
-            struct.pack_into(">i", entry, 0x8C, rule.tovalue)
-            struct.pack_into(">i", entry, 0x94, rule.todate)
-            struct.pack_into(">I", entry, 0x9C, rule.tounits)
+        # Rule header: field(4) + action(4) + 44 zeros
+        data += struct.pack(">II", rule.field, rule.action)
+        data += b"\x00" * 44  # 11 x 4-byte zeros
+
+        if ft == SPLFieldType.STRING:
+            # String rule: string_len(4) + utf16be string data
+            encoded = rule.string.encode("utf-16-be") if rule.string else b""
+            data += struct.pack(">I", len(encoded))
+            data += encoded
         else:
-            # v1 format: 136-byte rules with 32-bit values
-            entry = bytearray()
-            entry += struct.pack(">II", rule.field, rule.action)
-            entry += b"\x00" * 4  # padding
-            entry += struct.pack(">I", str_len)
-            entry += struct.pack(">ii", rule.fromvalue, rule.fromdate)
-            entry += struct.pack(">I", rule.fromunits)
-            entry += b"\x00" * 8  # padding
-            entry += struct.pack(">ii", rule.tovalue, rule.todate)
-            entry += struct.pack(">I", rule.tounits)
-            entry += b"\x00" * (136 - len(entry))
+            # Non-string rule: data_len(4) + 6x uint64 values + 5x uint32 unknowns
+            # data_len is always 0x44 (68 bytes)
+            data += struct.pack(">I", 0x44)
+            data += struct.pack(">q", rule.fromvalue)   # fromvalue (int64)
+            data += struct.pack(">q", rule.fromdate)    # fromdate (int64)
+            data += struct.pack(">Q", rule.fromunits)   # fromunits (uint64)
+            data += struct.pack(">q", rule.tovalue)     # tovalue (int64)
+            data += struct.pack(">q", rule.todate)      # todate (int64)
+            data += struct.pack(">Q", rule.tounits)     # tounits (uint64)
+            data += b"\x00" * 20  # 5 x 4-byte unknown fields
 
-        rule_data.extend(entry)
-        string_data.extend(encoded_str)
-
-    return header + bytes(rule_data) + bytes(string_data)
+    return bytes(data)
 
 
 def parse_spl_prefs(data: bytes) -> SPLPrefs:
