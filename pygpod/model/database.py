@@ -324,7 +324,7 @@ class Database:
             self._auto_add_to_podcast_playlist(track, pl_name)
 
         # Add artwork if available
-        self._add_artwork_for_track(mhit, dbid, filepath)
+        self._add_artwork_for_track(mhit, dbid, filepath, tags.get("cover_art"))
 
         self._modified = True
         logger.info("Track added: %s", track)
@@ -344,18 +344,29 @@ class Database:
             self._artwork_manager.reset()
         return self._artwork_manager
 
-    def _add_artwork_for_track(self, mhit: Record, dbid: int, filepath: str) -> None:
+    def _add_artwork_for_track(
+        self, mhit: Record, dbid: int, filepath: str, cover_art: str = None
+    ) -> None:
         """Extract artwork from audio file and process immediately.
 
         Creates thumbnails and writes .ithmb data right away during track
         addition, so save() doesn't have to do all the heavy lifting.
         ArtworkDB is written once at save time.
+
+        Args:
+            mhit: The MHIT record for the track.
+            dbid: Database ID of the track.
+            filepath: Path to the audio file.
+            cover_art: Optional fallback image path if no embedded artwork.
         """
         if not self._mountpoint:
             return
 
         try:
             art_data = extract_artwork(filepath)
+            if not art_data and cover_art and os.path.isfile(cover_art):
+                with open(cover_art, "rb") as f:
+                    art_data = f.read()
             if not art_data:
                 return
 
@@ -472,22 +483,27 @@ class Database:
         self._modified = True
 
     def _auto_add_to_podcast_playlist(self, track: Track, playlist_name: str) -> None:
-        """Find or create a podcast playlist and add the track to it.
+        """Add a podcast track to the single "Podcasts" playlist.
+
+        iPod firmware expects exactly one playlist with podcastflag=1
+        containing all podcast tracks. The type 3 hierarchical grouping
+        is done by album name at save time.
 
         Args:
             track: The podcast track to add.
-            playlist_name: Playlist name (usually category or "Podcasts").
+            playlist_name: Ignored (kept for API compat). All podcasts go
+                into one "Podcasts" playlist.
         """
-        # Find existing podcast playlist with this name
+        # Find the existing podcast playlist (there should be at most one)
         pl = None
         for p in self._playlists:
-            if p.name == playlist_name and p.is_podcast:
+            if p.is_podcast:
                 pl = p
                 break
         # Create if not found
         if pl is None:
-            pl = self.create_playlist(playlist_name, podcast=True)
-            logger.info("Auto-created podcast playlist: %s", playlist_name)
+            pl = self.create_playlist("Podcasts", podcast=True)
+            logger.info("Auto-created Podcasts playlist")
         self.add_track_to_playlist(pl, track)
 
     def remove_track_from_playlist(self, playlist: Playlist, track: Track) -> None:
@@ -625,6 +641,114 @@ class Database:
                     mhlp.children.append(mirror)
                     logger.debug("Mirrored master playlist to MHSD type 3")
                 return
+
+    def _rebuild_type3_podcasts(self) -> None:
+        """Rebuild podcast playlists in MHSD type 3 with hierarchical grouping.
+
+        iPod firmware expects podcast playlists in type 3 to have a
+        two-level MHIP structure: group MHIPs (per album/show) containing
+        member MHIPs (per track). This matches libgpod's write_podcast_mhips().
+        """
+        if not self._root:
+            return
+
+        # Find type 3 MHLP
+        mhlp3 = None
+        for mhsd in self._root.children:
+            if mhsd.fields.get("mhsd_type") == 3 and mhsd.children:
+                mhlp3 = mhsd.children[0]
+                break
+        if mhlp3 is None:
+            return
+
+        # Find type 2 podcast playlists to get track lists
+        type2_podcasts = {}  # playlist_id -> mhyp record
+        for mhsd in self._root.children:
+            if mhsd.fields.get("mhsd_type") == 2 and mhsd.children:
+                for mhyp in mhsd.children[0].children:
+                    if (
+                        mhyp.magic == MHYP_MAGIC
+                        and mhyp.fields.get("podcast_flag") == 1
+                        and mhyp.fields.get("playlist_type") != 1
+                    ):
+                        type2_podcasts[mhyp.fields.get("playlist_id")] = mhyp
+
+        if not type2_podcasts:
+            return
+
+        # Track lookup for album names
+        mhlt = self._get_or_create_mhlt()
+        track_albums = {}  # track_id -> album name
+        for mhit in mhlt.children:
+            if mhit.magic == MHIT_MAGIC:
+                tid = mhit.fields.get("track_id", 0)
+                album = mhit.get_mhod(MHOD_ID_ALBUM) or ""
+                track_albums[tid] = album
+
+        # Counter for unique MHIP IDs
+        next_id = 1
+        for mhyp in mhlp3.children:
+            if mhyp.magic == MHYP_MAGIC:
+                for c in mhyp.children:
+                    if c.magic == MHIP_MAGIC:
+                        gid = c.fields.get("podcastgroupid", 0)
+                        if gid >= next_id:
+                            next_id = gid + 1
+
+        # Rebuild each podcast playlist in type 3
+        for pid, mhyp2 in type2_podcasts.items():
+            # Find matching type 3 MHYP
+            mhyp3 = None
+            for mhyp in mhlp3.children:
+                if (
+                    mhyp.magic == MHYP_MAGIC
+                    and mhyp.fields.get("playlist_id") == pid
+                ):
+                    mhyp3 = mhyp
+                    break
+            if mhyp3 is None:
+                continue
+
+            # Collect track IDs from type 2
+            track_ids = [
+                c.fields.get("track_id", 0)
+                for c in mhyp2.children
+                if c.magic == MHIP_MAGIC
+            ]
+            if not track_ids:
+                continue
+
+            # Group tracks by album
+            album_groups = {}  # album -> [track_id, ...]
+            for tid in track_ids:
+                album = track_albums.get(tid, "")
+                album_groups.setdefault(album, []).append(tid)
+
+            # Remove old MHIPs from type 3 MHYP
+            mhyp3.children = [
+                c for c in mhyp3.children if c.magic != MHIP_MAGIC
+            ]
+
+            # Create hierarchical MHIPs
+            for album_name, tids in sorted(album_groups.items()):
+                group_id = next_id
+                next_id += 1
+                group_mhip = self._create_podcast_group_mhip(group_id, album_name)
+                mhyp3.children.append(group_mhip)
+
+                for tid in tids:
+                    member_id = next_id
+                    next_id += 1
+                    member_mhip = self._create_podcast_member_mhip(
+                        member_id, tid, group_id
+                    )
+                    mhyp3.children.append(member_mhip)
+
+            logger.debug(
+                "Rebuilt type 3 podcast playlist %s with %d groups",
+                pid,
+                len(album_groups),
+            )
 
     # ---- Sort Index Generation ----
 
@@ -884,6 +1008,7 @@ class Database:
         self._upgrade_header_sizes()
         self._ensure_playlist_prefs()
         self._ensure_type3_mirror()
+        self._rebuild_type3_podcasts()
         self._rebuild_sort_indexes()
         if self._config.generate_album_list:
             self._rebuild_album_list()
@@ -1143,11 +1268,12 @@ class Database:
 
         # Podcast/audiobook flags
         is_podcast_or_audiobook = media_type & (MEDIATYPE_PODCAST | MEDIATYPE_AUDIOBOOK)
-        if header_len > 0xA7:
-            # skip_when_shuffling (0xA5), remember_position (0xA6)
+        if header_len > 0xA8:
+            # skip_when_shuffling (0xA5), remember_position (0xA6), flag4 (0xA7)
             if is_podcast_or_audiobook:
                 put8int(header, 0xA5, 1)  # skip when shuffling
                 put8int(header, 0xA6, 1)  # remember playback position
+                put8int(header, 0xA7, 1)  # flag4: podcast display format
 
         # mark_unplayed at offset 0xB2
         if header_len > 0xB2:
@@ -1374,6 +1500,65 @@ class Database:
         rec.fields["num_mhods"] = 1
         rec.children.append(order_mhod)
 
+        return rec
+
+    def _create_podcast_group_mhip(
+        self, group_id: int, group_name: str
+    ) -> Record:
+        """Create a podcast group MHIP (parent node for album/show grouping in type 3)."""
+        header_len = DEFAULT_MHIP_HEADER_LEN
+        header = bytearray(header_len)
+        header[0:4] = MHIP_MAGIC
+        put32lint(header, 4, header_len)
+        put32lint(header, 0x0C, 1)  # num_mhods = 1 (title child)
+        put32lint(header, 0x10, 256)  # podcastgroupflag = 256
+        put32lint(header, 0x14, group_id)  # podcastgroupid
+        # trackid = 0, timestamp = 0, podcastgroupref = 0
+
+        # Title MHOD child with group name
+        name_mhod = make_string_mhod(
+            MHOD_ID_TITLE, group_name, encoding=self._config.string_encoding
+        )
+        total_len = header_len + name_mhod.total_len
+        put32lint(header, 8, total_len)
+
+        rec = Record(MHIP_MAGIC, header_len, total_len)
+        rec.raw_header = bytes(header)
+        rec.fields["track_id"] = 0
+        rec.fields["num_mhods"] = 1
+        rec.fields["podcastgroupflag"] = 256
+        rec.fields["podcastgroupid"] = group_id
+        rec.children.append(name_mhod)
+        return rec
+
+    def _create_podcast_member_mhip(
+        self, member_id: int, track_id: int, group_ref: int
+    ) -> Record:
+        """Create a podcast member MHIP (child node referencing a track in type 3)."""
+        header_len = DEFAULT_MHIP_HEADER_LEN
+        header = bytearray(header_len)
+        header[0:4] = MHIP_MAGIC
+        put32lint(header, 4, header_len)
+        put32lint(header, 0x0C, 1)  # num_mhods = 1
+        put32lint(header, 0x10, 0)  # podcastgroupflag = 0
+        put32lint(header, 0x14, member_id)  # podcastgroupid (unique item id)
+        put32lint(header, 0x18, track_id)  # trackid
+        # timestamp = 0
+        put32lint(header, 0x20, group_ref)  # podcastgroupref -> parent group
+
+        # MHOD type 100 (playlist order) child
+        order_mhod = self._make_mhip_order_mhod(member_id)
+        total_len = header_len + order_mhod.total_len
+        put32lint(header, 8, total_len)
+
+        rec = Record(MHIP_MAGIC, header_len, total_len)
+        rec.raw_header = bytes(header)
+        rec.fields["track_id"] = track_id
+        rec.fields["num_mhods"] = 1
+        rec.fields["podcastgroupflag"] = 0
+        rec.fields["podcastgroupid"] = member_id
+        rec.fields["podcastgroupref"] = group_ref
+        rec.children.append(order_mhod)
         return rec
 
     def _add_to_master_playlists(self, track_id: int) -> None:
