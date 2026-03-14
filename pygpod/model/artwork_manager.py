@@ -164,8 +164,16 @@ class ArtworkManager:
             return None
         return self.add_artwork_data(dbid, art_data)
 
-    def add_artwork_data(self, dbid: int, art_data: bytes) -> Optional[int]:
+    def add_artwork_data(
+        self, dbid: int, art_data: bytes, save: bool = True
+    ) -> Optional[int]:
         """Add raw image data as artwork for a track.
+
+        Args:
+            dbid: Track database ID.
+            art_data: Raw image bytes (JPEG/PNG).
+            save: If True, write ArtworkDB to disk after adding. Set to False
+                  when batch-adding artwork and call save() manually at the end.
 
         Returns:
             image_id if successful, None on failure.
@@ -247,8 +255,9 @@ class ArtworkManager:
             # Update MHFD next_id
             self._update_mhfd_next_id()
 
-            # Save ArtworkDB
-            self._save()
+            # Save ArtworkDB (can be deferred for batch operations)
+            if save:
+                self._save()
 
             logger.info(
                 "Added artwork id=%d for dbid=%d (%d formats)",
@@ -261,13 +270,16 @@ class ArtworkManager:
         finally:
             os.unlink(tmp_path)
 
-    def _save(self) -> None:
+    def save(self) -> None:
         """Write ArtworkDB to disk."""
         if self._root is None:
             return
         data = write_artworkdb(self._root)
         with open(self._artworkdb_path, "wb") as f:
             f.write(data)
+
+    # Keep private alias for backwards compatibility within this class
+    _save = save
 
     # ========================================================================
     # MHFD (ArtworkDB root)

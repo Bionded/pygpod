@@ -330,12 +330,26 @@ class Database:
         logger.info("Track added: %s", track)
         return track
 
-    def _add_artwork_for_track(self, mhit: Record, dbid: int, filepath: str) -> None:
-        """Extract artwork from audio file and queue for later processing.
+    def _get_artwork_manager(self):
+        """Lazily create and return the ArtworkManager instance."""
+        if not hasattr(self, "_artwork_manager") or self._artwork_manager is None:
+            from .artwork_manager import ArtworkManager
+            from ..device.models import IpodGeneration
 
-        Artwork images are saved to temp files. The actual ArtworkDB and .ithmb
-        generation happens at the start of save() so MHIT artwork fields are
-        included in the written iTunesDB.
+            generation = self._device.generation if self._device else None
+            if generation is None:
+                generation = IpodGeneration.UNKNOWN
+
+            self._artwork_manager = ArtworkManager(self._mountpoint, generation=generation)
+            self._artwork_manager.reset()
+        return self._artwork_manager
+
+    def _add_artwork_for_track(self, mhit: Record, dbid: int, filepath: str) -> None:
+        """Extract artwork from audio file and process immediately.
+
+        Creates thumbnails and writes .ithmb data right away during track
+        addition, so save() doesn't have to do all the heavy lifting.
+        ArtworkDB is written once at save time.
         """
         if not self._mountpoint:
             return
@@ -345,25 +359,24 @@ class Database:
             if not art_data:
                 return
 
-            # Save artwork image to system temp dir for later processing
-            # Determine image format from magic bytes
-            ext = ".jpg"
-            if art_data[:8] == b"\x89PNG\r\n\x1a\n":
-                ext = ".png"
+            mgr = self._get_artwork_manager()
+            image_id = mgr.add_artwork_data(dbid, art_data, save=False)
+            if image_id is not None:
+                # Update MHIT fields so iPod knows artwork exists
+                header = bytearray(mhit.raw_header)
+                if len(header) > 0x82:
+                    put16lint(header, 0x7C, 1)  # artwork_count
+                if len(header) > 0x84:
+                    put32lint(header, 0x80, len(art_data))  # artwork_size
+                if len(header) > 0xA5:
+                    put8int(header, 0xA4, 1)  # has_artwork
+                if len(header) > 0x164:
+                    put32lint(header, 0x160, image_id)  # mhii_link
+                mhit.raw_header = bytes(header)
 
-            fd, img_path = tempfile.mkstemp(suffix=ext, prefix=f"_art_{dbid}_")
-            try:
-                os.write(fd, art_data)
-            finally:
-                os.close(fd)
-
-            if not hasattr(self, "_pending_artwork"):
-                self._pending_artwork = []
-            self._pending_artwork.append((dbid, img_path))
-
-            logger.info("Artwork queued for track dbid=%d (%d bytes)", dbid, len(art_data))
+            logger.info("Artwork processed for track dbid=%d (%d bytes)", dbid, len(art_data))
         except Exception:
-            logger.debug("Failed to extract artwork", exc_info=True)
+            logger.debug("Failed to process artwork", exc_info=True)
 
     def remove_track(self, track: Track, delete_file: bool = False) -> None:
         """Remove a track from the database.
@@ -866,8 +879,7 @@ class Database:
         if not self._root:
             raise DatabaseError("No database loaded")
 
-        if hasattr(self, "_pending_artwork") and self._pending_artwork:
-            self._apply_pending_artwork()
+        self._save_artwork_db()
 
         self._upgrade_header_sizes()
         self._ensure_playlist_prefs()
@@ -935,60 +947,14 @@ class Database:
         self._modified = False
         logger.debug("Database saved to %s", db_path)
 
-    def _apply_pending_artwork(self) -> None:
-        """Apply pending artwork using pure Python ArtworkManager.
-
-        Creates ArtworkDB and .ithmb files, and updates MHIT fields in the
-        record tree. Must be called BEFORE write_itunesdb() so that MHIT
-        artwork fields are included in the serialized database.
-        """
-        count = len(self._pending_artwork)
-        try:
-            from .artwork_manager import ArtworkManager
-
-            generation = self._device.generation if self._device else None
-            if generation is None:
-                from ..device.models import IpodGeneration
-
-                generation = IpodGeneration.UNKNOWN
-
-            mgr = ArtworkManager(self._mountpoint, generation=generation)
-            mgr.reset()
-
-            mhlt = self._get_or_create_mhlt()
-            for dbid, img_path in self._pending_artwork:
-                with open(img_path, "rb") as f:
-                    art_data = f.read()
-                image_id = mgr.add_artwork_data(dbid, art_data)
-                if image_id is not None:
-                    # Update MHIT fields so iPod knows artwork exists
-                    for mhit in mhlt.children:
-                        if mhit.magic != MHIT_MAGIC:
-                            continue
-                        if mhit.fields.get("dbid") == dbid:
-                            header = bytearray(mhit.raw_header)
-                            if len(header) > 0x82:
-                                put16lint(header, 0x7C, 1)  # artwork_count
-                            if len(header) > 0x84:
-                                put32lint(header, 0x80, len(art_data))  # artwork_size
-                            if len(header) > 0xA5:
-                                put8int(header, 0xA4, 1)  # has_artwork
-                            if len(header) > 0x164:
-                                put32lint(header, 0x160, image_id)  # mhii_link
-                            mhit.raw_header = bytes(header)
-                            break
-
-            # Clean up temp artwork images
-            for _, img_path in self._pending_artwork:
-                try:
-                    os.unlink(img_path)
-                except OSError:
-                    pass
-            self._pending_artwork.clear()
-
-            logger.info("Applied artwork for %d tracks (pure Python)", count)
-        except Exception:
-            logger.warning("Artwork processing failed", exc_info=True)
+    def _save_artwork_db(self) -> None:
+        """Write ArtworkDB to disk once (artwork was already processed per-track)."""
+        if hasattr(self, "_artwork_manager") and self._artwork_manager is not None:
+            try:
+                self._artwork_manager.save()
+                logger.info("ArtworkDB saved")
+            except Exception:
+                logger.warning("ArtworkDB save failed", exc_info=True)
 
     def _try_resolve_guid(self) -> Optional[str]:
         """Try to get FirewireGuid from USB and write SysInfo for future use."""
