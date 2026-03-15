@@ -1,11 +1,11 @@
 """Shared pytest fixtures for pygpod tests.
 
 Provides session-scoped fixtures for iPod filesystem, generated MP3 files,
-and writable iPod directories to avoid hardcoded paths in test modules.
+and writable iPod directories. All fixtures are built in pure Python using
+pygpod itself — no gcc, libgpod, or ffmpeg required.
 
-The iPod fixture at test_files/ipod_fs/ is auto-generated using the
-integration test C builder (build_ipod_mass.c) if it doesn't exist.
-Requires gcc, libgpod-1.0, glib-2.0, and ffmpeg.
+If gcc + libgpod + ffmpeg ARE available, the C-based fixture builder is used
+for integration tests (richer fixture with cover art, video tracks, etc.).
 """
 
 import os
@@ -27,6 +27,7 @@ def pytest_sessionfinish(session, exitstatus):
     if os.path.isdir(test_files):
         shutil.rmtree(test_files, ignore_errors=True)
 
+
 # Root of the project
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEST_FILES_DIR = os.path.join(PROJECT_ROOT, "test_files")
@@ -37,6 +38,31 @@ C_SOURCE = os.path.join(PROJECT_ROOT, "integration_tests", "build_ipod_mass.c")
 FIXTURE_MODEL = "B029"
 FIXTURE_GUID = "000A2700213749FF"
 FIXTURE_MUSIC_DIRS = 50
+
+# -------------------------------------------------------------------------
+# Minimal MP3 generator (pure Python, no ffmpeg)
+# -------------------------------------------------------------------------
+
+# A valid MPEG Layer 3 frame header for 128kbps, 44100Hz, stereo, padded.
+# This is followed by silence (zero bytes) to fill the frame.
+# Frame header: 0xFFFB9004  (sync=FFF, ver=MPEG1, layer=III, no CRC,
+#   bitrate=128k, samplerate=44100, padding=0, stereo)
+_MP3_FRAME_HEADER = b"\xff\xfb\x90\x04"
+# MPEG1 Layer3 128kbps 44100Hz frame size = 417 bytes (with header)
+_MP3_FRAME_SIZE = 417
+
+
+def _make_minimal_mp3(path, duration_frames=38):
+    """Create a minimal valid MP3 file (~1 second) without ffmpeg.
+
+    Just repeated silent MPEG frames. Enough for pygpod to detect as MP3
+    and get basic metadata (duration, bitrate, samplerate).
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        for _ in range(duration_frames):
+            f.write(_MP3_FRAME_HEADER)
+            f.write(b"\x00" * (_MP3_FRAME_SIZE - len(_MP3_FRAME_HEADER)))
 
 
 def _make_minimal_png(path, width=64, height=64, color=(0, 100, 200)):
@@ -60,7 +86,190 @@ def _make_minimal_png(path, width=64, height=64, color=(0, 100, 200)):
                 + chunk(b"IEND", b""))
 
 
-def _generate_ipod_fixture():
+# -------------------------------------------------------------------------
+# MP3 generation helpers
+# -------------------------------------------------------------------------
+
+_HAS_FFMPEG = shutil.which("ffmpeg") is not None
+
+
+def _generate_mp3_ffmpeg(path, freq=440, title="", artist="", album="", genre="",
+                         year=0, track_num=0, cover_png=None):
+    """Generate a real MP3 with ID3 tags using ffmpeg."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    cmd = [
+        "ffmpeg", "-y", "-f", "lavfi", "-i",
+        f"sine=frequency={freq}:duration=1",
+        "-ar", "44100", "-ab", "128k",
+    ]
+    meta = {}
+    if title:
+        meta["title"] = title
+    if artist:
+        meta["artist"] = artist
+    if album:
+        meta["album"] = album
+    if genre:
+        meta["genre"] = genre
+    if year:
+        meta["date"] = str(year)
+    if track_num:
+        meta["track"] = str(track_num)
+    for k, v in meta.items():
+        cmd += ["-metadata", f"{k}={v}"]
+    cmd.append(path)
+    subprocess.run(cmd, capture_output=True, check=True)
+
+    # Embed cover art if provided
+    if cover_png and os.path.isfile(cover_png):
+        try:
+            from mutagen.mp3 import MP3
+            from mutagen.id3 import APIC, ID3
+
+            audio = MP3(path)
+            if audio.tags is None:
+                audio.add_tags()
+            with open(cover_png, "rb") as f:
+                art_data = f.read()
+            audio.tags.add(APIC(
+                encoding=0, mime="image/png", type=3,
+                desc="Cover", data=art_data,
+            ))
+            audio.save()
+        except ImportError:
+            pass
+
+
+# -------------------------------------------------------------------------
+# Pure-Python iPod fixture (always available)
+# -------------------------------------------------------------------------
+
+TRACKS_META = [
+    # (title, artist, album, genre, year, track_num, freq)
+    ("Highway Ride", "The Rockers", "Road Trip", "Rock", 2018, 1, 220),
+    ("Desert Wind", "The Rockers", "Road Trip", "Rock", 2018, 2, 260),
+    ("Mountain Echo", "The Rockers", "Road Trip", "Rock", 2018, 3, 300),
+    ("City Lights", "The Rockers", "Road Trip", "Rock", 2018, 4, 340),
+    ("Open Road", "The Rockers", "Road Trip", "Rock", 2018, 5, 380),
+    ("Neon Dreams", "Synthwave", "Retrowave", "Electronic", 2020, 1, 420),
+    ("Midnight Run", "Synthwave", "Retrowave", "Electronic", 2020, 2, 460),
+    ("Laser Grid", "Synthwave", "Retrowave", "Electronic", 2020, 3, 500),
+    ("Chrome Horizon", "Synthwave", "Retrowave", "Electronic", 2020, 4, 540),
+    ("Digital Sunset", "Synthwave", "Retrowave", "Electronic", 2020, 5, 580),
+    ("Acoustic Morning", "Folk Band", "Campfire", "Folk", 2019, 1, 620),
+    ("River Song", "Folk Band", "Campfire", "Folk", 2019, 2, 660),
+    ("Timber Trail", "Folk Band", "Campfire", "Folk", 2019, 3, 700),
+    ("Starlight", "Folk Band", "Campfire", "Folk", 2019, 4, 740),
+    ("Embers", "Folk Band", "Campfire", "Folk", 2019, 5, 780),
+    ("Podcast Ep 1", "Host", "My Podcast", "Podcast", 2021, 1, 330),
+    ("Podcast Ep 2", "Host", "My Podcast", "Podcast", 2021, 2, 370),
+    ("Podcast Ep 3", "Host", "My Podcast", "Podcast", 2021, 3, 410),
+    ("Bass Drop", "DJ Mix", "Club Anthems", "Dance", 2022, 1, 440),
+    ("Peak Hour", "DJ Mix", "Club Anthems", "Dance", 2022, 2, 480),
+    ("After Party", "DJ Mix", "Club Anthems", "Dance", 2022, 3, 520),
+]
+
+
+def _generate_pure_python_fixture(dest_dir):
+    """Build an iPod filesystem fixture using pygpod.
+
+    Uses ffmpeg + mutagen for real MP3s with tags and cover art when
+    available, falls back to silent MP3 frames with manual metadata.
+    """
+    from pygpod.device.mountpoint import init_ipod
+    from pygpod.model.database import Database
+
+    os.makedirs(dest_dir, exist_ok=True)
+
+    # Create directory structure
+    ipod_ctrl = os.path.join(dest_dir, "iPod_Control")
+    for sub in ["iTunes", "Artwork", "Device"]:
+        os.makedirs(os.path.join(ipod_ctrl, sub), exist_ok=True)
+    for i in range(FIXTURE_MUSIC_DIRS):
+        os.makedirs(os.path.join(ipod_ctrl, "Music", f"F{i:02d}"), exist_ok=True)
+
+    # Write SysInfo
+    sysinfo_path = os.path.join(ipod_ctrl, "Device", "SysInfo")
+    with open(sysinfo_path, "w") as f:
+        f.write(f"ModelNumStr: x{FIXTURE_MODEL}\n")
+        f.write(f"FirewireGuid: 0x{FIXTURE_GUID}\n")
+
+    # Initialize database
+    init_ipod(dest_dir)
+
+    # Generate cover art for embedding
+    media_dir = os.path.join(dest_dir, "_media_src")
+    os.makedirs(media_dir, exist_ok=True)
+    cover_png = os.path.join(media_dir, "cover.png")
+    _make_minimal_png(cover_png, 128, 128)
+
+    # Generate MP3 files
+    use_ffmpeg = _HAS_FFMPEG
+    mp3_paths = []
+    for i, (title, artist, album, genre, year, track_num, freq) in enumerate(TRACKS_META):
+        mp3_path = os.path.join(media_dir, f"track_{i+1:02d}.mp3")
+        if use_ffmpeg:
+            try:
+                _generate_mp3_ffmpeg(
+                    mp3_path, freq=freq, title=title, artist=artist,
+                    album=album, genre=genre, year=year, track_num=track_num,
+                    cover_png=cover_png if i < 15 else None,  # first 15 get art
+                )
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                use_ffmpeg = False
+                _make_minimal_mp3(mp3_path)
+        else:
+            _make_minimal_mp3(mp3_path)
+        mp3_paths.append(mp3_path)
+
+    # Add tracks to database
+    db = Database(dest_dir)
+    added_tracks = []
+    for i, (title, artist, album, genre, year, track_num, _freq) in enumerate(TRACKS_META):
+        kwargs = {}
+        if not use_ffmpeg:
+            # Manual metadata when ffmpeg isn't available
+            kwargs = {
+                "title": title,
+                "artist": artist,
+                "album": album,
+                "genre": genre,
+                "year": year,
+                "track_number": track_num,
+                "total_tracks": 5 if track_num <= 5 else 3,
+            }
+        if genre == "Podcast":
+            kwargs["media_type"] = 0x00000004
+            kwargs["category"] = album
+
+        track = db.add_track(mp3_paths[i], **kwargs)
+        added_tracks.append(track)
+
+    # Create playlists
+    rock_pl = db.create_playlist("Rock Favorites")
+    for t in added_tracks[:5]:
+        db.add_track_to_playlist(rock_pl, t)
+
+    electro_pl = db.create_playlist("Electronic Mix")
+    for t in added_tracks[5:10]:
+        db.add_track_to_playlist(electro_pl, t)
+
+    db.save()
+
+    # Generate iTunesSD
+    _generate_itunessd(dest_dir)
+
+    # Clean up source media files
+    shutil.rmtree(media_dir, ignore_errors=True)
+
+    return dest_dir
+
+
+# -------------------------------------------------------------------------
+# C-based fixture (richer, for integration tests)
+# -------------------------------------------------------------------------
+
+def _generate_c_fixture():
     """Auto-generate the iPod fixture using the integration C builder.
 
     Compiles build_ipod_mass.c, generates media files, and creates a
@@ -71,7 +280,6 @@ def _generate_ipod_fixture():
     if not os.path.isfile(C_SOURCE):
         return None
 
-    # Check for pkg-config, gcc, ffmpeg
     try:
         cflags = subprocess.check_output(
             ["pkg-config", "--cflags", "libgpod-1.0", "glib-2.0"],
@@ -86,12 +294,10 @@ def _generate_ipod_fixture():
 
     build_dir = tempfile.mkdtemp(prefix="pygpod_fixture_build_")
     try:
-        # Compile
         binary = os.path.join(build_dir, "build_ipod_mass")
         cmd = f"gcc -o {binary} {C_SOURCE} {cflags} {libs}"
         subprocess.check_call(cmd, shell=True, stderr=subprocess.PIPE)
 
-        # Generate media files
         media_dir = os.path.join(build_dir, "media")
         os.makedirs(media_dir)
         for i in range(21):
@@ -118,11 +324,9 @@ def _generate_ipod_fixture():
                     capture_output=True, check=True,
                 )
 
-        # Cover art
         cover_art = os.path.join(media_dir, "cover_art.png")
         _make_minimal_png(cover_art)
 
-        # Build iPod filesystem
         os.makedirs(IPOD_FS_DIR, exist_ok=True)
         result = subprocess.run(
             [binary, IPOD_FS_DIR, FIXTURE_MODEL, media_dir,
@@ -133,9 +337,7 @@ def _generate_ipod_fixture():
             shutil.rmtree(IPOD_FS_DIR, ignore_errors=True)
             return None
 
-        # Generate iTunesSD for Shuffle tests
         _generate_itunessd(IPOD_FS_DIR)
-
         return IPOD_FS_DIR
     except (subprocess.CalledProcessError, FileNotFoundError, OSError):
         shutil.rmtree(IPOD_FS_DIR, ignore_errors=True)
@@ -160,15 +362,11 @@ def _generate_itunessd(ipod_dir):
     for track in db.tracks:
         ipod_path = track.ipod_path or ""
         colon_path = ipod_path.replace("/", ":")
-        if colon_path.startswith(":"):
-            pass  # already colon-prefixed
-        elif not colon_path:
+        if not colon_path:
             colon_path = ":iPod_Control:Music:F00:unknown.mp3"
 
         ft = 1  # mp3
-        if colon_path.endswith((".m4a", ".aac")):
-            ft = 2
-        elif colon_path.endswith((".mp4", ".m4v")):
+        if colon_path.endswith((".m4a", ".aac", ".mp4", ".m4v")):
             ft = 2
         elif colon_path.endswith((".wav", ".aiff")):
             ft = 4
@@ -185,20 +383,28 @@ def _generate_itunessd(ipod_dir):
         f.write(sd.write())
 
 
+# =========================================================================
+# Fixtures
+# =========================================================================
+
 @pytest.fixture(scope="session")
-def ipod_fs_path():
+def ipod_fs_path(tmp_path_factory):
     """Path to the iPod filesystem test fixture.
 
-    Auto-generates test_files/ipod_fs/ using the integration C builder
-    if it doesn't exist. Skips if libgpod/gcc/ffmpeg are unavailable.
+    Tries the C-based builder first (richer fixture). Falls back to
+    pure-Python builder (always works, no external dependencies).
     """
-    if not os.path.isdir(IPOD_FS_DIR):
-        result = _generate_ipod_fixture()
-        if result is None:
-            pytest.skip(
-                "iPod fixture not available (needs gcc, libgpod, ffmpeg)"
-            )
-    return IPOD_FS_DIR
+    if os.path.isdir(IPOD_FS_DIR):
+        return IPOD_FS_DIR
+
+    # Try C builder
+    result = _generate_c_fixture()
+    if result is not None:
+        return result
+
+    # Fall back to pure Python
+    dest = str(tmp_path_factory.mktemp("ipod_fixture"))
+    return _generate_pure_python_fixture(dest)
 
 
 @pytest.fixture(scope="session")
@@ -235,61 +441,71 @@ def sysinfo_path(ipod_fs_path):
     return path
 
 
-def _generate_minimal_mp3(path):
-    """Generate a minimal valid MP3 file using ffmpeg.
-
-    Creates a 1-second 128kbps sine tone at 440Hz.
-    """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=440:duration=1",
-            "-ar",
-            "44100",
-            "-ab",
-            "128k",
-            "-f",
-            "mp3",
-            path,
-        ],
-        capture_output=True,
-        check=True,
-    )
-
-
 @pytest.fixture(scope="session")
 def generated_mp3(tmp_path_factory):
-    """Generate a minimal MP3 file for testing track operations.
+    """Generate an MP3 file for testing.
 
-    Returns the path to a valid MP3 file (1 second, 440Hz sine tone).
+    Uses ffmpeg with ID3 tags when available, falls back to silent frames.
     """
     mp3_dir = tmp_path_factory.mktemp("music")
     mp3_path = str(mp3_dir / "test_track.mp3")
-    _generate_minimal_mp3(mp3_path)
+    if _HAS_FFMPEG:
+        try:
+            _generate_mp3_ffmpeg(
+                mp3_path, freq=440, title="Test Track",
+                artist="Test Artist", album="Test Album", genre="Test",
+            )
+            return mp3_path
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+    _make_minimal_mp3(mp3_path)
+    return mp3_path
+
+
+@pytest.fixture(scope="session")
+def generated_mp3_with_art(tmp_path_factory):
+    """Generate an MP3 file with embedded cover art."""
+    mp3_dir = tmp_path_factory.mktemp("music_art")
+    mp3_path = str(mp3_dir / "track_with_art.mp3")
+    cover_path = str(mp3_dir / "cover.png")
+    _make_minimal_png(cover_path, 200, 200, (255, 0, 0))
+    if _HAS_FFMPEG:
+        try:
+            _generate_mp3_ffmpeg(
+                mp3_path, freq=440, title="Art Track",
+                artist="Art Artist", album="Art Album",
+                cover_png=cover_path,
+            )
+            return mp3_path
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+    _make_minimal_mp3(mp3_path)
     return mp3_path
 
 
 @pytest.fixture
-def writable_ipod(tmp_path, ipod_fs_path, generated_mp3):
+def writable_ipod(tmp_path, ipod_fs_path):
     """A writable copy of the iPod filesystem for modification tests.
 
     Includes:
     - Full iPod_Control directory tree copied from test fixture
     - F00-F49 music directories created
-    - The generated MP3 placed in the music directory for add operations
     """
     ipod = str(tmp_path / "ipod")
     shutil.copytree(ipod_fs_path, ipod)
 
-    # Create Fxx music directories
+    # Ensure Fxx music directories exist
     music_dir = os.path.join(ipod, "iPod_Control", "Music")
     os.makedirs(music_dir, exist_ok=True)
     for i in range(50):
         os.makedirs(os.path.join(music_dir, f"F{i:02d}"), exist_ok=True)
 
     return ipod
+
+
+@pytest.fixture
+def writable_ipod_with_mp3(writable_ipod, tmp_path):
+    """Writable iPod + a fresh MP3 file ready to be added."""
+    mp3_path = str(tmp_path / "new_track.mp3")
+    _make_minimal_mp3(mp3_path)
+    return writable_ipod, mp3_path

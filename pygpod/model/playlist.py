@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import List, Optional
 
-from ..db.constants import MHIP_MAGIC, MHOD_ID_TITLE
+from ..db.constants import MHIP_MAGIC, MHOD_ID_TITLE, MHOD_MAGIC
 from ..db.parser import Record
 from .track import Track
 
@@ -13,7 +13,11 @@ logger = logging.getLogger(__name__)
 
 
 class Playlist:
-    """High-level representation of an iPod playlist."""
+    """High-level representation of an iPod playlist.
+
+    The ``name`` property has a setter. Structural properties like
+    ``playlist_id`` and ``is_master`` are read-only.
+    """
 
     def __init__(
         self, record: Optional[Record] = None, track_lookup: Optional[dict] = None
@@ -36,6 +40,21 @@ class Playlist:
         if self._record:
             return self._record.get_mhod(MHOD_ID_TITLE) or ""
         return ""
+
+    @name.setter
+    def name(self, value: str) -> None:
+        """Rename the playlist."""
+        if not self._record:
+            return
+        from ..db.writer import make_string_mhod
+
+        self._record.children = [
+            c
+            for c in self._record.children
+            if not (c.magic == MHOD_MAGIC and c.fields.get("mhod_type") == MHOD_ID_TITLE)
+        ]
+        if value:
+            self._record.children.insert(0, make_string_mhod(MHOD_ID_TITLE, value))
 
     @property
     def playlist_id(self) -> int:

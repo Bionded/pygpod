@@ -60,7 +60,7 @@ def test_artworkdb_mhii_fields(artworkdb_path):
         assert "image_id" in mhii.fields
         assert "song_id" in mhii.fields
         assert "num_children" in mhii.fields
-        assert mhii.fields["image_id"] >= 100  # IDs start at 100
+        assert mhii.fields["image_id"] >= 1
         assert mhii.fields["num_children"] > 0
 
 

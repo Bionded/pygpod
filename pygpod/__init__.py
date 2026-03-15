@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 logger = logging.getLogger(__name__)
 

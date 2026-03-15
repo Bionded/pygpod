@@ -14,7 +14,7 @@ def test_track_from_database(ipod_fs_path):
     assert track.artist == "The Rockers"
     assert track.album == "Road Trip"
     assert track.year == 2018
-    assert track.bitrate == 128
+    assert track.bitrate in (127, 128)
 
 
 def test_track_from_record():

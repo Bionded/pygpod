@@ -488,29 +488,27 @@ class TestPlaylistDelete:
 class TestAutoPodcastPlaylist:
 
     def test_podcast_auto_creates_playlist(self, mp, generated_mp3, capsys):
-        """Adding a podcast track auto-creates a podcast playlist."""
+        """Adding a podcast track auto-creates the Podcasts playlist."""
         assert _main([
             "-m", mp, "tr", "add", generated_mp3,
             "--type", "podcast", "--category", "Tech News",
         ]) == 0
         out = capsys.readouterr().out
-        assert "Created podcast playlist: Tech News" in out
-        assert "Added to playlist: Tech News" in out
+        assert "Podcasts playlist" in out
 
-        # Verify playlist exists and has the track
+        # Verify Podcasts playlist exists and has the track
         from pygpod.model.database import Database
         db = Database(mp)
         pl = None
         for p in db.playlists:
-            if p.name == "Tech News":
+            if p.is_podcast:
                 pl = p
                 break
         assert pl is not None
-        assert pl.is_podcast
         assert pl.track_count >= 1
 
     def test_podcast_auto_adds_to_existing(self, mp, generated_mp3, capsys):
-        """Second podcast track with same category reuses existing playlist."""
+        """Second podcast track reuses existing Podcasts playlist."""
         # First track creates the playlist
         _main([
             "-m", mp, "tr", "add", generated_mp3,
@@ -518,14 +516,14 @@ class TestAutoPodcastPlaylist:
         ])
         capsys.readouterr()
 
-        # Second track should add to existing playlist (no "Created" message)
+        # Second track should add to existing Podcasts playlist
         assert _main([
             "-m", mp, "tr", "add", generated_mp3,
             "--type", "podcast", "--category", "Science",
         ]) == 0
         out = capsys.readouterr().out
-        assert "Created podcast playlist" not in out
-        assert "Added to playlist: Science" in out
+        assert "Added to Podcasts playlist" in out
+        assert "Created Podcasts playlist" not in out
 
     def test_podcast_default_playlist_name(self, mp, generated_mp3, capsys):
         """Podcast without category uses 'Podcasts' as default playlist name."""
@@ -534,4 +532,4 @@ class TestAutoPodcastPlaylist:
             "--type", "podcast",
         ]) == 0
         out = capsys.readouterr().out
-        assert "Added to playlist: Podcasts" in out
+        assert "Added to Podcasts playlist" in out

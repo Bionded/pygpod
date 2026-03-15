@@ -517,10 +517,10 @@ def _cmd_track_add(args: argparse.Namespace) -> int:
         print(f"Added [{mtype}]: {track}")
         # Show podcast playlist auto-assignment
         if track.media_type & _MEDIA_TYPES["podcast"]:
-            pl_name = overrides.get("category") or "Podcasts"
-            if pl_name not in playlists_before:
-                print(f"  -> Created podcast playlist: {pl_name}")
-            print(f"  -> Added to playlist: {pl_name}")
+            if "Podcasts" not in playlists_before:
+                print("  -> Created Podcasts playlist")
+                playlists_before.add("Podcasts")
+            print("  -> Added to Podcasts playlist")
     db.save()
     print(f"Database saved. Total tracks: {len(db.tracks)}")
     return 0

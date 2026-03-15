@@ -149,33 +149,93 @@ Use `Database.from_file(path)` to parse a standalone iTunesDB file without a mou
 
 ### Track
 
-Read-only properties on a parsed MHIT record - covers 100+ fields.
+Properties on a parsed MHIT record - covers 100+ fields. Most metadata fields have setters.
+
+#### Editable string properties
 
 ```python
-track.track_id       # unique ID
-track.title          # string metadata (also: artist, album, genre, composer, comment, ...)
-track.duration       # seconds (float)
-track.duration_ms    # milliseconds (int)
+track.title = "New Title"
+track.artist = "New Artist"
+track.album = "New Album"
+track.genre = "Rock"
+track.composer = "Someone"
+track.comment = "My note"
+track.albumartist = "Various Artists"
+track.grouping = "Group"
+track.description = "Desc"
+track.subtitle = "Sub"
+track.category = "Category"
+track.keywords = "tag1 tag2"
+track.podcast_url = "https://..."
+track.podcast_rss = "https://..."
+track.tvshow = "Show Name"
+track.tvepisode = "S01E01"
+track.tvnetwork = "Network"
+# Sort keys (override default sort order)
+track.sort_title = "title for sorting"
+track.sort_artist = "artist for sorting"
+track.sort_album = "album for sorting"
+track.sort_albumartist = "albumartist for sorting"
+track.sort_composer = "composer for sorting"
+track.sort_tvshow = "tvshow for sorting"
+```
+
+#### Editable numeric properties
+
+```python
+track.rating = 80             # 0-100 (each star = 20)
+track.rating_stars = 4        # 0-5 (convenience setter)
+track.play_count = 10
+track.track_number = 3
+track.total_tracks = 12
+track.year = 2024
+track.cd_number = 1
+track.total_cds = 2
+track.bpm = 120
+track.volume = 50             # -255 to 255
+track.start_time = 5000       # ms (partial playback start)
+track.stop_time = 180000      # ms (partial playback end)
+track.season_number = 1
+track.episode_number = 5
+track.media_type = 0x0004     # auto-updates type1/type2/podcast flags
+track.compilation = True
+track.skip_when_shuffling = True
+track.remember_position = True
+track.mark_unplayed = True
+```
+
+#### Read-only properties (structural)
+
+```python
+track.track_id       # unique ID assigned on add
+track.dbid           # database ID
+track.ipod_path      # colon-separated iPod path
+track.filetype_marker # 4-byte file type code
+track.filetype_str   # "MPEG audio file" etc.
+track.file_size      # bytes
 track.bitrate        # kbps
 track.samplerate     # Hz
-track.file_size      # bytes
-track.year           # release year
-track.track_number   # track number in album
-track.play_count     # number of plays
-track.rating         # 0-100 (each star = 20)
-track.ipod_path      # colon-separated iPod path
-track.is_podcast     # bool
+track.duration       # seconds (float)
+track.duration_ms    # milliseconds (int)
+track.is_podcast     # bool (derived from media_type)
 track.is_audiobook   # bool
+track.is_video       # bool
+track.has_artwork    # bool
+track.time_added     # datetime
+track.time_modified  # datetime
+track.time_played    # datetime
 ```
 
 ### Playlist
 
 ```python
-playlist.name         # playlist name
-playlist.tracks       # list of Track objects
-playlist.track_count  # number of tracks
-playlist.is_master    # True for the library playlist
-playlist.track_ids    # list of track IDs
+playlist.name = "New Name"  # editable
+playlist.tracks             # list of Track objects
+playlist.track_count        # number of tracks
+playlist.track_ids          # list of track IDs
+playlist.is_master          # True for the library playlist (read-only)
+playlist.is_podcast         # bool (read-only)
+playlist.is_smart           # bool (read-only)
 ```
 
 ### Device
