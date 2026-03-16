@@ -6,12 +6,18 @@ on:
       - master
       - develop
       - develop-*
+      - rc-*
+      - release-*
+      - candidate-*
   pull_request:
     branches:
       - master
       - develop
 
 jobs:
+  # =====================================================================
+  # Lint — always runs on all branches
+  # =====================================================================
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -31,14 +37,45 @@ jobs:
       - name: Ruff format check
         run: ruff format --check pygpod/ tests/
 
+  # =====================================================================
+  # Quick smoke test — runs on develop branches only
+  # =====================================================================
+  test-quick:
+    name: Quick Test (Python 3.8, Linux)
+    if: startsWith(github.ref, 'refs/heads/develop')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install dependencies
+        run: pip install -e ".[all]" pytest
+
+      - name: Run tests
+        run: python -m pytest tests/ -v --tb=short
+
+  # =====================================================================
+  # Full test matrix — runs on master, rc-*, release-*, candidate-*
+  # =====================================================================
   test-linux:
     name: Test (Python ${{ matrix.python-version }}, Linux)
+    if: |
+      github.ref == 'refs/heads/master' ||
+      startsWith(github.ref, 'refs/heads/rc-') ||
+      startsWith(github.ref, 'refs/heads/release-') ||
+      startsWith(github.ref, 'refs/heads/candidate-') ||
+      github.event_name == 'pull_request'
     runs-on: ${{ matrix.ubuntu }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Python 3.8 needs ubuntu-22.04 (not available on 24.04)
           - python-version: "3.8"
             ubuntu: ubuntu-22.04
           - python-version: "3.9"
@@ -82,6 +119,12 @@ jobs:
 
   test-macos:
     name: Test (Python ${{ matrix.python-version }}, macOS)
+    if: |
+      github.ref == 'refs/heads/master' ||
+      startsWith(github.ref, 'refs/heads/rc-') ||
+      startsWith(github.ref, 'refs/heads/release-') ||
+      startsWith(github.ref, 'refs/heads/candidate-') ||
+      github.event_name == 'pull_request'
     runs-on: macos-latest
     strategy:
       fail-fast: false
@@ -106,6 +149,12 @@ jobs:
 
   test-windows:
     name: Test (Python ${{ matrix.python-version }}, Windows)
+    if: |
+      github.ref == 'refs/heads/master' ||
+      startsWith(github.ref, 'refs/heads/rc-') ||
+      startsWith(github.ref, 'refs/heads/release-') ||
+      startsWith(github.ref, 'refs/heads/candidate-') ||
+      github.event_name == 'pull_request'
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -130,6 +179,12 @@ jobs:
 
   test-libgpod:
     name: Integration (libgpod)
+    if: |
+      github.ref == 'refs/heads/master' ||
+      startsWith(github.ref, 'refs/heads/rc-') ||
+      startsWith(github.ref, 'refs/heads/release-') ||
+      startsWith(github.ref, 'refs/heads/candidate-') ||
+      github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
