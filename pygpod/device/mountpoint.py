@@ -22,14 +22,17 @@ def validate_mountpoint(mountpoint: str) -> bool:
         True if iPod_Control directory structure exists.
     """
     logger.debug("Validating mountpoint: %s", mountpoint)
-    mp = pathlib.Path(mountpoint)
-    ipod_control = _find_ipod_control(mp)
-    if ipod_control is None:
-        return False
-    # Check for iTunes directory
-    for child in ipod_control.iterdir():
-        if child.name.lower() == "itunes" and child.is_dir():
-            return True
+    try:
+        mp = pathlib.Path(mountpoint)
+        ipod_control = _find_ipod_control(mp)
+        if ipod_control is None:
+            return False
+        # Check for iTunes directory
+        for child in ipod_control.iterdir():
+            if child.name.lower() == "itunes" and child.is_dir():
+                return True
+    except (PermissionError, OSError):
+        logger.debug("Permission denied checking %s", mountpoint)
     return False
 
 
@@ -225,16 +228,19 @@ def _find_ipod_control(mountpoint: pathlib.Path) -> Optional[pathlib.Path]:
 
 def _find_ci(parent: pathlib.Path, name: str) -> Optional[pathlib.Path]:
     """Case-insensitive file/directory lookup."""
-    # Try exact match first (fast path)
-    exact = parent / name
-    if exact.exists():
-        return exact
+    try:
+        # Try exact match first (fast path)
+        exact = parent / name
+        if exact.exists():
+            return exact
 
-    # Fall back to case-insensitive search
-    if not parent.exists():
+        # Fall back to case-insensitive search
+        if not parent.exists():
+            return None
+        name_lower = name.lower()
+        for child in parent.iterdir():
+            if child.name.lower() == name_lower:
+                return child
+    except (PermissionError, OSError):
         return None
-    name_lower = name.lower()
-    for child in parent.iterdir():
-        if child.name.lower() == name_lower:
-            return child
     return None

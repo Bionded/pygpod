@@ -904,7 +904,11 @@ def _cmd_fix_checksums(args: argparse.Namespace) -> int:
 def _cmd_discover(args: argparse.Namespace) -> int:
     from . import discover
 
-    results = discover()
+    try:
+        results = discover()
+    except Exception as e:
+        print(f"Error during discovery: {e}", file=sys.stderr)
+        return 1
 
     if not results:
         print("No iPods found.")
