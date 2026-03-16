@@ -437,8 +437,10 @@ def test_timezone_validate():
 
     assert _validate_tz(3600) == 3600
     assert _validate_tz(-18000) == -18000
-    assert _validate_tz(50000) is None  # > 12 hours
-    assert _validate_tz(-50000) is None
+    assert _validate_tz(50000) == 50000  # within ±14 hours
+    assert _validate_tz(-50000) == -50000  # within ±14 hours
+    assert _validate_tz(50401) is None  # > 14 hours
+    assert _validate_tz(-50401) is None
 
 
 # ============================================================================

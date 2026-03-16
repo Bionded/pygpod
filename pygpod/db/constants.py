@@ -106,6 +106,7 @@ STRING_MHOD_TYPES = {
     MHOD_ID_ALBUM_ALBUM,
     MHOD_ID_ALBUM_ARTIST,
     MHOD_ID_ALBUM_SORT_ARTIST,
+    MHOD_ID_ALBUM_ARTIST_MHII,
 }
 
 # Map of MHOD type to human-readable name

@@ -617,8 +617,14 @@ class Database:
                 )
                 if not has_prefs:
                     prefs = self._make_playlist_prefs_mhod()
-                    # Insert after name MHOD (position 1)
-                    insert_idx = 1 if len(mhyp.children) > 0 else 0
+                    # Insert after the last MHOD, before the first MHIP
+                    insert_idx = 0
+                    for ci, c in enumerate(mhyp.children):
+                        if c.magic == MHIP_MAGIC:
+                            insert_idx = ci
+                            break
+                    else:
+                        insert_idx = len(mhyp.children)
                     mhyp.children.insert(insert_idx, prefs)
                     logger.debug("Added prefs MHOD to playlist %s", mhyp.fields.get("playlist_id"))
 
