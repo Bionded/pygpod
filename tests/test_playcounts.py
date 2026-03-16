@@ -20,23 +20,23 @@ from pygpod.db.playcounts import (
 
 
 class TestParsePlayCounts:
-    def _build(self, entries, entry_size=28, header_size=16):
-        """Build Play Counts binary."""
-        buf = struct.pack("<III", header_size, entry_size, len(entries))
-        buf += b"\x00" * (header_size - 12)
+    def _build(self, entries, entry_size=28, header_size=96):
+        """Build Play Counts binary with mhdp magic."""
+        buf = b"mhdp"
+        buf += struct.pack("<III", header_size, entry_size, len(entries))
+        buf += b"\x00" * (header_size - 16)
         for e in entries:
             entry = bytearray(entry_size)
             struct.pack_into("<I", entry, 0, e.get("play_count", 0))
             if entry_size >= 8:
                 struct.pack_into("<I", entry, 4, e.get("time_played", 0))
             if entry_size >= 12:
-                struct.pack_into("<I", entry, 8, e.get("rating", 0))
+                struct.pack_into("<I", entry, 8, e.get("bookmark_time", 0))
             if entry_size >= 16:
-                struct.pack_into("<I", entry, 12, e.get("skip_count", 0))
-            if entry_size >= 20:
-                struct.pack_into("<I", entry, 16, e.get("time_skipped", 0))
+                struct.pack_into("<I", entry, 12, e.get("rating", 0))
             if entry_size >= 28:
-                struct.pack_into("<I", entry, 24, e.get("bookmark_time", 0))
+                struct.pack_into("<I", entry, 20, e.get("skip_count", 0))
+                struct.pack_into("<I", entry, 24, e.get("time_skipped", 0))
             buf += bytes(entry)
         return buf
 
@@ -322,9 +322,11 @@ class TestReadFromMountpoint:
     def test_read_play_counts_binary(self, tmp_path):
         itunes = tmp_path / "iPod_Control" / "iTunes"
         itunes.mkdir(parents=True)
-        # Write binary Play Counts file
-        data = struct.pack("<IIII", 16, 12, 1, 0)
-        data += struct.pack("<III", 2, 3700000000, 60)
+        # Write binary Play Counts file with mhdp header
+        header_size = 96
+        data = b"mhdp" + struct.pack("<III", header_size, 12, 1)
+        data += b"\x00" * (header_size - 16)
+        data += struct.pack("<III", 2, 3700000000, 0)
         (itunes / "Play Counts").write_bytes(data)
 
         entries = read_play_counts(str(tmp_path))
