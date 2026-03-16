@@ -16,9 +16,11 @@ from ..utils.encoding import decode_mhod_string
 from .constants import (
     MHBD_MAGIC,
     MHIA_MAGIC,
+    MHII_MAGIC,
     MHIP_MAGIC,
     MHIT_MAGIC,
     MHLA_MAGIC,
+    MHLI_MAGIC,
     MHLP_MAGIC,
     MHLT_MAGIC,
     MHOD_MAGIC,
@@ -205,6 +207,11 @@ def _parse_mhsd(data: bytes, offset: int) -> Record:
     elif mhsd_type == 5:
         # New artist list - store raw
         pass
+    elif mhsd_type == 8:
+        # Artist list section - contains MHLI with MHII children
+        if pos + 4 <= len(data) and data[pos : pos + 4] == MHLI_MAGIC:
+            child = _parse_mhli(data, pos, offset + total_len)
+            rec.children.append(child)
     else:
         # Unknown section type - store raw for preservation
         pass
@@ -328,6 +335,10 @@ def _parse_mhit(data: bytes, offset: int) -> Record:
     # MHII link (header_len >= 0x184)
     if header_len >= 0x184:
         f["mhii_link"] = get32lint(data, offset + 0x160)
+
+    # Artist ID (header_len >= 0x1E4)
+    if header_len >= 0x1E4:
+        f["artist_id"] = get32lint(data, offset + 0x1E0)
 
     # Parse child MHOD records
     _parse_mhod_children(data, rec, offset + header_len, offset + total_len, f["num_mhods"])
@@ -512,13 +523,13 @@ def _parse_mhip(data: bytes, offset: int) -> Record:
 
     f = rec.fields
     f["num_mhods"] = get32lint(data, offset + 0x0C)
-    f["unk_0x10"] = get32lint(data, offset + 0x10)
-    f["unk_0x14"] = get32lint(data, offset + 0x14)
+    f["podcastgroupflag"] = get32lint(data, offset + 0x10)
+    f["podcastgroupid"] = get32lint(data, offset + 0x14)
     f["track_id"] = get32lint(data, offset + 0x18)
 
     if header_len >= 0x24:
         f["timestamp"] = get32lint(data, offset + 0x1C)
-        f["podcast_groupref"] = get32lint(data, offset + 0x20)
+        f["podcastgroupref"] = get32lint(data, offset + 0x20)
 
     # Parse child MHODs
     _parse_mhod_children(data, rec, offset + header_len, offset + total_len, f["num_mhods"])
@@ -576,6 +587,63 @@ def _parse_mhia(data: bytes, offset: int) -> Record:
     f["num_mhods"] = get32lint(data, offset + 0x0C)
     if header_len >= 0x14:
         f["album_id"] = get32lint(data, offset + 0x10)
+
+    # Parse child MHODs
+    _parse_mhod_children(data, rec, offset + header_len, offset + total_len, f.get("num_mhods", 0))
+
+    return rec
+
+
+def _parse_mhli(data: bytes, offset: int, end: int) -> Record:
+    """Parse MHLI (artist list) and child MHII records."""
+    header_len = get32lint(data, offset + 4)
+    num_artists = get32lint(data, offset + 8)
+
+    rec = Record(MHLI_MAGIC, header_len, num_artists)
+    rec.raw_header = bytes(data[offset : offset + header_len])
+    rec.fields["num_artists"] = num_artists
+
+    pos = offset + header_len
+    for _ in range(num_artists):
+        if pos + 4 > len(data):
+            break
+        magic = data[pos : pos + 4]
+        if magic == MHII_MAGIC:
+            artist = _parse_mhii(data, pos)
+            rec.children.append(artist)
+            pos += artist.total_len
+        else:
+            # Unknown record type - try to read its size and skip
+            if pos + 12 <= len(data):
+                child_total = get32lint(data, pos + 8)
+                if child_total > 0:
+                    child = Record(magic, get32lint(data, pos + 4), child_total)
+                    child.raw_bytes = bytes(data[pos : pos + child_total])
+                    child.raw_header = bytes(data[pos : pos + child.header_len])
+                    rec.children.append(child)
+                    pos += child_total
+                else:
+                    break
+            else:
+                break
+
+    rec.raw_bytes = bytes(data[offset:pos])
+    return rec
+
+
+def _parse_mhii(data: bytes, offset: int) -> Record:
+    """Parse MHII (artist item) record."""
+    header_len = get32lint(data, offset + 4)
+    total_len = get32lint(data, offset + 8)
+
+    rec = Record(MHII_MAGIC, header_len, total_len)
+    rec.raw_header = bytes(data[offset : offset + header_len])
+    rec.raw_bytes = bytes(data[offset : offset + total_len])
+
+    f = rec.fields
+    f["num_mhods"] = get32lint(data, offset + 0x0C)
+    if header_len >= 0x14:
+        f["artist_id"] = get32lint(data, offset + 0x10)
 
     # Parse child MHODs
     _parse_mhod_children(data, rec, offset + header_len, offset + total_len, f.get("num_mhods", 0))

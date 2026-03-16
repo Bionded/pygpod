@@ -167,11 +167,11 @@ class TestParseTz4g:
         assert _parse_tz_4g(bytes(data)) == 2 * 3600 + 3600
 
     def test_offset_out_of_range(self):
-        """Returns None when calculated offset exceeds ±12 hours."""
+        """Returns None when calculated offset exceeds ±14 hours."""
         data = bytearray(0xB11)
-        # Need adjusted >> 1 > 12 => adjusted >= 26 => 0x1A
-        # adjusted = 0x1A => hours = 13, offset = 46800 > 43200
-        data[0xB10] = 0x19 + 0x1A
+        # Need adjusted >> 1 > 14 => adjusted >= 30 => 0x1E
+        # adjusted = 0x1E => hours = 15, offset = 54000 > 50400
+        data[0xB10] = 0x19 + 0x1E
         assert _parse_tz_4g(bytes(data)) is None
 
 
@@ -217,10 +217,10 @@ class TestParseTz5g:
         assert _parse_tz_5g(bytes(data)) == 3600
 
     def test_offset_out_of_range(self):
-        """Returns None when offset exceeds ±12 hours."""
+        """Returns None when offset exceeds ±14 hours."""
         data = bytearray(0xB24)
-        # raw = 540 + 800 = 1340 => offset_minutes = 800 => 48000s > 43200
-        struct.pack_into("<h", data, 0xB22, 1340)
+        # raw = 540 + 900 = 1440 => offset_minutes = 900 => 54000s > 50400
+        struct.pack_into("<h", data, 0xB22, 1440)
         assert _parse_tz_5g(bytes(data)) is None
 
 
@@ -532,11 +532,17 @@ class TestValidateTz:
     def test_boundary_minus_12h(self):
         assert _validate_tz(-43200) == -43200  # exactly -12h
 
+    def test_boundary_14h(self):
+        assert _validate_tz(50400) == 50400  # exactly +14h
+
+    def test_boundary_minus_14h(self):
+        assert _validate_tz(-50400) == -50400  # exactly -14h
+
     def test_exceeds_positive(self):
-        assert _validate_tz(43201) is None
+        assert _validate_tz(50401) is None
 
     def test_exceeds_negative(self):
-        assert _validate_tz(-43201) is None
+        assert _validate_tz(-50401) is None
 
 
 # ---------------------------------------------------------------------------

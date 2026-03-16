@@ -263,7 +263,7 @@ def apply_play_counts(tracks: list, entries: List[PlayCountEntry]) -> int:
             changed = True
         if entry.rating >= 0:
             fields["rating"] = entry.rating
-            if len(header) > 0x1F:
+            if len(header) >= 0x20:
                 header[0x1F] = min(entry.rating, 255)
             changed = True
         if entry.skip_count > 0:

@@ -1216,4 +1216,4 @@ class TestParseMhip:
         mhip_rec = [c for c in mhyp_rec.children if c.magic == b"mhip"][0]
         assert mhip_rec.fields["track_id"] == 42
         assert mhip_rec.fields["timestamp"] == 1000
-        assert mhip_rec.fields["podcast_groupref"] == 5
+        assert mhip_rec.fields["podcastgroupref"] == 5

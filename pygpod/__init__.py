@@ -85,30 +85,54 @@ def discover():
     system = platform.system()
     mounts = []
 
-    if system == "Linux":
-        for base in [pathlib.Path("/media"), pathlib.Path("/run/media")]:
-            if base.exists():
-                for p in base.glob("*/*"):
-                    if p.is_dir():
-                        mounts.append(p)
-        mnt = pathlib.Path("/mnt")
-        if mnt.exists():
-            for p in mnt.iterdir():
-                if p.is_dir():
-                    mounts.append(p)
-    elif system == "Darwin":
-        volumes = pathlib.Path("/Volumes")
-        if volumes.exists():
-            for p in volumes.iterdir():
-                if p.is_dir():
-                    mounts.append(p)
-    elif system == "Windows":
-        import string
+    try:
+        if system == "Linux":
+            for base in [pathlib.Path("/media"), pathlib.Path("/run/media")]:
+                try:
+                    if base.exists():
+                        for p in base.glob("*/*"):
+                            try:
+                                if p.is_dir():
+                                    mounts.append(p)
+                            except (PermissionError, OSError):
+                                pass
+                except (PermissionError, OSError):
+                    pass
+            mnt = pathlib.Path("/mnt")
+            try:
+                if mnt.exists():
+                    for p in mnt.iterdir():
+                        try:
+                            if p.is_dir():
+                                mounts.append(p)
+                        except (PermissionError, OSError):
+                            pass
+            except (PermissionError, OSError):
+                pass
+        elif system == "Darwin":
+            volumes = pathlib.Path("/Volumes")
+            try:
+                if volumes.exists():
+                    for p in volumes.iterdir():
+                        try:
+                            if p.is_dir():
+                                mounts.append(p)
+                        except (PermissionError, OSError):
+                            pass
+            except (PermissionError, OSError):
+                pass
+        elif system == "Windows":
+            import string
 
-        for letter in string.ascii_uppercase:
-            drive = pathlib.Path(f"{letter}:\\")
-            if drive.exists():
-                mounts.append(drive)
+            for letter in string.ascii_uppercase:
+                drive = pathlib.Path(f"{letter}:\\")
+                try:
+                    if drive.exists():
+                        mounts.append(drive)
+                except (PermissionError, OSError):
+                    pass
+    except Exception:
+        logger.debug("Mount point scanning failed", exc_info=True)
 
     for mp in mounts:
         if validate_mountpoint(str(mp)):

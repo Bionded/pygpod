@@ -545,6 +545,8 @@ class Database:
             for c in playlist.record.children
             if not (c.magic == MHIP_MAGIC and c.fields.get("track_id") == track.track_id)
         ]
+        # Mirror removal to MHSD type 3
+        self._unmirror_from_type3(playlist.playlist_id, track.track_id)
         self._modified = True
 
     # ---- Pre-save Fixups ----
@@ -617,8 +619,14 @@ class Database:
                 )
                 if not has_prefs:
                     prefs = self._make_playlist_prefs_mhod()
-                    # Insert after name MHOD (position 1)
-                    insert_idx = 1 if len(mhyp.children) > 0 else 0
+                    # Insert after the last MHOD, before the first MHIP
+                    insert_idx = 0
+                    for ci, c in enumerate(mhyp.children):
+                        if c.magic == MHIP_MAGIC:
+                            insert_idx = ci
+                            break
+                    else:
+                        insert_idx = len(mhyp.children)
                     mhyp.children.insert(insert_idx, prefs)
                     logger.debug("Added prefs MHOD to playlist %s", mhyp.fields.get("playlist_id"))
 
@@ -671,6 +679,51 @@ class Database:
                     mhlp.children.append(mirror)
                     logger.debug("Mirrored master playlist to MHSD type 3")
                 return
+
+    def _sync_type3_names(self) -> None:
+        """Sync playlist names from MHSD type 2 to type 3 mirrors.
+
+        When a playlist is renamed via playlist.name setter, only the type 2
+        MHYP is updated. This fixup copies the name MHOD from type 2 to the
+        matching type 3 MHYP at save time.
+        """
+        if not self._root:
+            return
+
+        from ..db.writer import make_string_mhod
+
+        # Build type 2 playlist_id -> name map
+        type2_names: dict = {}
+        for mhsd in self._root.children:
+            if mhsd.fields.get("mhsd_type") == 2 and mhsd.children:
+                for mhyp in mhsd.children[0].children:
+                    if mhyp.magic == MHYP_MAGIC:
+                        pid = mhyp.fields.get("playlist_id")
+                        name = mhyp.get_mhod(MHOD_ID_TITLE)
+                        if pid and name:
+                            type2_names[pid] = name
+
+        # Update type 3 names to match
+        for mhsd in self._root.children:
+            if mhsd.fields.get("mhsd_type") == 3 and mhsd.children:
+                for mhyp in mhsd.children[0].children:
+                    if mhyp.magic != MHYP_MAGIC:
+                        continue
+                    pid = mhyp.fields.get("playlist_id")
+                    expected_name = type2_names.get(pid)
+                    if not expected_name:
+                        continue
+                    current_name = mhyp.get_mhod(MHOD_ID_TITLE)
+                    if current_name != expected_name:
+                        # Replace name MHOD
+                        mhyp.children = [
+                            c
+                            for c in mhyp.children
+                            if not (
+                                c.magic == MHOD_MAGIC and c.fields.get("mhod_type") == MHOD_ID_TITLE
+                            )
+                        ]
+                        mhyp.children.insert(0, make_string_mhod(MHOD_ID_TITLE, expected_name))
 
     def _rebuild_type3_podcasts(self) -> None:
         """Rebuild podcast playlists in MHSD type 3 with hierarchical grouping.
@@ -1029,6 +1082,7 @@ class Database:
         self._upgrade_header_sizes()
         self._ensure_playlist_prefs()
         self._ensure_type3_mirror()
+        self._sync_type3_names()
         self._rebuild_type3_podcasts()
         self._rebuild_sort_indexes()
         if self._config.generate_album_list:
@@ -1601,6 +1655,20 @@ class Database:
                         pos = sum(1 for c in mhyp.children if c.magic == MHIP_MAGIC)
                         mhip = self._create_mhip(track_id, position=pos)
                         mhyp.children.append(mhip)
+                        return
+
+    def _unmirror_from_type3(self, playlist_id: int, track_id: int) -> None:
+        """Mirror a track removal to the MHSD type 3 playlist copy."""
+        for mhsd in self._root.children:
+            if mhsd.fields.get("mhsd_type") == 3 and mhsd.children:
+                mhlp = mhsd.children[0]
+                for mhyp in mhlp.children:
+                    if mhyp.fields.get("playlist_id") == playlist_id:
+                        mhyp.children = [
+                            c
+                            for c in mhyp.children
+                            if not (c.magic == MHIP_MAGIC and c.fields.get("track_id") == track_id)
+                        ]
                         return
 
     def _remove_from_all_playlists(self, track_id: int) -> None:

@@ -881,6 +881,11 @@ def _cmd_purge(args: argparse.Namespace) -> int:
             shutil.rmtree(target)
             target.mkdir(parents=True, exist_ok=True)
 
+    # Recreate F00-F49 music subdirectories
+    music_dir = ipod_control / "Music"
+    for i in range(50):
+        (music_dir / f"F{i:02d}").mkdir(exist_ok=True)
+
     print(f"All data purged from {mp}")
     print("Run 'pygpod init' to re-initialize the iPod.")
     return 0
@@ -899,7 +904,11 @@ def _cmd_fix_checksums(args: argparse.Namespace) -> int:
 def _cmd_discover(args: argparse.Namespace) -> int:
     from . import discover
 
-    results = discover()
+    try:
+        results = discover()
+    except Exception as e:
+        print(f"Error during discovery: {e}", file=sys.stderr)
+        return 1
 
     if not results:
         print("No iPods found.")

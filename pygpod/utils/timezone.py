@@ -273,7 +273,7 @@ def _validate_tz(offset: int) -> Optional[int]:
     Returns:
         Validated offset, or None if out of range (±12 hours).
     """
-    if abs(offset) > 43200:  # ±12 hours
+    if abs(offset) > 50400:  # ±14 hours
         return None
     return offset
 

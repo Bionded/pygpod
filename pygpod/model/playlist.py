@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import logging
 from typing import List, Optional
 
 from ..db.constants import MHIP_MAGIC, MHOD_ID_TITLE, MHOD_MAGIC
 from ..db.parser import Record
 from .track import Track
-
-logger = logging.getLogger(__name__)
 
 
 class Playlist:
@@ -116,7 +113,6 @@ class Playlist:
         return len(self.track_ids)
 
     def __repr__(self) -> str:
-        logger.debug("Playlist '%s': %d tracks", self.name, self.track_count)
         return f"<Playlist '{self.name}' ({self.track_count} tracks)>"
 
     def __str__(self) -> str:
