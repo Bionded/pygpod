@@ -197,12 +197,14 @@ def test_spl_prefs_roundtrip():
 
 
 def test_parse_play_counts_binary():
-    """Test parsing binary Play Counts file."""
+    """Test parsing binary Play Counts file with mhdp header."""
     from pygpod.db.playcounts import parse_play_counts
 
-    # Build a fake Play Counts file
-    header = struct.pack("<III", 16, 16, 2) + b"\x00" * 4
-    entry1 = struct.pack("<IIII", 5, 3819698947, 80, 1)  # 5 plays, rating 80
+    # Build with mhdp magic, entry_size=16 (play_count + time + bookmark + rating)
+    header_size = 96
+    header = b"mhdp" + struct.pack("<III", header_size, 16, 2)
+    header += b"\x00" * (header_size - 16)
+    entry1 = struct.pack("<IIII", 5, 3819698947, 0, 80)  # 5 plays, rating 80
     entry2 = struct.pack("<IIII", 0, 0, 0, 0)
 
     data = header + entry1 + entry2
@@ -211,7 +213,6 @@ def test_parse_play_counts_binary():
     assert len(entries) == 2
     assert entries[0].play_count == 5
     assert entries[0].rating == 80
-    assert entries[0].skip_count == 1
     assert entries[1].play_count == 0
 
 

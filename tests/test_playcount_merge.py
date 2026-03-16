@@ -5,19 +5,20 @@ import struct
 
 
 def _write_play_counts_file(itunes_dir, entries):
-    """Write a binary Play Counts file."""
+    """Write a binary Play Counts file with mhdp header."""
     entry_size = 28
-    header_size = 16
-    buf = struct.pack("<III", header_size, entry_size, len(entries))
-    buf += b"\x00" * (header_size - 12)
+    header_size = 96
+    buf = b"mhdp"
+    buf += struct.pack("<III", header_size, entry_size, len(entries))
+    buf += b"\x00" * (header_size - 16)
     for e in entries:
         entry = bytearray(entry_size)
         struct.pack_into("<I", entry, 0, e.get("play_count", 0))
         struct.pack_into("<I", entry, 4, e.get("time_played", 0))
-        struct.pack_into("<I", entry, 8, e.get("rating", 0))
-        struct.pack_into("<I", entry, 12, e.get("skip_count", 0))
-        struct.pack_into("<I", entry, 16, e.get("time_skipped", 0))
-        struct.pack_into("<I", entry, 24, e.get("bookmark_time", 0))
+        struct.pack_into("<I", entry, 8, e.get("bookmark_time", 0))
+        struct.pack_into("<I", entry, 12, e.get("rating", 0))
+        struct.pack_into("<I", entry, 20, e.get("skip_count", 0))
+        struct.pack_into("<I", entry, 24, e.get("time_skipped", 0))
         buf += bytes(entry)
     pc_path = os.path.join(itunes_dir, "Play Counts")
     with open(pc_path, "wb") as f:

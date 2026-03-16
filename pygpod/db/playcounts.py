@@ -38,21 +38,21 @@ class PlayCountEntry(NamedTuple):
 def parse_play_counts(data: bytes) -> List[PlayCountEntry]:
     """Parse a 'Play Counts' binary file.
 
-    Format:
-    - Header: 16 bytes
-      - 0x00: header size (32-bit LE)
-      - 0x04: entry size (32-bit LE)
-      - 0x08: num entries (32-bit LE)
-    - Entries: entry_size bytes each
+    Format (from libgpod itdb_itunesdb.c playcounts_read):
+    - Header starts with "mhdp" magic:
+      - 0x00: magic "mhdp" (4 bytes)
+      - 0x04: header_length (32-bit LE, typically 0x60 = 96)
+      - 0x08: entry_length (32-bit LE)
+      - 0x0C: num_entries (32-bit LE)
+    - Entries at offset header_length, entry_length bytes each:
       - 0x00: play_count (32-bit LE)
       - 0x04: time_played (32-bit LE, Mac timestamp)
-      - 0x08: rating (32-bit LE, 0-100 or 0 if unchanged)
-      (if entry_size >= 16:)
-      - 0x0C: skip_count (32-bit LE)
-      (if entry_size >= 20:)
-      - 0x10: time_skipped (32-bit LE)
-      (if entry_size >= 28:)
-      - 0x18: bookmark_time (32-bit LE)
+      - 0x08: bookmark_time (32-bit LE)
+      (if entry_length >= 0x10:)
+      - 0x0C: rating (32-bit LE, 0-100 or 0 if unchanged)
+      (if entry_length >= 0x1C:)
+      - 0x14: skip_count (32-bit LE)
+      - 0x18: time_skipped (32-bit LE, Mac timestamp)
 
     Args:
         data: Raw bytes of the Play Counts file.
@@ -60,14 +60,22 @@ def parse_play_counts(data: bytes) -> List[PlayCountEntry]:
     Returns:
         List of PlayCountEntry, one per track (indexed by track position).
     """
-    if len(data) < 12:
+    if len(data) < 16:
         return []
 
-    header_size = struct.unpack_from("<I", data, 0)[0]
-    entry_size = struct.unpack_from("<I", data, 4)[0]
-    num_entries = struct.unpack_from("<I", data, 8)[0]
+    # Check for mhdp magic header
+    magic = data[0:4]
+    if magic in (b"mhdp", b"pdhm"):
+        header_size = struct.unpack_from("<I", data, 4)[0]
+        entry_size = struct.unpack_from("<I", data, 8)[0]
+        num_entries = struct.unpack_from("<I", data, 12)[0]
+    else:
+        # Legacy format without magic
+        header_size = struct.unpack_from("<I", data, 0)[0]
+        entry_size = struct.unpack_from("<I", data, 4)[0]
+        num_entries = struct.unpack_from("<I", data, 8)[0]
 
-    if entry_size == 0:
+    if entry_size == 0 or header_size == 0:
         return []
 
     entries = []
@@ -78,10 +86,10 @@ def parse_play_counts(data: bytes) -> List[PlayCountEntry]:
 
         play_count = struct.unpack_from("<I", data, offset)[0]
         time_played = struct.unpack_from("<I", data, offset + 4)[0] if entry_size >= 8 else 0
-        rating = struct.unpack_from("<I", data, offset + 8)[0] if entry_size >= 12 else 0
-        skip_count = struct.unpack_from("<I", data, offset + 12)[0] if entry_size >= 16 else 0
-        time_skipped = struct.unpack_from("<I", data, offset + 16)[0] if entry_size >= 20 else 0
-        bookmark_time = struct.unpack_from("<I", data, offset + 24)[0] if entry_size >= 28 else 0
+        bookmark_time = struct.unpack_from("<I", data, offset + 8)[0] if entry_size >= 12 else 0
+        rating = struct.unpack_from("<I", data, offset + 12)[0] if entry_size >= 16 else 0
+        skip_count = struct.unpack_from("<I", data, offset + 20)[0] if entry_size >= 28 else 0
+        time_skipped = struct.unpack_from("<I", data, offset + 24)[0] if entry_size >= 28 else 0
 
         # Rating of 0 means unchanged (not "0 stars")
         r = rating if rating > 0 else -1
