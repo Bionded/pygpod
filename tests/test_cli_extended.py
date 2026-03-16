@@ -1,7 +1,6 @@
 """Extended CLI tests — discover, init, track info, filters, error paths."""
 
 import os
-import shutil
 
 import pytest
 
@@ -13,6 +12,7 @@ def mp(writable_ipod):
 
 def _main(argv):
     from pygpod.cli import main
+
     return main(argv)
 
 
@@ -70,6 +70,7 @@ class TestInit:
 class TestTrackInfo:
     def test_track_info(self, mp, capsys):
         from pygpod.model.database import Database
+
         db = Database(mp)
         if not db.tracks:
             pytest.skip("No tracks")
@@ -92,11 +93,11 @@ class TestTrackInfo:
 
     def test_track_info_podcast_fields(self, mp, generated_mp3, capsys):
         """Track info shows podcast-specific fields."""
-        _main(["-m", mp, "tr", "add", generated_mp3, "--type", "podcast",
-               "--category", "Tech"])
+        _main(["-m", mp, "tr", "add", generated_mp3, "--type", "podcast", "--category", "Tech"])
         capsys.readouterr()
 
         from pygpod.model.database import Database
+
         db = Database(mp)
         pod = [t for t in db.tracks if t.is_podcast]
         if not pod:
@@ -149,6 +150,7 @@ class TestTrackListFilters:
 class TestTrackExport:
     def test_export(self, mp, tmp_path, capsys):
         from pygpod.model.database import Database
+
         db = Database(mp)
         if not db.tracks:
             pytest.skip("No tracks")
@@ -173,6 +175,7 @@ class TestTrackExport:
 class TestPlaylistCommands:
     def test_playlist_remove_track(self, mp, capsys):
         from pygpod.model.database import Database
+
         db = Database(mp)
         pls = [p for p in db.playlists if not p.is_master and p.track_count > 0]
         if not pls:
@@ -282,16 +285,19 @@ class TestUnknownCommand:
 class TestMediaTypeName:
     def test_known_types(self):
         from pygpod.cli import _media_type_name
+
         assert _media_type_name(0x0001) == "audio"
         assert _media_type_name(0x0002) == "video"
         assert _media_type_name(0x0004) == "podcast"
 
     def test_combined_type(self):
         from pygpod.cli import _media_type_name
+
         name = _media_type_name(0x0006)  # VIDEO | PODCAST
         assert "video" in name
         assert "podcast" in name
 
     def test_unknown_type(self):
         from pygpod.cli import _media_type_name
+
         assert _media_type_name(0) == "audio"

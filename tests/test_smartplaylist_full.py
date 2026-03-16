@@ -1,7 +1,5 @@
 """Comprehensive smart playlist tests - rule evaluation, limits, binary format."""
 
-
-
 from pygpod.model.smartplaylist import (
     SPLAction,
     SPLField,
@@ -71,20 +69,35 @@ class MockTrack:
 # Field type lookup
 # ============================================================================
 class TestFieldTypes:
-
     def test_string_fields(self):
-        for f in [SPLField.SONG_NAME, SPLField.ALBUM, SPLField.ARTIST,
-                  SPLField.GENRE, SPLField.COMMENT, SPLField.COMPOSER]:
+        for f in [
+            SPLField.SONG_NAME,
+            SPLField.ALBUM,
+            SPLField.ARTIST,
+            SPLField.GENRE,
+            SPLField.COMMENT,
+            SPLField.COMPOSER,
+        ]:
             assert get_field_type(f) == SPLFieldType.STRING
 
     def test_int_fields(self):
-        for f in [SPLField.BITRATE, SPLField.YEAR, SPLField.RATING,
-                  SPLField.PLAYCOUNT, SPLField.SIZE, SPLField.TIME]:
+        for f in [
+            SPLField.BITRATE,
+            SPLField.YEAR,
+            SPLField.RATING,
+            SPLField.PLAYCOUNT,
+            SPLField.SIZE,
+            SPLField.TIME,
+        ]:
             assert get_field_type(f) == SPLFieldType.INT
 
     def test_date_fields(self):
-        for f in [SPLField.DATE_MODIFIED, SPLField.DATE_ADDED,
-                  SPLField.LAST_PLAYED, SPLField.LAST_SKIPPED]:
+        for f in [
+            SPLField.DATE_MODIFIED,
+            SPLField.DATE_ADDED,
+            SPLField.LAST_PLAYED,
+            SPLField.LAST_SKIPPED,
+        ]:
             assert get_field_type(f) == SPLFieldType.DATE
 
     def test_boolean_fields(self):
@@ -102,7 +115,6 @@ class TestFieldTypes:
 # String rule evaluation
 # ============================================================================
 class TestStringRules:
-
     def test_is_string(self):
         track = MockTrack(artist="Beatles")
         rule = SPLRule(field=SPLField.ARTIST, action=SPLAction.IS_STRING, string="Beatles")
@@ -153,7 +165,6 @@ class TestStringRules:
 # Integer rule evaluation
 # ============================================================================
 class TestIntRules:
-
     def test_is_int(self):
         track = MockTrack(year=2020)
         rule = SPLRule(field=SPLField.YEAR, action=SPLAction.IS_INT, fromvalue=2020)
@@ -186,14 +197,16 @@ class TestIntRules:
 
     def test_in_range(self):
         track = MockTrack(year=2015)
-        rule = SPLRule(field=SPLField.YEAR, action=SPLAction.IS_IN_THE_RANGE,
-                       fromvalue=2010, tovalue=2020)
+        rule = SPLRule(
+            field=SPLField.YEAR, action=SPLAction.IS_IN_THE_RANGE, fromvalue=2010, tovalue=2020
+        )
         assert eval_rule(rule, track)
 
     def test_not_in_range(self):
         track = MockTrack(year=2005)
-        rule = SPLRule(field=SPLField.YEAR, action=SPLAction.IS_NOT_IN_THE_RANGE,
-                       fromvalue=2010, tovalue=2020)
+        rule = SPLRule(
+            field=SPLField.YEAR, action=SPLAction.IS_NOT_IN_THE_RANGE, fromvalue=2010, tovalue=2020
+        )
         assert eval_rule(rule, track)
 
 
@@ -201,7 +214,6 @@ class TestIntRules:
 # Boolean rule evaluation
 # ============================================================================
 class TestBooleanRules:
-
     def test_is_compilation(self):
         track = MockTrack(rating=1)  # compilation is mapped to rating?
         # Actually, compilation maps to a record field
@@ -215,7 +227,6 @@ class TestBooleanRules:
 # Playlist evaluation (AND/OR)
 # ============================================================================
 class TestPlaylistEval:
-
     def test_and_match(self):
         track = MockTrack(artist="Beatles", year=1969)
         rules = [
@@ -273,10 +284,10 @@ class TestPlaylistEval:
 # Limits
 # ============================================================================
 class TestLimits:
-
     def _make_tracks(self, n):
-        return [MockTrack(title=f"Track {i}", duration_ms=180000, file_size=5_000_000)
-                for i in range(n)]
+        return [
+            MockTrack(title=f"Track {i}", duration_ms=180000, file_size=5_000_000) for i in range(n)
+        ]
 
     def test_limit_songs(self):
         prefs = SPLPrefs()
@@ -310,7 +321,6 @@ class TestLimits:
 # SPL binary format round-trip
 # ============================================================================
 class TestSPLBinaryFormat:
-
     def test_write_and_parse_rules(self):
         rules = [
             SPLRule(field=SPLField.ARTIST, action=SPLAction.IS_STRING, string="Beatles"),

@@ -13,6 +13,7 @@ def mp(writable_ipod):
 
 def _main(argv):
     from pygpod.cli import main
+
     return main(argv)
 
 
@@ -20,7 +21,6 @@ def _main(argv):
 # info command
 # ============================================================================
 class TestInfoCommand:
-
     def test_info_shows_device(self, mp, capsys):
         assert _main(["-m", mp, "info"]) == 0
         out = capsys.readouterr().out
@@ -54,7 +54,6 @@ class TestInfoCommand:
 # track commands
 # ============================================================================
 class TestTrackList:
-
     def test_track_list(self, mp, capsys):
         assert _main(["-m", mp, "track", "list"]) == 0
         out = capsys.readouterr().out
@@ -77,7 +76,6 @@ class TestTrackList:
 
 
 class TestTrackAdd:
-
     def test_track_add(self, mp, generated_mp3, capsys):
         assert _main(["-m", mp, "tr", "add", generated_mp3]) == 0
         out = capsys.readouterr().out
@@ -95,7 +93,6 @@ class TestTrackAdd:
 
 
 class TestTrackRemove:
-
     def test_track_remove_not_found(self, mp, capsys):
         assert _main(["-m", mp, "tr", "rm", "99999"]) == 1
         err = capsys.readouterr().err
@@ -112,6 +109,7 @@ class TestTrackRemove:
 
         # Find any track ID in the listing
         from pygpod.model.database import Database
+
         db = Database(mp)
         tid = db.tracks[0].track_id
 
@@ -122,7 +120,6 @@ class TestTrackRemove:
 
 
 class TestTrackExport:
-
     def test_export_not_found(self, mp, tmp_path):
         dest = str(tmp_path / "out.mp3")
         assert _main(["-m", mp, "track", "export", "99999", dest]) == 1
@@ -132,7 +129,6 @@ class TestTrackExport:
 # playlist commands
 # ============================================================================
 class TestPlaylistList:
-
     def test_playlist_list(self, mp, capsys):
         assert _main(["-m", mp, "pl", "ls"]) == 0
         out = capsys.readouterr().out
@@ -151,7 +147,6 @@ class TestPlaylistList:
 
 
 class TestPlaylistCreate:
-
     def test_playlist_create(self, mp, capsys):
         assert _main(["-m", mp, "pl", "create", "Test PL"]) == 0
         out = capsys.readouterr().out
@@ -164,7 +159,6 @@ class TestPlaylistCreate:
 
 
 class TestPlaylistAdd:
-
     def test_playlist_add_not_found_playlist(self, mp, capsys):
         assert _main(["-m", mp, "pl", "add", "NoSuchPlaylist", "52"]) == 1
         err = capsys.readouterr().err
@@ -187,6 +181,7 @@ class TestPlaylistAdd:
 
         # Get track ID
         from pygpod.model.database import Database
+
         db = Database(mp)
         tid = db.tracks[0].track_id
 
@@ -201,7 +196,6 @@ class TestPlaylistAdd:
 
 
 class TestPlaylistRemove:
-
     def test_playlist_remove_not_found_playlist(self, mp, capsys):
         assert _main(["-m", mp, "pl", "rm", "NoSuch", "52"]) == 1
         err = capsys.readouterr().err
@@ -219,7 +213,6 @@ class TestPlaylistRemove:
 # dump command
 # ============================================================================
 class TestDumpCommand:
-
     def test_dump(self, mp, capsys):
         assert _main(["-m", mp, "dump"]) == 0
         out = capsys.readouterr().out
@@ -236,7 +229,6 @@ class TestDumpCommand:
 # init command
 # ============================================================================
 class TestInitCommand:
-
     def test_init(self, tmp_path, capsys):
         new_ipod = str(tmp_path / "new_ipod")
         os.makedirs(new_ipod)
@@ -267,7 +259,6 @@ class TestInitCommand:
 # fix-checksums command
 # ============================================================================
 class TestFixChecksums:
-
     def test_fix_checksums(self, mp, capsys):
         assert _main(["-m", mp, "fix-checksums"]) == 0
         out = capsys.readouterr().out
@@ -278,7 +269,6 @@ class TestFixChecksums:
 # purge command
 # ============================================================================
 class TestPurgeCommand:
-
     def test_purge_invalid_mountpoint(self, capsys):
         assert _main(["-m", "/nonexistent", "purge", "--yes"]) == 1
 
@@ -297,7 +287,6 @@ class TestPurgeCommand:
 # discover command
 # ============================================================================
 class TestDiscoverCommand:
-
     def test_discover(self, capsys):
         # Just verify it runs without error
         result = _main(["discover"])
@@ -308,7 +297,6 @@ class TestDiscoverCommand:
 # mountpoint resolution
 # ============================================================================
 class TestMountpoint:
-
     def test_env_var_fallback(self, mp, monkeypatch, capsys):
         monkeypatch.setenv("PYGPOD_MOUNTPOINT", mp)
         assert _main(["info"]) == 0
@@ -330,9 +318,9 @@ class TestMountpoint:
 # track info command
 # ============================================================================
 class TestTrackInfo:
-
     def test_track_info(self, mp, capsys):
         from pygpod.model.database import Database
+
         db = Database(mp)
         tid = db.tracks[0].track_id
         assert _main(["-m", mp, "tr", "info", str(tid)]) == 0
@@ -353,21 +341,35 @@ class TestTrackInfo:
 # track add with metadata overrides
 # ============================================================================
 class TestTrackAddOverrides:
-
     def test_track_add_with_tags(self, mp, generated_mp3, capsys):
-        assert _main([
-            "-m", mp, "tr", "add", generated_mp3,
-            "--title", "My Title",
-            "--artist", "My Artist",
-            "--album", "My Album",
-            "--genre", "Rock",
-            "--year", "2025",
-        ]) == 0
+        assert (
+            _main(
+                [
+                    "-m",
+                    mp,
+                    "tr",
+                    "add",
+                    generated_mp3,
+                    "--title",
+                    "My Title",
+                    "--artist",
+                    "My Artist",
+                    "--album",
+                    "My Album",
+                    "--genre",
+                    "Rock",
+                    "--year",
+                    "2025",
+                ]
+            )
+            == 0
+        )
         out = capsys.readouterr().out
         assert "Added" in out
 
         # Verify tags were applied
         from pygpod.model.database import Database
+
         db = Database(mp)
         track = db.tracks[-1]
         assert track.title == "My Title"
@@ -377,17 +379,31 @@ class TestTrackAddOverrides:
         assert track.year == 2025
 
     def test_track_add_as_podcast(self, mp, generated_mp3, capsys):
-        assert _main([
-            "-m", mp, "tr", "add", generated_mp3,
-            "--type", "podcast",
-            "--title", "Episode 1",
-            "--category", "News",
-            "--description", "A test episode",
-        ]) == 0
+        assert (
+            _main(
+                [
+                    "-m",
+                    mp,
+                    "tr",
+                    "add",
+                    generated_mp3,
+                    "--type",
+                    "podcast",
+                    "--title",
+                    "Episode 1",
+                    "--category",
+                    "News",
+                    "--description",
+                    "A test episode",
+                ]
+            )
+            == 0
+        )
         out = capsys.readouterr().out
         assert "[podcast]" in out
 
         from pygpod.model.database import Database
+
         db = Database(mp)
         track = db.tracks[-1]
         assert track.is_podcast
@@ -396,17 +412,31 @@ class TestTrackAddOverrides:
         assert track.description == "A test episode"
 
     def test_track_add_as_video(self, mp, generated_mp3, capsys):
-        assert _main([
-            "-m", mp, "tr", "add", generated_mp3,
-            "--type", "tvshow",
-            "--tvshow", "My Show",
-            "--season-number", "2",
-            "--episode-number", "5",
-        ]) == 0
+        assert (
+            _main(
+                [
+                    "-m",
+                    mp,
+                    "tr",
+                    "add",
+                    generated_mp3,
+                    "--type",
+                    "tvshow",
+                    "--tvshow",
+                    "My Show",
+                    "--season-number",
+                    "2",
+                    "--episode-number",
+                    "5",
+                ]
+            )
+            == 0
+        )
         out = capsys.readouterr().out
         assert "[tvshow]" in out
 
         from pygpod.model.database import Database
+
         db = Database(mp)
         track = db.tracks[-1]
         assert track.tvshow == "My Show"
@@ -418,7 +448,6 @@ class TestTrackAddOverrides:
 # track list filtering
 # ============================================================================
 class TestTrackListFilter:
-
     def test_track_list_filter_genre(self, mp, generated_mp3, capsys):
         # Add a track with specific genre
         _main(["-m", mp, "tr", "add", generated_mp3, "--genre", "Jazz"])
@@ -443,7 +472,6 @@ class TestTrackListFilter:
 # podcast playlist
 # ============================================================================
 class TestPodcastPlaylist:
-
     def test_create_podcast_playlist(self, mp, capsys):
         assert _main(["-m", mp, "pl", "create", "My Podcast", "--podcast"]) == 0
         out = capsys.readouterr().out
@@ -467,7 +495,6 @@ class TestPodcastPlaylist:
 # playlist delete
 # ============================================================================
 class TestPlaylistDelete:
-
     def test_playlist_delete(self, mp, capsys):
         _main(["-m", mp, "pl", "create", "ToDelete"])
         capsys.readouterr()
@@ -486,18 +513,30 @@ class TestPlaylistDelete:
 # auto podcast playlist
 # ============================================================================
 class TestAutoPodcastPlaylist:
-
     def test_podcast_auto_creates_playlist(self, mp, generated_mp3, capsys):
         """Adding a podcast track auto-creates the Podcasts playlist."""
-        assert _main([
-            "-m", mp, "tr", "add", generated_mp3,
-            "--type", "podcast", "--category", "Tech News",
-        ]) == 0
+        assert (
+            _main(
+                [
+                    "-m",
+                    mp,
+                    "tr",
+                    "add",
+                    generated_mp3,
+                    "--type",
+                    "podcast",
+                    "--category",
+                    "Tech News",
+                ]
+            )
+            == 0
+        )
         out = capsys.readouterr().out
         assert "Podcasts playlist" in out
 
         # Verify Podcasts playlist exists and has the track
         from pygpod.model.database import Database
+
         db = Database(mp)
         pl = None
         for p in db.playlists:
@@ -510,26 +549,57 @@ class TestAutoPodcastPlaylist:
     def test_podcast_auto_adds_to_existing(self, mp, generated_mp3, capsys):
         """Second podcast track reuses existing Podcasts playlist."""
         # First track creates the playlist
-        _main([
-            "-m", mp, "tr", "add", generated_mp3,
-            "--type", "podcast", "--category", "Science",
-        ])
+        _main(
+            [
+                "-m",
+                mp,
+                "tr",
+                "add",
+                generated_mp3,
+                "--type",
+                "podcast",
+                "--category",
+                "Science",
+            ]
+        )
         capsys.readouterr()
 
         # Second track should add to existing Podcasts playlist
-        assert _main([
-            "-m", mp, "tr", "add", generated_mp3,
-            "--type", "podcast", "--category", "Science",
-        ]) == 0
+        assert (
+            _main(
+                [
+                    "-m",
+                    mp,
+                    "tr",
+                    "add",
+                    generated_mp3,
+                    "--type",
+                    "podcast",
+                    "--category",
+                    "Science",
+                ]
+            )
+            == 0
+        )
         out = capsys.readouterr().out
         assert "Added to Podcasts playlist" in out
         assert "Created Podcasts playlist" not in out
 
     def test_podcast_default_playlist_name(self, mp, generated_mp3, capsys):
         """Podcast without category uses 'Podcasts' as default playlist name."""
-        assert _main([
-            "-m", mp, "tr", "add", generated_mp3,
-            "--type", "podcast",
-        ]) == 0
+        assert (
+            _main(
+                [
+                    "-m",
+                    mp,
+                    "tr",
+                    "add",
+                    generated_mp3,
+                    "--type",
+                    "podcast",
+                ]
+            )
+            == 0
+        )
         out = capsys.readouterr().out
         assert "Added to Podcasts playlist" in out

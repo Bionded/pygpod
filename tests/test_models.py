@@ -8,12 +8,10 @@ from pygpod.device.models import (
     HASH72_GENERATIONS,
     HASHAB_GENERATIONS,
     IPOD_INFO_TABLE,
-    PODCAST_GENERATIONS,
     SHUFFLE_GENERATIONS,
     VIDEO_GENERATIONS,
     ChecksumType,
     IpodGeneration,
-    IpodInfo,
     get_checksum_type,
     get_db_version,
     get_generation_name,
@@ -21,7 +19,6 @@ from pygpod.device.models import (
     lookup_model,
     lookup_model_by_serial,
 )
-
 
 # =========================================================================
 # lookup_model
@@ -128,19 +125,24 @@ class TestChecksumType:
         assert get_checksum_type(gen) == expected
 
     def test_sysinfo_db_version_none(self):
-        assert get_checksum_type(IpodGeneration.CLASSIC_1, sysinfo_db_version=None) == ChecksumType.HASH58
+        ct = get_checksum_type(IpodGeneration.CLASSIC_1, sysinfo_db_version=None)
+        assert ct == ChecksumType.HASH58
 
     def test_sysinfo_db_version_0(self):
-        assert get_checksum_type(IpodGeneration.CLASSIC_1, sysinfo_db_version=0) == ChecksumType.NONE
+        ct = get_checksum_type(IpodGeneration.CLASSIC_1, sysinfo_db_version=0)
+        assert ct == ChecksumType.NONE
 
     def test_sysinfo_db_version_2(self):
-        assert get_checksum_type(IpodGeneration.CLASSIC_1, sysinfo_db_version=2) == ChecksumType.NONE
+        ct = get_checksum_type(IpodGeneration.CLASSIC_1, sysinfo_db_version=2)
+        assert ct == ChecksumType.NONE
 
     def test_sysinfo_db_version_3(self):
-        assert get_checksum_type(IpodGeneration.CLASSIC_1, sysinfo_db_version=3) == ChecksumType.HASH58
+        ct = get_checksum_type(IpodGeneration.CLASSIC_1, sysinfo_db_version=3)
+        assert ct == ChecksumType.HASH58
 
     def test_sysinfo_db_version_4(self):
-        assert get_checksum_type(IpodGeneration.CLASSIC_1, sysinfo_db_version=4) == ChecksumType.HASH72
+        ct = get_checksum_type(IpodGeneration.CLASSIC_1, sysinfo_db_version=4)
+        assert ct == ChecksumType.HASH72
 
     def test_sysinfo_db_version_5(self):
         assert get_checksum_type(IpodGeneration.FIRST, sysinfo_db_version=5) == ChecksumType.HASH72
@@ -277,9 +279,7 @@ class TestUSBProductLookup:
         # VIDEO_1 and VIDEO_2 share same capacities (30/60/80 GB)
         info = lookup_by_usb_product_id(0x1209, capacity_gb=30)
         # Both generations have 30GB models, so still ambiguous
-        assert info is None or info.generation in (
-            IpodGeneration.VIDEO_1, IpodGeneration.VIDEO_2
-        )
+        assert info is None or info.generation in (IpodGeneration.VIDEO_1, IpodGeneration.VIDEO_2)
 
     def test_shuffle_usb(self):
         info = lookup_by_usb_product_id(0x1300)

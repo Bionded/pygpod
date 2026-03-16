@@ -129,7 +129,7 @@ def _build_empty_itunesdb() -> bytes:
         put32lint(mhod_body, 4, len(name_bytes))  # string length
         put32lint(mhod_body, 8, 1)  # unk1
         put32lint(mhod_body, 12, 0)  # unk2
-        mhod_body[16:16 + len(name_bytes)] = name_bytes
+        mhod_body[16 : 16 + len(name_bytes)] = name_bytes
         mhod_total = mhod_header_len + len(mhod_body)
 
         mhod = bytearray(mhod_header_len)
@@ -142,6 +142,7 @@ def _build_empty_itunesdb() -> bytes:
     def _make_mhyp(pid: int, is_master: bool, mhod_data: bytes, num_mhods: int) -> bytes:
         """Create MHYP record."""
         import time
+
         # Mac epoch timestamp (seconds since 1904-01-01)
         mac_epoch_offset = 2082844800
         timestamp = int(time.time()) + mac_epoch_offset

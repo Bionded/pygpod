@@ -20,29 +20,55 @@ class TestTrackInfoAllOptionalFields:
     def test_track_info_with_all_optional_fields(self, mp, generated_mp3, capsys):
         """Track info displays all optional metadata fields when present."""
         # Add a track with every optional field populated
-        _main([
-            "-m", mp, "tr", "add", generated_mp3,
-            "--title", "Full Track",
-            "--artist", "Test Artist",
-            "--album", "Test Album",
-            "--albumartist", "Album Artist Name",
-            "--composer", "Composer Name",
-            "--comment", "A test comment",
-            "--grouping", "Grouping Value",
-            "--genre", "TestGenre",
-            "--year", "2024",
-            "--track-number", "3",
-            "--total-tracks", "12",
-            "--cd-number", "2",
-            "--total-cds", "3",
-            "--type", "podcast",
-            "--category", "Tech",
-            "--description", "Episode description here",
-            "--subtitle", "Episode subtitle",
-            "--keywords", "python,ipod,test",
-            "--podcast-url", "https://example.com/ep1.mp3",
-            "--podcast-rss", "https://example.com/feed.xml",
-        ])
+        _main(
+            [
+                "-m",
+                mp,
+                "tr",
+                "add",
+                generated_mp3,
+                "--title",
+                "Full Track",
+                "--artist",
+                "Test Artist",
+                "--album",
+                "Test Album",
+                "--albumartist",
+                "Album Artist Name",
+                "--composer",
+                "Composer Name",
+                "--comment",
+                "A test comment",
+                "--grouping",
+                "Grouping Value",
+                "--genre",
+                "TestGenre",
+                "--year",
+                "2024",
+                "--track-number",
+                "3",
+                "--total-tracks",
+                "12",
+                "--cd-number",
+                "2",
+                "--total-cds",
+                "3",
+                "--type",
+                "podcast",
+                "--category",
+                "Tech",
+                "--description",
+                "Episode description here",
+                "--subtitle",
+                "Episode subtitle",
+                "--keywords",
+                "python,ipod,test",
+                "--podcast-url",
+                "https://example.com/ep1.mp3",
+                "--podcast-rss",
+                "https://example.com/feed.xml",
+            ]
+        )
         capsys.readouterr()
 
         from pygpod.model.database import Database
@@ -88,16 +114,29 @@ class TestTrackInfoAllOptionalFields:
 
     def test_track_info_tvshow_fields(self, mp, generated_mp3, capsys):
         """Track info displays TV show-specific fields."""
-        _main([
-            "-m", mp, "tr", "add", generated_mp3,
-            "--title", "TV Episode",
-            "--type", "tvshow",
-            "--tvshow", "Breaking Bad",
-            "--tvepisode", "S01E01",
-            "--tvnetwork", "AMC",
-            "--season-number", "1",
-            "--episode-number", "1",
-        ])
+        _main(
+            [
+                "-m",
+                mp,
+                "tr",
+                "add",
+                generated_mp3,
+                "--title",
+                "TV Episode",
+                "--type",
+                "tvshow",
+                "--tvshow",
+                "Breaking Bad",
+                "--tvepisode",
+                "S01E01",
+                "--tvnetwork",
+                "AMC",
+                "--season-number",
+                "1",
+                "--episode-number",
+                "1",
+            ]
+        )
         capsys.readouterr()
 
         from pygpod.model.database import Database

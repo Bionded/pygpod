@@ -455,7 +455,6 @@ class TestSetterRoundTrip:
             pytest.skip("No tracks in fixture")
 
         track = db.tracks[0]
-        original_title = track.title
 
         track.title = "Modified Title"
         track.artist = "Modified Artist"

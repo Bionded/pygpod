@@ -578,8 +578,6 @@ def _parse_mhia(data: bytes, offset: int) -> Record:
         f["album_id"] = get32lint(data, offset + 0x10)
 
     # Parse child MHODs
-    _parse_mhod_children(
-        data, rec, offset + header_len, offset + total_len, f.get("num_mhods", 0)
-    )
+    _parse_mhod_children(data, rec, offset + header_len, offset + total_len, f.get("num_mhods", 0))
 
     return rec

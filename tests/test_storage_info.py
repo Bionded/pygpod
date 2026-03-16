@@ -1,7 +1,5 @@
 """Tests for Device.storage_info() and StorageInfo."""
 
-import os
-
 import pytest
 
 from pygpod.device.device import Device, StorageInfo, _dir_size, _file_size, _fmt_size
@@ -18,7 +16,7 @@ class TestFmtSize:
         assert "MB" in _fmt_size(5 * 1024 * 1024)
 
     def test_gb(self):
-        assert "GB" in _fmt_size(2 * 1024 ** 3)
+        assert "GB" in _fmt_size(2 * 1024**3)
 
     def test_zero(self):
         assert _fmt_size(0) == "0 B"
@@ -52,7 +50,7 @@ class TestDirSize:
 
 class TestStorageInfo:
     def test_repr(self):
-        si = StorageInfo(total=80 * 1024 ** 3, used=40 * 1024 ** 3, free=40 * 1024 ** 3)
+        si = StorageInfo(total=80 * 1024**3, used=40 * 1024**3, free=40 * 1024**3)
         r = repr(si)
         assert "80.0 GB" in r
         assert "40.0 GB" in r
@@ -157,6 +155,7 @@ class TestDeviceStorageInfo:
 
     def test_no_mountpoint_raises(self):
         from pygpod.exceptions import DeviceError
+
         dev = Device(mountpoint=None)
         with pytest.raises(DeviceError):
             dev.storage_info()

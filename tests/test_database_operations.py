@@ -1,6 +1,5 @@
 """Tests for Database model - playlist operations, save cycle, round-trip."""
 
-
 import pytest
 
 

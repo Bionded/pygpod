@@ -19,7 +19,6 @@ def test_default_config():
     assert cfg.set_time_fields_zero is False
 
 
-
 def test_deterministic_seed():
     cfg = DatabaseConfig(random_seed=42)
     assert cfg.random_seed == 42

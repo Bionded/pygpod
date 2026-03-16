@@ -188,7 +188,12 @@ class ArtworkThumbnail:
                 f.seek(self.image_offset)
                 return f.read(self.image_size)
         except (OSError, IOError):
-            logger.debug("Failed to read ithmb file %s at offset %d", filepath, self.image_offset, exc_info=True)
+            logger.debug(
+                "Failed to read ithmb file %s at offset %d",
+                filepath,
+                self.image_offset,
+                exc_info=True,
+            )
             return None
 
     def to_artwork(self, artwork_dir: str) -> Optional[Artwork]:

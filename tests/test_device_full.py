@@ -4,9 +4,6 @@ import os
 import pathlib
 import plistlib
 from types import SimpleNamespace
-from unittest import mock
-
-import pytest
 
 from pygpod.device.device import Device
 from pygpod.device.models import (
@@ -21,7 +18,6 @@ from pygpod.device.models import (
     IpodModel,
 )
 from pygpod.model.sysinfo import SysInfo
-
 
 # =========================================================================
 # Helpers
@@ -52,13 +48,15 @@ def _make_ipod_fs(tmp_path, model="B029", guid="000A2700131A2BFC", serial=None, 
 
     # Write minimal iTunesDB
     from pygpod.device.mountpoint import init_ipod
+
     init_ipod(str(ipod))
 
     return str(ipod)
 
 
-def _make_usb_info(product_id=0x1261, serial="8K74729BY5N",
-                   firewire_guid="000A2700131A2BFC", capacity_gb=80):
+def _make_usb_info(
+    product_id=0x1261, serial="8K74729BY5N", firewire_guid="000A2700131A2BFC", capacity_gb=80
+):
     return SimpleNamespace(
         product_id=product_id,
         serial=serial,
@@ -105,6 +103,7 @@ class TestFromMountpoint:
         (ipod / "iPod_Control" / "iTunes").mkdir(parents=True)
         (ipod / "iPod_Control" / "Device").mkdir(parents=True)
         from pygpod.device.mountpoint import init_ipod
+
         init_ipod(str(ipod))
         dev = Device.from_mountpoint(str(ipod))
         assert dev.is_unknown
@@ -119,19 +118,24 @@ class TestFromMountpoint:
         # Serial ending in "Y5N" — might match a model via lookup_model_by_serial
         (dev_dir / "SysInfo").write_text("SerialNumber: XXXXXXXXXXY5N\n")
         from pygpod.device.mountpoint import init_ipod
+
         init_ipod(str(ipod))
         dev = Device.from_mountpoint(str(ipod))
         # May or may not find a match depending on serial table
         assert isinstance(dev, Device)
 
     def test_with_sysinfo_extended(self, tmp_path):
-        mp = _make_ipod_fs(tmp_path, model="B029", extended={
-            "FireWireGUID": 0x000A2700131A2BFC,
-            "SerialNumber": "8K74729BY5N",
-            "ProductType": "iPod5,1",
-            "FamilyID": 10001,
-            "DatabaseVersion": 3,
-        })
+        mp = _make_ipod_fs(
+            tmp_path,
+            model="B029",
+            extended={
+                "FireWireGUID": 0x000A2700131A2BFC,
+                "SerialNumber": "8K74729BY5N",
+                "ProductType": "iPod5,1",
+                "FamilyID": 10001,
+                "DatabaseVersion": 3,
+            },
+        )
         dev = Device.from_mountpoint(mp)
         assert dev.generation == IpodGeneration.CLASSIC_1
         assert dev.checksum_type == ChecksumType.HASH58
@@ -274,6 +278,7 @@ class TestWriteSysInfo:
         (ipod / "iPod_Control" / "iTunes").mkdir()
         (dev_dir / "SysInfo").write_text("FirewireGuid: 0xABCD\n")
         from pygpod.device.mountpoint import init_ipod
+
         init_ipod(str(ipod))
 
         from pygpod.model.sysinfo import read_sysinfo as _read_si

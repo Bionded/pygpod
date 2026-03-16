@@ -272,7 +272,7 @@ class TestParseArtworkDB:
 
     def test_mhni_fields(self):
         mhni = _make_mhni(format_id=1060, offset=204800, size=204800, width=320, height=320)
-        wrapper = _make_mhod_wrapper(mhni)
+        _make_mhod_wrapper(mhni)
         mhii_data = _make_mhii(image_id=1, song_id=1, mhni_list=[_make_mhni()])
         root = parse_artworkdb(_make_artworkdb([_make_mhsd(1, _make_mhli([mhii_data]))]))
 
@@ -425,7 +425,7 @@ class TestParseEdgeCases:
         put32lint(header, 0x10, 1060)
         mhni_data = bytes(header)
 
-        mhii_data = _make_mhii(image_id=1, song_id=1, mhni_list=[])
+        _make_mhii(image_id=1, song_id=1, mhni_list=[])
         # Manually replace MHII body with bare MHNI
         mhii_hdr = bytearray(152)
         mhii_hdr[0:4] = MHII_MAGIC

@@ -2,8 +2,6 @@
 
 import datetime
 
-import pytest
-
 from pygpod.utils.datetime import MAC_EPOCH_OFFSET, datetime_to_mac, mac_to_datetime, now_mac
 
 

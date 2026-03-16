@@ -1,7 +1,6 @@
 """Tests for Playlist model - edge cases and falsy behavior."""
 
 
-
 class TestPlaylistBoolBehavior:
     """Regression: empty playlists are falsy due to __len__."""
 
@@ -9,6 +8,7 @@ class TestPlaylistBoolBehavior:
         # Find or create an empty playlist record
         from pygpod.db.parser import Record
         from pygpod.model.playlist import Playlist
+
         rec = Record(b"mhyp", 148, 0)
         rec.raw_header = bytearray(148)
         rec.raw_header[0:4] = b"mhyp"
@@ -23,6 +23,7 @@ class TestPlaylistBoolBehavior:
 
     def test_playlist_with_tracks_is_truthy(self, ipod_fs_path):
         from pygpod.model.database import Database
+
         db = Database(ipod_fs_path)
         master = db.master_playlist
         if master and master.track_count > 0:
@@ -30,6 +31,7 @@ class TestPlaylistBoolBehavior:
 
     def test_playlist_iteration(self, ipod_fs_path):
         from pygpod.model.database import Database
+
         db = Database(ipod_fs_path)
         for pl in db.playlists:
             # Should be iterable
@@ -40,6 +42,7 @@ class TestPlaylistBoolBehavior:
 
     def test_playlist_repr(self, ipod_fs_path):
         from pygpod.model.database import Database
+
         db = Database(ipod_fs_path)
         for pl in db.playlists:
             r = repr(pl)
@@ -50,6 +53,7 @@ class TestPlaylistBoolBehavior:
 
     def test_playlist_sort_order(self, ipod_fs_path):
         from pygpod.model.database import Database
+
         db = Database(ipod_fs_path)
         for pl in db.playlists:
             assert isinstance(pl.sort_order, int)
@@ -57,6 +61,7 @@ class TestPlaylistBoolBehavior:
 
     def test_playlist_is_podcast(self, ipod_fs_path):
         from pygpod.model.database import Database
+
         db = Database(ipod_fs_path)
         for pl in db.playlists:
             assert isinstance(pl.is_podcast, bool)
@@ -64,6 +69,7 @@ class TestPlaylistBoolBehavior:
 
     def test_playlist_is_smart(self, ipod_fs_path):
         from pygpod.model.database import Database
+
         db = Database(ipod_fs_path)
         for pl in db.playlists:
             assert isinstance(pl.is_smart, bool)

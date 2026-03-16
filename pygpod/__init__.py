@@ -320,8 +320,7 @@ def _check_optional_deps() -> None:
         missing.append("pyusb (USB detection: pip install pygpod[usb])")
     if missing:
         warnings.warn(
-            "pygpod: optional dependencies not installed: "
-            + ", ".join(missing),
+            "pygpod: optional dependencies not installed: " + ", ".join(missing),
             stacklevel=3,
         )
 

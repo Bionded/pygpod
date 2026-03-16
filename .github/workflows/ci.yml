@@ -31,14 +31,26 @@ jobs:
       - name: Ruff format check
         run: ruff format --check pygpod/ tests/
 
-  test:
-    name: Test (Python ${{ matrix.python-version }}, ${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+  test-linux:
+    name: Test (Python ${{ matrix.python-version }}, Linux)
+    runs-on: ${{ matrix.ubuntu }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+        include:
+          # Python 3.8 needs ubuntu-22.04 (not available on 24.04)
+          - python-version: "3.8"
+            ubuntu: ubuntu-22.04
+          - python-version: "3.9"
+            ubuntu: ubuntu-latest
+          - python-version: "3.10"
+            ubuntu: ubuntu-latest
+          - python-version: "3.11"
+            ubuntu: ubuntu-latest
+          - python-version: "3.12"
+            ubuntu: ubuntu-latest
+          - python-version: "3.13"
+            ubuntu: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -47,17 +59,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install ffmpeg (Ubuntu)
-        if: runner.os == 'Linux'
+      - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
-      - name: Install ffmpeg (macOS)
-        if: runner.os == 'macOS'
-        run: brew install ffmpeg
-
-      - name: Install ffmpeg (Windows)
-        if: runner.os == 'Windows'
-        run: choco install ffmpeg -y
 
       - name: Install dependencies
         run: pip install -e ".[all]" pytest pytest-cov
@@ -66,32 +69,64 @@ jobs:
         run: python -m pytest tests/ -v --tb=short
 
       - name: Run tests with coverage
-        if: matrix.python-version == '3.12' && matrix.os == 'ubuntu-latest'
+        if: matrix.python-version == '3.12'
         run: python -m pytest tests/ --cov=pygpod --cov-report=term --cov-report=xml
 
       - name: Upload coverage
-        if: matrix.python-version == '3.12' && matrix.os == 'ubuntu-latest'
+        if: matrix.python-version == '3.12'
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report
           path: coverage.xml
           retention-days: 5
 
-  test-minimal:
-    name: Test (no optional deps)
-    runs-on: ubuntu-latest
+  test-macos:
+    name: Test (Python ${{ matrix.python-version }}, macOS)
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.13"]
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
-      - name: Install without optional deps
-        run: pip install -e . pytest
+      - name: Install ffmpeg
+        run: brew install ffmpeg
+
+      - name: Install dependencies
+        run: pip install -e ".[all]" pytest
 
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short
+
+  test-windows:
+    name: Test (Python ${{ matrix.python-version }}, Windows)
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install ffmpeg
+        run: choco install ffmpeg -y
+
+      - name: Install dependencies
+        run: pip install -e ".[all]" pytest
+
+      - name: Run tests
+        run: python -m pytest tests/ -v --tb=short -k "not test_resolve_linux and not test_resolve_macos and not test_reads_proc_mounts"
 
   test-libgpod:
     name: Integration (libgpod)

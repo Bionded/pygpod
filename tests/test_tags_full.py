@@ -3,7 +3,6 @@
 import os
 import shutil
 import subprocess
-import tempfile
 
 import pytest
 
@@ -13,10 +12,18 @@ _HAS_FFMPEG = shutil.which("ffmpeg") is not None
 def _gen_audio(path, fmt_args, duration=1):
     """Generate a test audio file with ffmpeg."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    cmd = [
-        "ffmpeg", "-y", "-f", "lavfi", "-i",
-        f"sine=frequency=440:duration={duration}",
-    ] + fmt_args + [path]
+    cmd = (
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"sine=frequency=440:duration={duration}",
+        ]
+        + fmt_args
+        + [path]
+    )
     subprocess.run(cmd, capture_output=True, check=True)
 
 
@@ -130,15 +137,27 @@ class TestTagReadingCodecs:
         from pygpod.tags import read_tags
 
         p = str(tmp_path / "test.mp3")
-        _gen_audio(p, [
-            "-codec:a", "libmp3lame", "-b:a", "128k",
-            "-metadata", "title=MP3 Title",
-            "-metadata", "artist=MP3 Artist",
-            "-metadata", "album=MP3 Album",
-            "-metadata", "genre=Rock",
-            "-metadata", "date=2023",
-            "-metadata", "track=3/10",
-        ])
+        _gen_audio(
+            p,
+            [
+                "-codec:a",
+                "libmp3lame",
+                "-b:a",
+                "128k",
+                "-metadata",
+                "title=MP3 Title",
+                "-metadata",
+                "artist=MP3 Artist",
+                "-metadata",
+                "album=MP3 Album",
+                "-metadata",
+                "genre=Rock",
+                "-metadata",
+                "date=2023",
+                "-metadata",
+                "track=3/10",
+            ],
+        )
         tags = read_tags(p)
         assert tags["title"] == "MP3 Title"
         assert tags["artist"] == "MP3 Artist"
@@ -155,12 +174,21 @@ class TestTagReadingCodecs:
         from pygpod.tags import read_tags
 
         p = str(tmp_path / "test.m4a")
-        _gen_audio(p, [
-            "-codec:a", "aac", "-b:a", "128k",
-            "-metadata", "title=M4A Title",
-            "-metadata", "artist=M4A Artist",
-            "-metadata", "album=M4A Album",
-        ])
+        _gen_audio(
+            p,
+            [
+                "-codec:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-metadata",
+                "title=M4A Title",
+                "-metadata",
+                "artist=M4A Artist",
+                "-metadata",
+                "album=M4A Album",
+            ],
+        )
         tags = read_tags(p)
         assert tags["title"] == "M4A Title"
         assert tags["artist"] == "M4A Artist"
@@ -192,11 +220,17 @@ class TestTagReadingCodecs:
         from pygpod.tags import read_tags
 
         p = str(tmp_path / "test.flac")
-        _gen_audio(p, [
-            "-codec:a", "flac",
-            "-metadata", "title=FLAC Title",
-            "-metadata", "artist=FLAC Artist",
-        ])
+        _gen_audio(
+            p,
+            [
+                "-codec:a",
+                "flac",
+                "-metadata",
+                "title=FLAC Title",
+                "-metadata",
+                "artist=FLAC Artist",
+            ],
+        )
         tags = read_tags(p)
         assert tags["title"] == "FLAC Title"
         assert tags["artist"] == "FLAC Artist"
@@ -207,10 +241,20 @@ class TestTagReadingCodecs:
         from pygpod.tags import read_tags
 
         p = str(tmp_path / "test.ogg")
-        _gen_audio(p, [
-            "-codec:a", "libvorbis", "-b:a", "128k",
-            "-metadata", "title=OGG Title",
-        ])
+        try:
+            _gen_audio(
+                p,
+                [
+                    "-codec:a",
+                    "libvorbis",
+                    "-b:a",
+                    "128k",
+                    "-metadata",
+                    "title=OGG Title",
+                ],
+            )
+        except subprocess.CalledProcessError:
+            pytest.skip("ffmpeg lacks libvorbis support")
         tags = read_tags(p)
         assert tags["title"] == "OGG Title"
         assert tags["duration_ms"] > 0
@@ -249,18 +293,25 @@ class TestTagEdgeCases:
         from pygpod.tags import read_tags
 
         p = str(tmp_path / "disc.mp3")
-        _gen_audio(p, [
-            "-codec:a", "libmp3lame", "-b:a", "128k",
-            "-metadata", "disc=2/3",
-        ])
+        _gen_audio(
+            p,
+            [
+                "-codec:a",
+                "libmp3lame",
+                "-b:a",
+                "128k",
+                "-metadata",
+                "disc=2/3",
+            ],
+        )
         tags = read_tags(p)
         assert tags["cd_number"] == 2
         assert tags["total_cds"] == 3
 
     def test_no_tags_returns_filename_as_title(self, tmp_path):
         """File with no metadata uses filename stem as title."""
-        from tests.conftest import _make_minimal_mp3
         from pygpod.tags import read_tags
+        from tests.conftest import _make_minimal_mp3
 
         p = str(tmp_path / "My Song Name.mp3")
         _make_minimal_mp3(p)
@@ -417,8 +468,9 @@ class TestConstants:
 
     def test_video_warning_logged(self, tmp_path, caplog):
         import logging
-        from pygpod.tags import check_format_supported
+
         import pygpod.tags
+        from pygpod.tags import check_format_supported
 
         # Reset the warning flag
         pygpod.tags._video_warning_shown = False
@@ -430,6 +482,7 @@ class TestConstants:
 
     def test_video_warning_only_once(self, tmp_path, caplog):
         import logging
+
         import pygpod.tags
         from pygpod.tags import check_format_supported
 

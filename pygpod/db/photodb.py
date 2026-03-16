@@ -217,8 +217,7 @@ class PhotoDB:
 
                 # MHOD type=3 (filename string, child of MHNI)
                 mhod3_hlen = 0x18
-                mhod3_body = struct.pack("<IbBhI",
-                                         len(fname_bytes), 1, 0, 0, 0) + fname_bytes
+                mhod3_body = struct.pack("<IbBhI", len(fname_bytes), 1, 0, 0, 0) + fname_bytes
                 # Pad to 4-byte boundary
                 pad = (4 - (mhod3_hlen + len(mhod3_body)) % 4) % 4
                 mhod3_body += b"\x00" * pad
@@ -240,12 +239,12 @@ class PhotoDB:
                 # total_len set below
                 put32lint(mhni_h, 0x0C, 1)  # num_children (MHOD type=3)
                 put32lint(mhni_h, 0x10, thumb.format_id)
-                put32lint(mhni_h, 0x14, thumb.image_offset)   # ithmb_offset
-                put32lint(mhni_h, 0x18, thumb.image_size)     # image_size
+                put32lint(mhni_h, 0x14, thumb.image_offset)  # ithmb_offset
+                put32lint(mhni_h, 0x18, thumb.image_size)  # image_size
                 # 0x1C: vertical_padding (16-bit) = 0
                 # 0x1E: horizontal_padding (16-bit) = 0
-                put16lint(mhni_h, 0x20, thumb.height)         # image_height
-                put16lint(mhni_h, 0x22, thumb.width)          # image_width
+                put16lint(mhni_h, 0x20, thumb.height)  # image_height
+                put16lint(mhni_h, 0x22, thumb.width)  # image_width
                 mhni_total = mhni_hlen + mhod3_total
                 put32lint(mhni_h, 8, mhni_total)
                 mhni_rec = Record(b"mhni", mhni_hlen, mhni_total)
@@ -315,8 +314,7 @@ class PhotoDB:
             name_bytes = album.name.encode("utf-8")
             mhod_hlen = 0x18
             # ArtworkDB MHOD string body: string_len(4), encoding(1), pad(3), unknown(4)
-            mhod_body = struct.pack("<IbBhI",
-                                    len(name_bytes), 1, 0, 0, 0) + name_bytes
+            mhod_body = struct.pack("<IbBhI", len(name_bytes), 1, 0, 0, 0) + name_bytes
             pad = (4 - (mhod_hlen + len(mhod_body)) % 4) % 4
             mhod_body += b"\x00" * pad
             mhod_total = mhod_hlen + len(mhod_body)
@@ -409,7 +407,7 @@ class PhotoDB:
             put32lint(mhif_h, 4, mhif_hlen)
             put32lint(mhif_h, 8, mhif_hlen)  # total_len
             # 0x0C: unknown1 = 0
-            put32lint(mhif_h, 0x10, fmt_id)   # format_id
+            put32lint(mhif_h, 0x10, fmt_id)  # format_id
             put32lint(mhif_h, 0x14, total_size)  # image_size
             mhif_rec = Record(b"mhif", mhif_hlen, mhif_hlen)
             mhif_rec.raw_header = bytes(mhif_h)
@@ -444,8 +442,8 @@ class PhotoDB:
         put32lint(mhfd_h, 4, mhfd_hlen)
         # offset 8 (total_len) set by writer
         # 0x0C: unknown1
-        put32lint(mhfd_h, 0x10, 2)   # unknown2 (must be 2, iTunes7+ requires this)
-        put32lint(mhfd_h, 0x14, 3)   # num_children = 3
+        put32lint(mhfd_h, 0x10, 2)  # unknown2 (must be 2, iTunes7+ requires this)
+        put32lint(mhfd_h, 0x14, 3)  # num_children = 3
         # 0x1C: next_id
         put32lint(mhfd_h, 0x1C, self._next_photo_id)
         mhfd_h[0x30] = 2  # unknown_flag1 = 2 (as libgpod sets)

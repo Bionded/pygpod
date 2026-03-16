@@ -3,8 +3,6 @@
 import os
 import struct
 
-import pytest
-
 
 def _write_play_counts_file(itunes_dir, entries):
     """Write a binary Play Counts file."""
@@ -65,7 +63,7 @@ class TestPlayCountMergeOnLoad:
         assert os.path.isfile(pc_path)
 
         # Reload — should merge and delete
-        db2 = Database(writable_ipod)
+        Database(writable_ipod)
         assert not os.path.isfile(pc_path), "Play Counts file should be deleted after merge"
 
     def test_database_marked_modified_after_merge(self, writable_ipod):
@@ -167,5 +165,5 @@ class TestPlayCountMergeOnLoad:
             f.write(stats)
         assert os.path.isfile(stats_path)
 
-        db2 = Database(writable_ipod)
+        Database(writable_ipod)
         assert not os.path.isfile(stats_path), "iTunesStats should be deleted after merge"

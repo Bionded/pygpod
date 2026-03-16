@@ -2,8 +2,6 @@
 
 import struct
 
-import pytest
-
 from pygpod.db.constants import (
     MEDIATYPE_AUDIO,
     MEDIATYPE_AUDIOBOOK,

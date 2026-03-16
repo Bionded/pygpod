@@ -4,7 +4,6 @@ import os
 
 
 class TestRoundTrip:
-
     def test_add_track_roundtrip(self, writable_ipod, generated_mp3):
         from pygpod.model.database import Database
 
