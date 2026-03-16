@@ -19,8 +19,8 @@ MHIP_MAGIC = b"mhip"  # Playlist item
 MHLA_MAGIC = b"mhla"  # Album list
 MHIA_MAGIC = b"mhia"  # Album item
 MHBA_MAGIC = b"mhba"  # Album record (podcast?)
-MHLI_MAGIC = b"mhli"  # Artist list (MHSD type 5)
-MHII_MAGIC = b"mhii"  # Artist item (MHSD type 5)
+MHLI_MAGIC = b"mhli"  # List record (used in MHSD type 8 for artists, ArtworkDB for images)
+MHII_MAGIC = b"mhii"  # Item record (used in MHSD type 8 for artists, ArtworkDB for images)
 
 # ============================================================================
 # MHSD section types
@@ -29,7 +29,7 @@ MHSD_TYPE_TRACKS = 1
 MHSD_TYPE_PLAYLISTS = 2
 MHSD_TYPE_PODCASTS = 3
 MHSD_TYPE_ALBUMS = 4
-MHSD_TYPE_ARTISTS = 5
+MHSD_TYPE_ARTISTS = 8
 
 # ============================================================================
 # MHOD types (data object types)
