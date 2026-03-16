@@ -720,13 +720,10 @@ class Database:
                             c
                             for c in mhyp.children
                             if not (
-                                c.magic == MHOD_MAGIC
-                                and c.fields.get("mhod_type") == MHOD_ID_TITLE
+                                c.magic == MHOD_MAGIC and c.fields.get("mhod_type") == MHOD_ID_TITLE
                             )
                         ]
-                        mhyp.children.insert(
-                            0, make_string_mhod(MHOD_ID_TITLE, expected_name)
-                        )
+                        mhyp.children.insert(0, make_string_mhod(MHOD_ID_TITLE, expected_name))
 
     def _rebuild_type3_podcasts(self) -> None:
         """Rebuild podcast playlists in MHSD type 3 with hierarchical grouping.
@@ -1670,10 +1667,7 @@ class Database:
                         mhyp.children = [
                             c
                             for c in mhyp.children
-                            if not (
-                                c.magic == MHIP_MAGIC
-                                and c.fields.get("track_id") == track_id
-                            )
+                            if not (c.magic == MHIP_MAGIC and c.fields.get("track_id") == track_id)
                         ]
                         return
 
