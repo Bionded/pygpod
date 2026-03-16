@@ -84,7 +84,7 @@ class TestDatabaseSortIndexes:
             db.remove_track(track)
         db.save()
 
-        # Should not crash — sort indexes are just empty
+        # Should not crash - sort indexes are just empty
         db2 = Database(writable_ipod)
         assert len(db2.tracks) == 0
 

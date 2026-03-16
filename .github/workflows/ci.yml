@@ -2,29 +2,9 @@ name: CI
 
 on:
   push:
-    branches:
-      - master
-      - develop
-      - develop-*
-      - rc-*
-      - release-*
-      - candidate-*
   pull_request:
-    branches:
-      - master
-      - develop
-      - rc-*
-      - release-*
-      - candidate-*
-
-# Conditions use this helper:
-#   is_full = PR OR master/rc/release/candidate push
-#   is_develop_push = push to develop or develop-*
 
 jobs:
-  # =====================================================================
-  # Lint — always runs
-  # =====================================================================
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -44,46 +24,15 @@ jobs:
       - name: Ruff format check
         run: ruff format --check pygpod/ tests/
 
-  # =====================================================================
-  # Smoke test — always runs (fast, single Python version)
-  # On develop push: this is the ONLY test job
-  # On full branches/PRs: runs alongside the full matrix
-  # =====================================================================
-  test-smoke:
-    name: Test (Python 3.8, Linux)
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.8"
-
-      - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
-      - name: Install dependencies
-        run: pip install -e ".[all]" pytest
-
-      - name: Run tests
-        run: python -m pytest tests/ -v --tb=short
-
-  # =====================================================================
-  # Full Linux matrix — skipped on develop push (smoke test is enough)
-  # =====================================================================
   test-linux:
     name: Test (Python ${{ matrix.python-version }}, Linux)
-    if: >-
-      github.event_name == 'pull_request' ||
-      github.ref == 'refs/heads/master' ||
-      startsWith(github.ref, 'refs/heads/rc-') ||
-      startsWith(github.ref, 'refs/heads/release-') ||
-      startsWith(github.ref, 'refs/heads/candidate-')
     runs-on: ${{ matrix.ubuntu }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          - python-version: "3.8"
+            ubuntu: ubuntu-22.04
           - python-version: "3.9"
             ubuntu: ubuntu-latest
           - python-version: "3.10"
@@ -123,17 +72,8 @@ jobs:
           path: coverage.xml
           retention-days: 5
 
-  # =====================================================================
-  # macOS
-  # =====================================================================
   test-macos:
     name: Test (Python ${{ matrix.python-version }}, macOS)
-    if: >-
-      github.event_name == 'pull_request' ||
-      github.ref == 'refs/heads/master' ||
-      startsWith(github.ref, 'refs/heads/rc-') ||
-      startsWith(github.ref, 'refs/heads/release-') ||
-      startsWith(github.ref, 'refs/heads/candidate-')
     runs-on: macos-latest
     strategy:
       fail-fast: false
@@ -156,17 +96,8 @@ jobs:
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short
 
-  # =====================================================================
-  # Windows
-  # =====================================================================
   test-windows:
     name: Test (Python ${{ matrix.python-version }}, Windows)
-    if: >-
-      github.event_name == 'pull_request' ||
-      github.ref == 'refs/heads/master' ||
-      startsWith(github.ref, 'refs/heads/rc-') ||
-      startsWith(github.ref, 'refs/heads/release-') ||
-      startsWith(github.ref, 'refs/heads/candidate-')
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -189,17 +120,8 @@ jobs:
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short -k "not test_resolve_linux and not test_resolve_macos and not test_reads_proc_mounts"
 
-  # =====================================================================
-  # libgpod integration
-  # =====================================================================
   test-libgpod:
     name: Integration (libgpod)
-    if: >-
-      github.event_name == 'pull_request' ||
-      github.ref == 'refs/heads/master' ||
-      startsWith(github.ref, 'refs/heads/rc-') ||
-      startsWith(github.ref, 'refs/heads/release-') ||
-      startsWith(github.ref, 'refs/heads/candidate-')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

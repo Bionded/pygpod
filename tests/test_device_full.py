@@ -1,4 +1,4 @@
-"""Full tests for device.py — multiple generations, from_usb, properties, write_sysinfo."""
+"""Full tests for device.py - multiple generations, from_usb, properties, write_sysinfo."""
 
 import os
 import pathlib
@@ -66,7 +66,7 @@ def _make_usb_info(
 
 
 # =========================================================================
-# from_mountpoint — multiple generations
+# from_mountpoint - multiple generations
 # =========================================================================
 
 
@@ -115,7 +115,7 @@ class TestFromMountpoint:
         dev_dir = ipod / "iPod_Control" / "Device"
         dev_dir.mkdir(parents=True)
         (ipod / "iPod_Control" / "iTunes").mkdir(parents=True)
-        # Serial ending in "Y5N" — might match a model via lookup_model_by_serial
+        # Serial ending in "Y5N" - might match a model via lookup_model_by_serial
         (dev_dir / "SysInfo").write_text("SerialNumber: XXXXXXXXXXY5N\n")
         from pygpod.device.mountpoint import init_ipod
 
@@ -170,7 +170,7 @@ class TestFromUSB:
 
 
 # =========================================================================
-# Properties — generation-specific
+# Properties - generation-specific
 # =========================================================================
 
 

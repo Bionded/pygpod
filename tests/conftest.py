@@ -2,7 +2,7 @@
 
 Provides session-scoped fixtures for iPod filesystem, generated MP3 files,
 and writable iPod directories. All fixtures are built in pure Python using
-pygpod itself — no gcc, libgpod, or ffmpeg required.
+pygpod itself - no gcc, libgpod, or ffmpeg required.
 
 If gcc + libgpod + ffmpeg ARE available, the C-based fixture builder is used
 for integration tests (richer fixture with cover art, video tracks, etc.).

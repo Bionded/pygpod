@@ -1,4 +1,4 @@
-"""Tests for pygpod.utils.timezone — iPod timezone handling."""
+"""Tests for pygpod.utils.timezone - iPod timezone handling."""
 
 from __future__ import annotations
 
@@ -67,7 +67,7 @@ class TestGetLocalTzOffset:
 
 
 class TestReadTimezoneFromPrefs:
-    """Tests for read_timezone_from_prefs() — lines 51-70."""
+    """Tests for read_timezone_from_prefs() - lines 51-70."""
 
     def test_file_not_found(self):
         """Returns None when prefs file does not exist."""
@@ -129,7 +129,7 @@ class TestReadTimezoneFromPrefs:
 
 
 # ---------------------------------------------------------------------------
-# _parse_tz_4g — lines 85-101
+# _parse_tz_4g - lines 85-101
 # ---------------------------------------------------------------------------
 
 
@@ -176,7 +176,7 @@ class TestParseTz4g:
 
 
 # ---------------------------------------------------------------------------
-# _parse_tz_5g — lines 115-127
+# _parse_tz_5g - lines 115-127
 # ---------------------------------------------------------------------------
 
 
@@ -225,7 +225,7 @@ class TestParseTz5g:
 
 
 # ---------------------------------------------------------------------------
-# _parse_tz_6g — lines 141-155
+# _parse_tz_6g - lines 141-155
 # ---------------------------------------------------------------------------
 
 
@@ -272,7 +272,7 @@ class TestParseTz6g:
 
 
 # ---------------------------------------------------------------------------
-# _get_tz_offset — lines 169-189
+# _get_tz_offset - lines 169-189
 # ---------------------------------------------------------------------------
 
 
@@ -351,7 +351,7 @@ class TestGetTzOffset:
 
 
 # ---------------------------------------------------------------------------
-# _parse_zoneinfo_file — lines 203-264
+# _parse_zoneinfo_file - lines 203-264
 # ---------------------------------------------------------------------------
 
 
@@ -540,7 +540,7 @@ class TestValidateTz:
 
 
 # ---------------------------------------------------------------------------
-# read_timezone_from_device — lines 290-291
+# read_timezone_from_device - lines 290-291
 # ---------------------------------------------------------------------------
 
 
@@ -565,7 +565,7 @@ class TestReadTimezoneFromDevice:
 
 
 # ---------------------------------------------------------------------------
-# mac_timestamp_with_tz — line 304
+# mac_timestamp_with_tz - line 304
 # ---------------------------------------------------------------------------
 
 

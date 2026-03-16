@@ -1,4 +1,4 @@
-"""Tests for iPod model database — lookup functions, checksums, db versions."""
+"""Tests for iPod model database - lookup functions, checksums, db versions."""
 
 import pytest
 
@@ -240,7 +240,7 @@ class TestUSBProductLookup:
         assert info.generation == IpodGeneration.NANO_5
 
     def test_classic_ambiguous_without_capacity(self):
-        # 0x1261 maps to Classic 1G, 2G, and 3G — ambiguous
+        # 0x1261 maps to Classic 1G, 2G, and 3G - ambiguous
         info = lookup_by_usb_product_id(0x1261)
         assert info is None  # ambiguous
 
@@ -259,7 +259,7 @@ class TestUSBProductLookup:
     def test_classic_160gb_ambiguous(self):
         # 160 GB exists in both Classic 1G and 3G
         info = lookup_by_usb_product_id(0x1261, capacity_gb=160)
-        # Could match either — may be ambiguous or pick first
+        # Could match either - may be ambiguous or pick first
         # Just verify it doesn't crash
         assert info is None or info.generation in (
             IpodGeneration.CLASSIC_1,
@@ -271,7 +271,7 @@ class TestUSBProductLookup:
         assert info is None
 
     def test_video_ambiguous(self):
-        # 0x1209 maps to both VIDEO_1 and VIDEO_2 — ambiguous without capacity
+        # 0x1209 maps to both VIDEO_1 and VIDEO_2 - ambiguous without capacity
         info = lookup_by_usb_product_id(0x1209)
         assert info is None
 

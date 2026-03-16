@@ -45,7 +45,7 @@ class TestPlayCountMergeOnLoad:
         pc_path = _write_play_counts_file(itunes_dir, entries)
         assert os.path.isfile(pc_path)
 
-        # Reload — should merge play counts
+        # Reload - should merge play counts
         db2 = Database(writable_ipod)
         for i, t in enumerate(db2.tracks):
             assert t.play_count == initial_counts[i] + 3
@@ -62,7 +62,7 @@ class TestPlayCountMergeOnLoad:
         pc_path = _write_play_counts_file(itunes_dir, entries)
         assert os.path.isfile(pc_path)
 
-        # Reload — should merge and delete
+        # Reload - should merge and delete
         Database(writable_ipod)
         assert not os.path.isfile(pc_path), "Play Counts file should be deleted after merge"
 
@@ -129,7 +129,7 @@ class TestPlayCountMergeOnLoad:
         expected_pc = db2.tracks[0].play_count
         db2.save()
 
-        # Reload after save — no Play Counts file, values should persist
+        # Reload after save - no Play Counts file, values should persist
         db3 = Database(writable_ipod)
         assert db3.tracks[0].play_count == expected_pc
         assert db3.tracks[0].record.fields["rating"] == 100

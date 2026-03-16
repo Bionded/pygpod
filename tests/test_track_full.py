@@ -1,4 +1,4 @@
-"""Tests for Track model — full field coverage including read-only defaults."""
+"""Tests for Track model - full field coverage including read-only defaults."""
 
 import struct
 

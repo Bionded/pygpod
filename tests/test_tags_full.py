@@ -1,4 +1,4 @@
-"""Full tests for tags.py — all codecs, format validation, edge cases."""
+"""Full tests for tags.py - all codecs, format validation, edge cases."""
 
 import os
 import shutil
@@ -127,7 +127,7 @@ class TestFormatValidation:
 
 
 # =========================================================================
-# Tag reading — different codecs
+# Tag reading - different codecs
 # =========================================================================
 
 
@@ -261,7 +261,7 @@ class TestTagReadingCodecs:
 
 
 # =========================================================================
-# Tag reading — edge cases
+# Tag reading - edge cases
 # =========================================================================
 
 

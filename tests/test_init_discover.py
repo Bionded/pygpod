@@ -1,11 +1,11 @@
-"""Tests for pygpod.__init__ — discover(), mount resolution, optional deps."""
+"""Tests for pygpod.__init__ - discover(), mount resolution, optional deps."""
 
 import sys
 from types import SimpleNamespace
 from unittest import mock
 
 # =========================================================================
-# discover() — Linux mount scanning
+# discover() - Linux mount scanning
 # =========================================================================
 
 
@@ -47,7 +47,7 @@ class TestDiscoverLinux:
 
 
 # =========================================================================
-# discover() — Darwin mount scanning
+# discover() - Darwin mount scanning
 # =========================================================================
 
 
@@ -61,7 +61,7 @@ class TestDiscoverDarwin:
 
 
 # =========================================================================
-# discover() — Windows mount scanning
+# discover() - Windows mount scanning
 # =========================================================================
 
 
@@ -75,7 +75,7 @@ class TestDiscoverWindows:
 
 
 # =========================================================================
-# discover() — USB fallback
+# discover() - USB fallback
 # =========================================================================
 
 
@@ -131,7 +131,7 @@ class TestDiscoverUSB:
 
 
 # =========================================================================
-# _resolve_usb_mount_points — per-OS
+# _resolve_usb_mount_points - per-OS
 # =========================================================================
 
 
@@ -263,7 +263,7 @@ class TestOptionalDeps:
         """No warning when mutagen, PIL, usb are available."""
         import warnings
 
-        # Just verify import doesn't crash — we have all deps installed
+        # Just verify import doesn't crash - we have all deps installed
         with warnings.catch_warnings(record=True):
             warnings.simplefilter("always")
             # Re-run the check

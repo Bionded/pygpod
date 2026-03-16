@@ -1,4 +1,4 @@
-"""Extended tests for smartplaylist.py — date rules, range rules, binary_and,
+"""Extended tests for smartplaylist.py - date rules, range rules, binary_and,
 limit types, sort orders, parse/write edge cases."""
 
 import struct
@@ -66,7 +66,7 @@ def _make_track(**kwargs):
 
 
 # =========================================================================
-# get_field_type — cover UNKNOWN and BINARY_AND
+# get_field_type - cover UNKNOWN and BINARY_AND
 # =========================================================================
 
 
@@ -275,7 +275,7 @@ class TestIntRangeRules:
 
 
 # =========================================================================
-# String rule — unknown action falls through
+# String rule - unknown action falls through
 # =========================================================================
 
 

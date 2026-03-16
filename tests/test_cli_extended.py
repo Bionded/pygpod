@@ -1,4 +1,4 @@
-"""Extended CLI tests — discover, init, track info, filters, error paths."""
+"""Extended CLI tests - discover, init, track info, filters, error paths."""
 
 import os
 
@@ -23,7 +23,7 @@ def _main(argv):
 
 class TestDiscover:
     def test_discover_runs(self, capsys):
-        # discover scans real system — just verify it doesn't crash
+        # discover scans real system - just verify it doesn't crash
         ret = _main(["-m", "/nonexistent", "discover"])
         out = capsys.readouterr().out
         # Either finds iPods or says none found

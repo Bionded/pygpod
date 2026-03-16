@@ -1,4 +1,4 @@
-"""Full tests for artwork_parser.py — synthetic ArtworkDB fixtures."""
+"""Full tests for artwork_parser.py - synthetic ArtworkDB fixtures."""
 
 import struct
 
