@@ -170,6 +170,87 @@ def _safe_int(s: str) -> int:
         return 0
 
 
+# Audio formats supported by all iPods
+_BASE_AUDIO_EXTS = {".mp3", ".m4a", ".m4b", ".m4p", ".aac", ".wav", ".aiff", ".aif"}
+
+# Video extensions (not validated here — resolution/codec limits vary too much)
+VIDEO_EXTS = {".m4v", ".mp4", ".mov"}
+
+# Audio formats that require conversion (never supported by any iPod)
+UNSUPPORTED_AUDIO_EXTS = {
+    ".flac": "FLAC",
+    ".ogg": "Ogg Vorbis",
+    ".opus": "Opus",
+    ".wma": "Windows Media Audio",
+    ".ape": "Monkey's Audio",
+    ".webm": "WebM",
+    ".mka": "Matroska Audio",
+}
+
+# Per-generation supported audio formats
+# All generations get _BASE_AUDIO_EXTS. Some add ALAC (.m4a container).
+# Shuffles are more limited (no Audible, no ALAC on older models).
+
+# Legacy alias for backwards compat
+IPOD_SUPPORTED_EXTS = _BASE_AUDIO_EXTS | VIDEO_EXTS
+
+
+def get_supported_audio_exts(generation=None) -> set:
+    """Get supported audio file extensions for an iPod generation.
+
+    Args:
+        generation: IpodGeneration enum value, or None for base set.
+
+    Returns:
+        Set of lowercase extensions (e.g. {'.mp3', '.m4a', ...}).
+    """
+    return set(_BASE_AUDIO_EXTS)  # all generations support the same audio exts
+
+
+_video_warning_shown = False
+
+
+def check_format_supported(filepath: str, generation=None) -> None:
+    """Raise UnsupportedFormatError if the audio format is not iPod-compatible.
+
+    Video files (.mp4, .m4v, .mov) are allowed through with a one-time warning
+    since they have complex codec/resolution requirements that can't be
+    validated by extension alone.
+
+    Args:
+        filepath: Path to the audio/video file.
+        generation: IpodGeneration enum value (for future per-gen validation).
+
+    Raises:
+        UnsupportedFormatError: If the audio format needs conversion.
+    """
+    from .exceptions import UnsupportedFormatError
+
+    ext = os.path.splitext(filepath)[1].lower()
+
+    # Video files: allow but warn once
+    if ext in VIDEO_EXTS:
+        global _video_warning_shown
+        if not _video_warning_shown:
+            logger.warning(
+                "Video file detected (%s). iPod video support depends on "
+                "codec (H.264 Baseline), resolution (max 640x480), and "
+                "container (.m4v/.mp4). Ensure the file is properly encoded.",
+                ext,
+            )
+            _video_warning_shown = True
+        return
+
+    # Known unsupported audio formats
+    if ext in UNSUPPORTED_AUDIO_EXTS:
+        fmt_name = UNSUPPORTED_AUDIO_EXTS[ext]
+        raise UnsupportedFormatError(
+            f"{fmt_name} ({ext}) is not supported by iPod. "
+            f"Convert to MP3 or AAC first. "
+            f"Auto-conversion is not yet implemented."
+        )
+
+
 def _detect_filetype(filepath: str) -> str:
     """Detect audio file type from extension.
 

@@ -45,3 +45,11 @@ class ArtworkError(PyGpodError):
 
 class DependencyError(PyGpodError):
     """A required optional dependency is not installed."""
+
+
+class UnsupportedFormatError(TrackError):
+    """Audio/video format not supported by iPod.
+
+    The file must be converted to a supported format (MP3, AAC, ALAC, WAV, AIFF)
+    before adding to the iPod. Auto-conversion is not yet implemented.
+    """

@@ -166,13 +166,38 @@ class Database:
             self._apply_play_counts(mountpoint)
 
     def _apply_play_counts(self, mountpoint: str) -> None:
-        """Read and apply play count data from device."""
+        """Read, apply, and delete play count data from device.
+
+        The iPod writes play counts to separate files (Play Counts,
+        iTunesStats, PlayCounts.plist) between syncs. We merge them
+        into the iTunesDB and delete the files so they aren't applied
+        again on next load.
+        """
         try:
             from ..db.playcounts import apply_play_counts, read_play_counts
 
             entries = read_play_counts(mountpoint)
-            if entries:
-                apply_play_counts(self._tracks, entries)
+            if not entries:
+                return
+
+            updated = apply_play_counts(self._tracks, entries)
+            if updated > 0:
+                self._modified = True
+                logger.info(
+                    "Merged play counts: %d tracks updated from %d entries",
+                    updated, len(entries),
+                )
+
+                # Delete the play count files so they aren't re-applied
+                itunes_dir = os.path.join(mountpoint, "iPod_Control", "iTunes")
+                for fname in ("Play Counts", "iTunesStats", "PlayCounts.plist"):
+                    fpath = os.path.join(itunes_dir, fname)
+                    if os.path.isfile(fpath):
+                        try:
+                            os.unlink(fpath)
+                            logger.debug("Deleted %s", fpath)
+                        except OSError:
+                            logger.debug("Failed to delete %s", fpath, exc_info=True)
         except Exception:
             logger.debug("Failed to apply play counts", exc_info=True)
 
@@ -280,6 +305,11 @@ class Database:
 
         if not self._mountpoint:
             raise TrackError("Cannot add tracks without a mount point")
+
+        # Check format is iPod-compatible
+        from ..tags import check_format_supported
+
+        check_format_supported(filepath)
 
         # Read tags
         tags = read_tags(filepath)

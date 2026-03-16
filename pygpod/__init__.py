@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,7 @@ from .exceptions import (
     PlaylistError,
     PyGpodError,
     TrackError,
+    UnsupportedFormatError,
     WriteError,
 )
 from .model.artwork import Artwork
@@ -295,6 +296,7 @@ __all__ = [
     "PlaylistError",
     "ArtworkError",
     "DependencyError",
+    "UnsupportedFormatError",
     "__version__",
 ]
 

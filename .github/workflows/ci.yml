@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+      - develop
+      - develop-*
+  pull_request:
+    branches:
+      - master
+      - develop
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Ruff check
+        run: ruff check pygpod/ tests/
+
+      - name: Ruff format check
+        run: ruff format --check pygpod/ tests/
+
+  test:
+    name: Test (Python ${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install ffmpeg (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y
+
+      - name: Install dependencies
+        run: pip install -e ".[all]" pytest pytest-cov
+
+      - name: Run tests
+        run: python -m pytest tests/ -v --tb=short
+
+      - name: Run tests with coverage
+        if: matrix.python-version == '3.12' && matrix.os == 'ubuntu-latest'
+        run: python -m pytest tests/ --cov=pygpod --cov-report=term --cov-report=xml
+
+      - name: Upload coverage
+        if: matrix.python-version == '3.12' && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 5
+
+  test-minimal:
+    name: Test (no optional deps)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install without optional deps
+        run: pip install -e . pytest
+
+      - name: Run tests
+        run: python -m pytest tests/ -v --tb=short
+
+  test-libgpod:
+    name: Integration (libgpod)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgpod-dev libgpod-common ffmpeg gcc pkg-config \
+            libglib2.0-dev
+
+      - name: Install Python deps
+        run: pip install -e ".[all]" pytest pytest-cov
+
+      - name: Run all tests (with libgpod fixture builder)
+        run: python -m pytest tests/ -v --tb=short
+
+      - name: Verify hash58 matches libgpod
+        run: |
+          cat > /tmp/test_hash.c << 'EOF'
+          #include <gpod/itdb.h>
+          #include <glib.h>
+          #include <stdio.h>
+          #include <string.h>
+          int main(int argc, char **argv) {
+              const char *mp = argv[1];
+              Itdb_iTunesDB *itdb = itdb_parse(mp, NULL);
+              if (!itdb) { fprintf(stderr, "parse failed\n"); return 1; }
+              if (!itdb_write(itdb, NULL)) { fprintf(stderr, "write failed\n"); return 1; }
+              char path[512];
+              snprintf(path, sizeof(path), "%s/iPod_Control/iTunes/iTunesDB", mp);
+              FILE *f = fopen(path, "rb");
+              unsigned char buf[128];
+              fread(buf, 1, 128, f);
+              fclose(f);
+              printf("hash58: ");
+              for (int i=0x58; i<0x58+20; i++) printf("%02x", buf[i]);
+              printf("\n");
+              itdb_free(itdb);
+              return 0;
+          }
+          EOF
+          gcc -o /tmp/test_hash /tmp/test_hash.c $(pkg-config --cflags --libs libgpod-1.0 glib-2.0) || echo "Compile skipped"

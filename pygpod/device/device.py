@@ -6,6 +6,7 @@ Detects iPod model, generation, and capabilities from mount point.
 from __future__ import annotations
 
 import logging
+import os
 import pathlib
 from typing import Optional
 
@@ -333,6 +334,32 @@ class Device:
         """Path to the SysInfo file on this iPod."""
         return pathlib.Path(self.mountpoint) / "iPod_Control" / "Device" / "SysInfo"
 
+    def storage_info(self, full: bool = True) -> "StorageInfo":
+        """Get filesystem storage usage.
+
+        Args:
+            full: If True (default), scan the filesystem to get per-category
+                  breakdown (music, artwork, databases, photos). This can be
+                  slow on large libraries. If False, return only total/used/free.
+
+        Returns:
+            StorageInfo with space data.
+
+        Raises:
+            DeviceError: If mountpoint is not set.
+        """
+        if not self.mountpoint:
+            from ..exceptions import DeviceError
+            raise DeviceError("Cannot get storage info without a mount point")
+
+        total, free = _get_disk_space(self.mountpoint)
+        used = total - free
+
+        si = StorageInfo(total=total, free=free, used=used)
+        if full:
+            si.scan(self.mountpoint)
+        return si
+
     def write_sysinfo(self) -> pathlib.Path:
         """Write current device info to SysInfo file.
 
@@ -398,3 +425,148 @@ class Device:
         if self.mountpoint:
             return f"<Device {self.model} at {self.mountpoint}>"
         return f"<Device {self.model} (USB, not mounted)>"
+
+
+# ============================================================================
+# Storage info
+# ============================================================================
+
+
+def _get_disk_space(path: str) -> tuple:
+    """Get total and free disk space in bytes (cross-platform).
+
+    Returns:
+        (total_bytes, free_bytes)
+    """
+    try:
+        # Python 3.3+ shutil.disk_usage works on all platforms
+        import shutil
+        usage = shutil.disk_usage(path)
+        return usage.total, usage.free
+    except (OSError, AttributeError):
+        pass
+
+    # Fallback for older Python or edge cases
+    try:
+        stat = os.statvfs(path)
+        return stat.f_frsize * stat.f_blocks, stat.f_frsize * stat.f_bavail
+    except (OSError, AttributeError):
+        pass
+
+    return 0, 0
+
+
+def _file_size(path: pathlib.Path) -> int:
+    """Get file size in bytes, 0 if doesn't exist."""
+    try:
+        return path.stat().st_size if path.is_file() else 0
+    except OSError:
+        return 0
+
+
+def _dir_size(path: pathlib.Path) -> int:
+    """Get total size of all files in a directory tree, 0 if doesn't exist."""
+    total = 0
+    try:
+        if not path.is_dir():
+            return 0
+        for f in path.rglob("*"):
+            if f.is_file():
+                try:
+                    total += f.stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
+def _fmt_size(b: int) -> str:
+    """Format byte count as human-readable string."""
+    if b >= 1 << 30:
+        return f"{b / (1 << 30):.1f} GB"
+    if b >= 1 << 20:
+        return f"{b / (1 << 20):.1f} MB"
+    if b >= 1 << 10:
+        return f"{b / (1 << 10):.1f} KB"
+    return f"{b} B"
+
+
+class StorageInfo:
+    """iPod filesystem storage usage breakdown.
+
+    Always has total/free/used. Per-category fields (music, artwork, etc.)
+    are populated by ``scan()`` or by ``Device.storage_info(full=True)``.
+    """
+
+    __slots__ = (
+        "total", "free", "used",
+        "music", "artwork_thumbnails", "artwork_db",
+        "itunes_db", "itunes_sd", "photos", "other",
+        "_scanned",
+    )
+
+    def __init__(self, **kwargs):
+        for k in self.__slots__:
+            setattr(self, k, kwargs.get(k, 0))
+        self._scanned = False
+
+    @property
+    def is_scanned(self) -> bool:
+        """Whether per-category breakdown has been computed."""
+        return self._scanned
+
+    def scan(self, mountpoint: str) -> None:
+        """Scan the iPod filesystem to compute per-category sizes.
+
+        Can be called multiple times to refresh. Updates all category
+        fields (music, artwork, databases, photos, other).
+
+        Args:
+            mountpoint: iPod mount point path.
+        """
+        mp = pathlib.Path(mountpoint)
+        ipod_ctrl = mp / "iPod_Control"
+
+        music_dir = ipod_ctrl / "Music"
+        artwork_dir = ipod_ctrl / "Artwork"
+        itunes_dir = ipod_ctrl / "iTunes"
+        photos_dir = ipod_ctrl / "Photos"
+
+        self.music = _dir_size(music_dir)
+
+        artwork_total = _dir_size(artwork_dir)
+        artworkdb = _file_size(artwork_dir / "ArtworkDB")
+        self.artwork_db = artworkdb
+        self.artwork_thumbnails = max(0, artwork_total - artworkdb)
+
+        self.itunes_db = _file_size(itunes_dir / "iTunesDB")
+        self.itunes_sd = _file_size(itunes_dir / "iTunesSD")
+        self.photos = _dir_size(photos_dir)
+        self.other = max(0, self.used - self.music - artwork_total - self.photos)
+        self._scanned = True
+
+    def __repr__(self) -> str:
+        return (
+            f"<StorageInfo total={_fmt_size(self.total)} "
+            f"used={_fmt_size(self.used)} free={_fmt_size(self.free)}>"
+        )
+
+    def __str__(self) -> str:
+        lines = [
+            f"Total:              {_fmt_size(self.total)}",
+            f"Used:               {_fmt_size(self.used)}",
+            f"Free:               {_fmt_size(self.free)}",
+        ]
+        if self._scanned:
+            lines.append("")
+            lines.append(f"  Music files:      {_fmt_size(self.music)}")
+            lines.append(f"  Artwork (.ithmb): {_fmt_size(self.artwork_thumbnails)}")
+            lines.append(f"  ArtworkDB:        {_fmt_size(self.artwork_db)}")
+            lines.append(f"  iTunesDB:         {_fmt_size(self.itunes_db)}")
+            if self.itunes_sd:
+                lines.append(f"  iTunesSD:         {_fmt_size(self.itunes_sd)}")
+            if self.photos:
+                lines.append(f"  Photos:           {_fmt_size(self.photos)}")
+            lines.append(f"  Other/System:     {_fmt_size(self.other)}")
+        return "\n".join(lines)

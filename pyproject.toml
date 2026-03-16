@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pygpod"
-version = "0.0.2"
+version = "0.0.3"
 description = "Pure Python library for iPod database management - a spiritual successor to libgpod"
 readme = "README.md"
 license = { text = "LGPL-2.1-or-later" }

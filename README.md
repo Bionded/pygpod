@@ -253,6 +253,31 @@ device.checksum_type    # ChecksumType enum
 device.firewire_guid    # GUID for hash computation
 ```
 
+#### Storage info
+
+```python
+# Quick check (no filesystem scan)
+si = device.storage_info(full=False)
+print(f"Free: {si.free / 1e9:.1f} GB of {si.total / 1e9:.1f} GB")
+
+# Full breakdown (scans Music, Artwork, etc.)
+si = device.storage_info()  # full=True by default
+print(si)
+# Total:              74.4 GB
+# Used:               35.2 GB
+# Free:               39.2 GB
+#
+#   Music files:      28.5 GB
+#   Artwork (.ithmb): 1.9 GB
+#   ArtworkDB:        5.9 MB
+#   iTunesDB:         61.0 MB
+#   Other/System:     4.8 GB
+
+# Or scan later
+si = device.storage_info(full=False)
+si.scan(device.mountpoint)  # populate categories on demand
+```
+
 ### DatabaseConfig
 
 Fine-grained control over binary output format.

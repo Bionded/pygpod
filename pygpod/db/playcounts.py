@@ -219,7 +219,8 @@ def apply_play_counts(tracks: list, entries: List[PlayCountEntry]) -> int:
     """Apply play count entries to tracks.
 
     Tracks and entries are matched by position (index). The iPod writes
-    one entry per track in database order.
+    one entry per track in database order. Updates both fields dict and
+    raw_header bytes so changes survive serialization.
 
     Args:
         tracks: List of Track objects (in database order).
@@ -238,28 +239,44 @@ def apply_play_counts(tracks: list, entries: List[PlayCountEntry]) -> int:
             continue
 
         fields = track.record.fields
+        header = bytearray(track.record.raw_header)
         changed = False
 
         if entry.play_count > 0:
-            fields["play_count"] = fields.get("play_count", 0) + entry.play_count
+            new_pc = fields.get("play_count", 0) + entry.play_count
+            fields["play_count"] = new_pc
+            if len(header) > 0x54:
+                struct.pack_into("<I", header, 0x50, new_pc)
             changed = True
         if entry.time_played > 0:
             fields["time_played"] = entry.time_played
+            if len(header) > 0x5C:
+                struct.pack_into("<I", header, 0x58, entry.time_played)
             changed = True
         if entry.rating >= 0:
             fields["rating"] = entry.rating
+            if len(header) > 0x1F:
+                header[0x1F] = min(entry.rating, 255)
             changed = True
         if entry.skip_count > 0:
-            fields["skip_count"] = fields.get("skip_count", 0) + entry.skip_count
+            new_sc = fields.get("skip_count", 0) + entry.skip_count
+            fields["skip_count"] = new_sc
+            if len(header) > 0xA0:
+                struct.pack_into("<I", header, 0x9C, new_sc)
             changed = True
         if entry.time_skipped > 0:
             fields["time_skipped"] = entry.time_skipped
+            if len(header) > 0xA4:
+                struct.pack_into("<I", header, 0xA0, entry.time_skipped)
             changed = True
         if entry.bookmark_time > 0:
             fields["bookmark_time"] = entry.bookmark_time
+            if len(header) > 0x70:
+                struct.pack_into("<I", header, 0x6C, entry.bookmark_time)
             changed = True
 
         if changed:
+            track.record.raw_header = bytes(header)
             updated += 1
 
     return updated
