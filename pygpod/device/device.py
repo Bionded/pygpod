@@ -125,8 +125,7 @@ class Device:
         dev = cls(None, sysinfo, ipod_info)
         dev._usb_enriched = True
         dev._usb_info = usb_info
-        logger.debug("USB device detected: %s (product_id=0x%04x)",
-                      dev.model, usb_info.product_id)
+        logger.debug("USB device detected: %s (product_id=0x%04x)", dev.model, usb_info.product_id)
         return dev
 
     @staticmethod
@@ -350,6 +349,7 @@ class Device:
         """
         if not self.mountpoint:
             from ..exceptions import DeviceError
+
             raise DeviceError("Cannot get storage info without a mount point")
 
         total, free = _get_disk_space(self.mountpoint)
@@ -441,6 +441,7 @@ def _get_disk_space(path: str) -> tuple:
     try:
         # Python 3.3+ shutil.disk_usage works on all platforms
         import shutil
+
         usage = shutil.disk_usage(path)
         return usage.total, usage.free
     except (OSError, AttributeError):
@@ -500,9 +501,16 @@ class StorageInfo:
     """
 
     __slots__ = (
-        "total", "free", "used",
-        "music", "artwork_thumbnails", "artwork_db",
-        "itunes_db", "itunes_sd", "photos", "other",
+        "total",
+        "free",
+        "used",
+        "music",
+        "artwork_thumbnails",
+        "artwork_db",
+        "itunes_db",
+        "itunes_sd",
+        "photos",
+        "other",
         "_scanned",
     )
 

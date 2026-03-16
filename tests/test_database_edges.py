@@ -1,8 +1,5 @@
 """Tests for database.py edge cases, error paths, and from_file()."""
 
-import os
-import struct
-
 import pytest
 
 from pygpod.exceptions import DatabaseError, MountPointError, TrackError
@@ -87,7 +84,7 @@ class TestDatabaseSortIndexes:
             db.remove_track(track)
         db.save()
 
-        # Should not crash — sort indexes are just empty
+        # Should not crash - sort indexes are just empty
         db2 = Database(writable_ipod)
         assert len(db2.tracks) == 0
 
@@ -96,7 +93,7 @@ class TestDatabaseSortIndexes:
 
         ipod, mp3 = writable_ipod_with_mp3
         db = Database(ipod)
-        track = db.add_track(mp3, title="Скрябін", artist="Українська Рок")
+        db.add_track(mp3, title="Скрябін", artist="Українська Рок")
         db.save()
 
         db2 = Database(ipod)
@@ -108,7 +105,7 @@ class TestDatabaseSortIndexes:
 
         ipod, mp3 = writable_ipod_with_mp3
         db = Database(ipod)
-        track = db.add_track(mp3, title="", artist="")
+        db.add_track(mp3, title="", artist="")
         db.save()
 
         # Should not crash

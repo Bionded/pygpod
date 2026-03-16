@@ -1,40 +1,22 @@
-"""Tests for pygpod.__init__ — discover(), mount resolution, optional deps."""
+"""Tests for pygpod.__init__ - discover(), mount resolution, optional deps."""
 
-import pathlib
 import sys
 from types import SimpleNamespace
 from unittest import mock
 
-import pytest
-
-
 # =========================================================================
-# discover() — Linux mount scanning
+# discover() - Linux mount scanning
 # =========================================================================
 
 
 class TestDiscoverLinux:
     @mock.patch("platform.system", return_value="Linux")
-    def test_scans_media_and_mnt(self, _mock_sys, tmp_path):
+    def test_scans_media_and_mnt(self, _mock_sys):
         """discover() scans /media, /run/media, /mnt on Linux."""
         import pygpod
 
-        # Create fake mount dirs with no iPods
-        media = tmp_path / "media"
-        media.mkdir()
-        run_media = tmp_path / "run_media"
-        run_media.mkdir()
-        mnt = tmp_path / "mnt"
-        mnt.mkdir()
-        (mnt / "some_drive").mkdir()
-
-        with mock.patch("pathlib.Path", wraps=pathlib.Path) as mock_path:
-            # Replace the hardcoded paths
-            orig_init = pathlib.Path.__new__
-
-            results = pygpod.discover()
-            # Should return list (may be empty — no real iPods on test system)
-            assert isinstance(results, list)
+        results = pygpod.discover()
+        assert isinstance(results, list)
 
     @mock.patch("platform.system", return_value="Linux")
     def test_finds_ipod_at_mount(self, _mock_sys, tmp_path):
@@ -44,10 +26,12 @@ class TestDiscoverLinux:
         # Create a fake iPod at a path
         ipod = tmp_path / "fake_ipod"
         from tests.conftest import _generate_pure_python_fixture
+
         _generate_pure_python_fixture(str(ipod))
 
         # Mock validate_mountpoint to accept our fixture
         orig_validate = pygpod.validate_mountpoint
+
         def mock_validate(path):
             if path == str(ipod):
                 return True
@@ -63,7 +47,7 @@ class TestDiscoverLinux:
 
 
 # =========================================================================
-# discover() — Darwin mount scanning
+# discover() - Darwin mount scanning
 # =========================================================================
 
 
@@ -77,7 +61,7 @@ class TestDiscoverDarwin:
 
 
 # =========================================================================
-# discover() — Windows mount scanning
+# discover() - Windows mount scanning
 # =========================================================================
 
 
@@ -91,7 +75,7 @@ class TestDiscoverWindows:
 
 
 # =========================================================================
-# discover() — USB fallback
+# discover() - USB fallback
 # =========================================================================
 
 
@@ -147,28 +131,32 @@ class TestDiscoverUSB:
 
 
 # =========================================================================
-# _resolve_usb_mount_points — per-OS
+# _resolve_usb_mount_points - per-OS
 # =========================================================================
 
 
 class TestResolveUSBMounts:
     def test_linux(self):
         from pygpod import _resolve_usb_mount_points
+
         result = _resolve_usb_mount_points("Linux")
         assert isinstance(result, list)
 
     def test_darwin(self):
         from pygpod import _resolve_usb_mount_points
+
         result = _resolve_usb_mount_points("Darwin")
         assert isinstance(result, list)
 
     def test_windows(self):
         from pygpod import _resolve_usb_mount_points
+
         result = _resolve_usb_mount_points("Windows")
         assert isinstance(result, list)
 
     def test_unknown_os(self):
         from pygpod import _resolve_usb_mount_points
+
         assert _resolve_usb_mount_points("Haiku") == []
 
 
@@ -201,18 +189,21 @@ class TestResolveMacOSUSB:
     def test_macos_with_diskutil(self):
         """macOS resolution parses diskutil plist output."""
         import plistlib
+
         from pygpod import _resolve_macos_usb_mounts
 
-        fake_plist = plistlib.dumps({
-            "AllDisksAndPartitions": [
-                {"MountPoint": "/Volumes/IPOD"},
-                {
-                    "Partitions": [
-                        {"MountPoint": "/Volumes/USB_DRIVE"},
-                    ]
-                },
-            ]
-        })
+        fake_plist = plistlib.dumps(
+            {
+                "AllDisksAndPartitions": [
+                    {"MountPoint": "/Volumes/IPOD"},
+                    {
+                        "Partitions": [
+                            {"MountPoint": "/Volumes/USB_DRIVE"},
+                        ]
+                    },
+                ]
+            }
+        )
 
         with mock.patch("subprocess.check_output", return_value=fake_plist):
             result = _resolve_macos_usb_mounts()
@@ -221,6 +212,7 @@ class TestResolveMacOSUSB:
 
     def test_macos_empty_response(self):
         import plistlib
+
         from pygpod import _resolve_macos_usb_mounts
 
         fake_plist = plistlib.dumps({"AllDisksAndPartitions": []})
@@ -270,12 +262,13 @@ class TestOptionalDeps:
     def test_no_warning_when_all_installed(self):
         """No warning when mutagen, PIL, usb are available."""
         import warnings
-        # Just verify import doesn't crash — we have all deps installed
-        with warnings.catch_warnings(record=True) as w:
+
+        # Just verify import doesn't crash - we have all deps installed
+        with warnings.catch_warnings(record=True):
             warnings.simplefilter("always")
             # Re-run the check
-            import importlib
             # Can't easily re-trigger _check_optional_deps since it's deleted
             # Just verify pygpod imported without warnings in our test env
             import pygpod
+
             assert pygpod.__version__

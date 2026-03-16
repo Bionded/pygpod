@@ -173,7 +173,7 @@ def _safe_int(s: str) -> int:
 # Audio formats supported by all iPods
 _BASE_AUDIO_EXTS = {".mp3", ".m4a", ".m4b", ".m4p", ".aac", ".wav", ".aiff", ".aif"}
 
-# Video extensions (not validated here — resolution/codec limits vary too much)
+# Video extensions (not validated here - resolution/codec limits vary too much)
 VIDEO_EXTS = {".m4v", ".mp4", ".mov"}
 
 # Audio formats that require conversion (never supported by any iPod)

@@ -1,11 +1,9 @@
 """Tests to improve coverage on artwork, tags, device, and database modules."""
 
 import os
-import shutil
 import struct
 
 import pytest
-
 
 # =========================================================================
 # Tags (mutagen-based)
@@ -283,7 +281,7 @@ class TestDatabaseOperations:
         db_path = os.path.join(writable_ipod, "iPod_Control", "iTunes", "iTunesDB")
         with open(db_path, "rb") as f:
             data = f.read()
-        h58 = data[0x58:0x58 + 20]
+        h58 = data[0x58 : 0x58 + 20]
         assert h58 != b"\x00" * 20  # hash should be non-zero
 
     def test_mhsd_order_after_save(self, writable_ipod):
@@ -301,7 +299,7 @@ class TestDatabaseOperations:
         pos = hdr_len
         types = []
         while pos < len(data) - 8:
-            if data[pos:pos + 4] != b"mhsd":
+            if data[pos : pos + 4] != b"mhsd":
                 break
             s_type = struct.unpack_from("<I", data, pos + 12)[0]
             s_total = struct.unpack_from("<I", data, pos + 8)[0]
@@ -329,7 +327,7 @@ class TestDatabaseOperations:
         hdr_len = struct.unpack_from("<I", data, 4)[0]
         pos = hdr_len
         while pos < len(data) - 8:
-            if data[pos:pos + 4] != b"mhsd":
+            if data[pos : pos + 4] != b"mhsd":
                 break
             s_type = struct.unpack_from("<I", data, pos + 12)[0]
             s_hdr = struct.unpack_from("<I", data, pos + 4)[0]
@@ -345,9 +343,9 @@ class TestDatabaseOperations:
                 # Walk MHODs looking for type 52/53
                 mhod_pos = mhyp_pos + mhyp_hdr
                 while mhod_pos < mhyp_pos + mhyp_total - 8:
-                    if data[mhod_pos:mhod_pos + 4] == b"mhip":
+                    if data[mhod_pos : mhod_pos + 4] == b"mhip":
                         break
-                    if data[mhod_pos:mhod_pos + 4] != b"mhod":
+                    if data[mhod_pos : mhod_pos + 4] != b"mhod":
                         break
                     md_hdr = struct.unpack_from("<I", data, mhod_pos + 4)[0]
                     md_total = struct.unpack_from("<I", data, mhod_pos + 8)[0]
@@ -376,7 +374,7 @@ class TestDatabaseOperations:
 
 
 class TestArtworkPixelFormats:
-    def test_create_thumbnail_rgb565(self):
+    def test_create_thumbnail_rgb565(self, tmp_path):
         try:
             from PIL import Image
         except ImportError:
@@ -384,13 +382,10 @@ class TestArtworkPixelFormats:
 
         from pygpod.model.artwork import create_thumbnail
 
-        import tempfile
-
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-            img = Image.new("RGB", (200, 200), color=(255, 0, 0))
-            img.save(f.name, "PNG")
-            thumb = create_thumbnail(f.name, 1060, 320, 320)
-            os.unlink(f.name)
+        png_path = str(tmp_path / "test.png")
+        img = Image.new("RGB", (200, 200), color=(255, 0, 0))
+        img.save(png_path, "PNG")
+        thumb = create_thumbnail(png_path, 1060, 320, 320)
 
         assert thumb is not None
         assert len(thumb) == 320 * 320 * 2
@@ -414,9 +409,9 @@ class TestChecksumRoundTrip:
 
         from pygpod.hash.hash58 import compute_hash58
 
-        original_hash = data[0x58:0x58 + 20]
+        original_hash = data[0x58 : 0x58 + 20]
         recomputed = compute_hash58(data, "000A2700213749FF")
-        assert recomputed[0x58:0x58 + 20] == original_hash
+        assert recomputed[0x58 : 0x58 + 20] == original_hash
 
 
 # =========================================================================

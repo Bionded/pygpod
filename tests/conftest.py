@@ -2,7 +2,7 @@
 
 Provides session-scoped fixtures for iPod filesystem, generated MP3 files,
 and writable iPod directories. All fixtures are built in pure Python using
-pygpod itself — no gcc, libgpod, or ffmpeg required.
+pygpod itself - no gcc, libgpod, or ffmpeg required.
 
 If gcc + libgpod + ffmpeg ARE available, the C-based fixture builder is used
 for integration tests (richer fixture with cover art, video tracks, etc.).
@@ -82,8 +82,7 @@ def _make_minimal_png(path, width=64, height=64, color=(0, 100, 200)):
         return struct.pack(">I", len(data)) + c + struct.pack(">I", crc)
 
     with open(path, "wb") as f:
-        f.write(sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", compressed)
-                + chunk(b"IEND", b""))
+        f.write(sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", compressed) + chunk(b"IEND", b""))
 
 
 # -------------------------------------------------------------------------
@@ -93,14 +92,22 @@ def _make_minimal_png(path, width=64, height=64, color=(0, 100, 200)):
 _HAS_FFMPEG = shutil.which("ffmpeg") is not None
 
 
-def _generate_mp3_ffmpeg(path, freq=440, title="", artist="", album="", genre="",
-                         year=0, track_num=0, cover_png=None):
+def _generate_mp3_ffmpeg(
+    path, freq=440, title="", artist="", album="", genre="", year=0, track_num=0, cover_png=None
+):
     """Generate a real MP3 with ID3 tags using ffmpeg."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     cmd = [
-        "ffmpeg", "-y", "-f", "lavfi", "-i",
+        "ffmpeg",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
         f"sine=frequency={freq}:duration=1",
-        "-ar", "44100", "-ab", "128k",
+        "-ar",
+        "44100",
+        "-ab",
+        "128k",
     ]
     meta = {}
     if title:
@@ -123,18 +130,23 @@ def _generate_mp3_ffmpeg(path, freq=440, title="", artist="", album="", genre=""
     # Embed cover art if provided
     if cover_png and os.path.isfile(cover_png):
         try:
+            from mutagen.id3 import APIC
             from mutagen.mp3 import MP3
-            from mutagen.id3 import APIC, ID3
 
             audio = MP3(path)
             if audio.tags is None:
                 audio.add_tags()
             with open(cover_png, "rb") as f:
                 art_data = f.read()
-            audio.tags.add(APIC(
-                encoding=0, mime="image/png", type=3,
-                desc="Cover", data=art_data,
-            ))
+            audio.tags.add(
+                APIC(
+                    encoding=0,
+                    mime="image/png",
+                    type=3,
+                    desc="Cover",
+                    data=art_data,
+                )
+            )
             audio.save()
         except ImportError:
             pass
@@ -207,12 +219,18 @@ def _generate_pure_python_fixture(dest_dir):
     use_ffmpeg = _HAS_FFMPEG
     mp3_paths = []
     for i, (title, artist, album, genre, year, track_num, freq) in enumerate(TRACKS_META):
-        mp3_path = os.path.join(media_dir, f"track_{i+1:02d}.mp3")
+        mp3_path = os.path.join(media_dir, f"track_{i + 1:02d}.mp3")
         if use_ffmpeg:
             try:
                 _generate_mp3_ffmpeg(
-                    mp3_path, freq=freq, title=title, artist=artist,
-                    album=album, genre=genre, year=year, track_num=track_num,
+                    mp3_path,
+                    freq=freq,
+                    title=title,
+                    artist=artist,
+                    album=album,
+                    genre=genre,
+                    year=year,
+                    track_num=track_num,
                     cover_png=cover_png if i < 15 else None,  # first 15 get art
                 )
             except (subprocess.CalledProcessError, FileNotFoundError):
@@ -269,6 +287,7 @@ def _generate_pure_python_fixture(dest_dir):
 # C-based fixture (richer, for integration tests)
 # -------------------------------------------------------------------------
 
+
 def _generate_c_fixture():
     """Auto-generate the iPod fixture using the integration C builder.
 
@@ -281,14 +300,22 @@ def _generate_c_fixture():
         return None
 
     try:
-        cflags = subprocess.check_output(
-            ["pkg-config", "--cflags", "libgpod-1.0", "glib-2.0"],
-            stderr=subprocess.DEVNULL,
-        ).decode().strip()
-        libs = subprocess.check_output(
-            ["pkg-config", "--libs", "libgpod-1.0", "glib-2.0"],
-            stderr=subprocess.DEVNULL,
-        ).decode().strip()
+        cflags = (
+            subprocess.check_output(
+                ["pkg-config", "--cflags", "libgpod-1.0", "glib-2.0"],
+                stderr=subprocess.DEVNULL,
+            )
+            .decode()
+            .strip()
+        )
+        libs = (
+            subprocess.check_output(
+                ["pkg-config", "--libs", "libgpod-1.0", "glib-2.0"],
+                stderr=subprocess.DEVNULL,
+            )
+            .decode()
+            .strip()
+        )
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
 
@@ -307,21 +334,52 @@ def _generate_c_fixture():
             path = os.path.join(media_dir, f"media_{i + 1:02d}.{ext}")
             if is_video:
                 subprocess.run(
-                    ["ffmpeg", "-y",
-                     "-f", "lavfi", "-i", f"color=c=blue:s=320x240:d=1",
-                     "-f", "lavfi", "-i", f"sine=frequency={freq}:duration=1",
-                     "-codec:v", "libx264", "-preset", "ultrafast",
-                     "-pix_fmt", "yuv420p", "-codec:a", "aac", "-b:a", "128k",
-                     "-shortest", path],
-                    capture_output=True, check=True,
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "color=c=blue:s=320x240:d=1",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        f"sine=frequency={freq}:duration=1",
+                        "-codec:v",
+                        "libx264",
+                        "-preset",
+                        "ultrafast",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-codec:a",
+                        "aac",
+                        "-b:a",
+                        "128k",
+                        "-shortest",
+                        path,
+                    ],
+                    capture_output=True,
+                    check=True,
                 )
             else:
                 subprocess.run(
-                    ["ffmpeg", "-y", "-f", "lavfi", "-i",
-                     f"sine=frequency={freq}:duration=1",
-                     "-codec:a", "libmp3lame", "-b:a", "128k", "-ar", "44100",
-                     path],
-                    capture_output=True, check=True,
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        f"sine=frequency={freq}:duration=1",
+                        "-codec:a",
+                        "libmp3lame",
+                        "-b:a",
+                        "128k",
+                        "-ar",
+                        "44100",
+                        path,
+                    ],
+                    capture_output=True,
+                    check=True,
                 )
 
         cover_art = os.path.join(media_dir, "cover_art.png")
@@ -329,9 +387,17 @@ def _generate_c_fixture():
 
         os.makedirs(IPOD_FS_DIR, exist_ok=True)
         result = subprocess.run(
-            [binary, IPOD_FS_DIR, FIXTURE_MODEL, media_dir,
-             FIXTURE_GUID, str(FIXTURE_MUSIC_DIRS), cover_art],
-            capture_output=True, text=True,
+            [
+                binary,
+                IPOD_FS_DIR,
+                FIXTURE_MODEL,
+                media_dir,
+                FIXTURE_GUID,
+                str(FIXTURE_MUSIC_DIRS),
+                cover_art,
+            ],
+            capture_output=True,
+            text=True,
         )
         if result.returncode != 0:
             shutil.rmtree(IPOD_FS_DIR, ignore_errors=True)
@@ -371,12 +437,17 @@ def _generate_itunessd(ipod_dir):
         elif colon_path.endswith((".wav", ".aiff")):
             ft = 4
 
-        sd.tracks.append(ITunesSDTrack(
-            start_pos_ms=0, stop_pos_ms=0, volume=100,
-            file_type=ft, filename=colon_path,
-            shuffle_flag=0 if track.is_podcast or track.is_audiobook else 1,
-            bookmark_flag=1 if track.is_podcast or track.is_audiobook else 0,
-        ))
+        sd.tracks.append(
+            ITunesSDTrack(
+                start_pos_ms=0,
+                stop_pos_ms=0,
+                volume=100,
+                file_type=ft,
+                filename=colon_path,
+                shuffle_flag=0 if track.is_podcast or track.is_audiobook else 1,
+                bookmark_flag=1 if track.is_podcast or track.is_audiobook else 0,
+            )
+        )
 
     sd_path = os.path.join(ipod_dir, "iPod_Control", "iTunes", "iTunesSD")
     with open(sd_path, "wb") as f:
@@ -386,6 +457,7 @@ def _generate_itunessd(ipod_dir):
 # =========================================================================
 # Fixtures
 # =========================================================================
+
 
 @pytest.fixture(scope="session")
 def ipod_fs_path(tmp_path_factory):
@@ -452,8 +524,12 @@ def generated_mp3(tmp_path_factory):
     if _HAS_FFMPEG:
         try:
             _generate_mp3_ffmpeg(
-                mp3_path, freq=440, title="Test Track",
-                artist="Test Artist", album="Test Album", genre="Test",
+                mp3_path,
+                freq=440,
+                title="Test Track",
+                artist="Test Artist",
+                album="Test Album",
+                genre="Test",
             )
             return mp3_path
         except (subprocess.CalledProcessError, FileNotFoundError):
@@ -472,8 +548,11 @@ def generated_mp3_with_art(tmp_path_factory):
     if _HAS_FFMPEG:
         try:
             _generate_mp3_ffmpeg(
-                mp3_path, freq=440, title="Art Track",
-                artist="Art Artist", album="Art Album",
+                mp3_path,
+                freq=440,
+                title="Art Track",
+                artist="Art Artist",
+                album="Art Album",
                 cover_png=cover_path,
             )
             return mp3_path

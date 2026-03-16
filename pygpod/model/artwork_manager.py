@@ -95,8 +95,7 @@ class ArtworkManager:
             self._formats = get_cover_art_formats(self._generation) or []
             if not self._formats:
                 logger.warning(
-                    "No artwork formats for generation %s, "
-                    "falling back to iPod Classic formats",
+                    "No artwork formats for generation %s, falling back to iPod Classic formats",
                     self._generation,
                 )
                 from ..device.artwork_formats import _CLASSIC_COVER_ART
@@ -164,9 +163,7 @@ class ArtworkManager:
             return None
         return self.add_artwork_data(dbid, art_data)
 
-    def add_artwork_data(
-        self, dbid: int, art_data: bytes, save: bool = True
-    ) -> Optional[int]:
+    def add_artwork_data(self, dbid: int, art_data: bytes, save: bool = True) -> Optional[int]:
         """Add raw image data as artwork for a track.
 
         Args:
@@ -203,9 +200,7 @@ class ArtworkManager:
             mhni_records = []
 
             for fmt in self.formats:
-                thumb_data = create_thumbnail(
-                    tmp_path, fmt.format_id, fmt.width, fmt.height
-                )
+                thumb_data = create_thumbnail(tmp_path, fmt.format_id, fmt.width, fmt.height)
                 if thumb_data is None:
                     continue
 
@@ -215,9 +210,7 @@ class ArtworkManager:
                     thumb_data = thumb_data + b"\x00" * (block_size - len(thumb_data))
 
                 # Write to .ithmb file
-                ithmb_path = os.path.join(
-                    self._artwork_dir, f"F{fmt.format_id}_1.ithmb"
-                )
+                ithmb_path = os.path.join(self._artwork_dir, f"F{fmt.format_id}_1.ithmb")
                 offset = self._ithmb_offsets.get(fmt.format_id, 0)
 
                 if os.path.isfile(ithmb_path):
@@ -241,9 +234,7 @@ class ArtworkManager:
                 return None
 
             # Create MHII record
-            mhii = self._create_mhii(
-                image_id, dbid, mhni_records, source_size=len(art_data)
-            )
+            mhii = self._create_mhii(image_id, dbid, mhni_records, source_size=len(art_data))
 
             # Add to MHLI in MHSD type 1
             mhli = self._get_or_create_mhli()

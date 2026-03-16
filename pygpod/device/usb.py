@@ -83,8 +83,12 @@ def _detect_pyusb() -> Optional[List[USBDeviceInfo]]:
                 manufacturer = usb.util.get_string(dev, dev.iManufacturer) or ""
                 product_name = usb.util.get_string(dev, dev.iProduct) or ""
             except Exception:
-                logger.debug("Failed to read USB descriptors for device %04x:%04x",
-                             dev.idVendor, dev.idProduct, exc_info=True)
+                logger.debug(
+                    "Failed to read USB descriptors for device %04x:%04x",
+                    dev.idVendor,
+                    dev.idProduct,
+                    exc_info=True,
+                )
 
             guid = _guid_from_serial(usb_serial)
 
@@ -277,7 +281,9 @@ def _run_powershell(command: str) -> List[str]:
     try:
         output = subprocess.check_output(
             ["powershell", "-NoProfile", "-Command", command],
-            text=True, timeout=10, stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+            stderr=subprocess.DEVNULL,
         )
         return [ln for ln in output.splitlines() if ln.strip()]
     except (subprocess.SubprocessError, FileNotFoundError):
@@ -576,10 +582,18 @@ def _read_serial_windows() -> Optional[str]:
     # Fallback: wmic (older Windows)
     try:
         output = subprocess.check_output(
-            ["wmic", "diskdrive", "where",
-             "InterfaceType='USB' and (Model like '%iPod%' or Model like '%Apple%')",
-             "get", "SerialNumber", "/value"],
-            text=True, timeout=10, stderr=subprocess.DEVNULL,
+            [
+                "wmic",
+                "diskdrive",
+                "where",
+                "InterfaceType='USB' and (Model like '%iPod%' or Model like '%Apple%')",
+                "get",
+                "SerialNumber",
+                "/value",
+            ],
+            text=True,
+            timeout=10,
+            stderr=subprocess.DEVNULL,
         )
         for wline in output.splitlines():
             if wline.startswith("SerialNumber="):

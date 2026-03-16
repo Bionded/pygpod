@@ -1,10 +1,5 @@
 """Tests for the pygpod public API (top-level imports from __init__.py)."""
 
-import platform
-from unittest import mock
-
-import pytest
-
 
 class TestPublicImports:
     """Verify all public symbols are importable from pygpod."""

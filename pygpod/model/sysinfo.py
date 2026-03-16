@@ -92,7 +92,6 @@ class SysInfo:
         return self.extended.get("FamilyID")
 
 
-
 def parse_sysinfo(path: str) -> SysInfo:
     """Parse a SysInfo plain text file.
 

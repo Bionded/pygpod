@@ -1,10 +1,8 @@
-"""Extended tests for smartplaylist.py — date rules, range rules, binary_and,
+"""Extended tests for smartplaylist.py - date rules, range rules, binary_and,
 limit types, sort orders, parse/write edge cases."""
 
 import struct
 import time
-
-import pytest
 
 from pygpod.db.parser import Record
 from pygpod.db.writer import make_string_mhod
@@ -19,7 +17,6 @@ from pygpod.model.smartplaylist import (
     SPLRule,
     apply_limit,
     eval_rule,
-    evaluate_smart_playlist,
     get_field_type,
     parse_spl_prefs,
     parse_spl_rules,
@@ -38,11 +35,20 @@ def _make_track(**kwargs):
     rec.raw_header[0:4] = b"mhit"
     struct.pack_into("<I", rec.raw_header, 4, hdr_len)
     defaults = {
-        "track_id": 1, "dbid": 1, "media_type": 1,
-        "play_count": 0, "rating": 0, "year": 0,
-        "bitrate": 128, "tracklen": 180000, "file_size": 5000000,
-        "track_number": 1, "samplerate": 44100 << 16,
-        "time_added": 0, "time_played": 0, "time_modified": 0,
+        "track_id": 1,
+        "dbid": 1,
+        "media_type": 1,
+        "play_count": 0,
+        "rating": 0,
+        "year": 0,
+        "bitrate": 128,
+        "tracklen": 180000,
+        "file_size": 5000000,
+        "track_number": 1,
+        "samplerate": 44100 << 16,
+        "time_added": 0,
+        "time_played": 0,
+        "time_modified": 0,
     }
     defaults.update(kwargs)
     rec.fields = defaults
@@ -60,7 +66,7 @@ def _make_track(**kwargs):
 
 
 # =========================================================================
-# get_field_type — cover UNKNOWN and BINARY_AND
+# get_field_type - cover UNKNOWN and BINARY_AND
 # =========================================================================
 
 
@@ -243,20 +249,23 @@ class TestBinaryAndRules:
 class TestIntRangeRules:
     def test_in_range(self):
         track = _make_track(year=2020)
-        rule = SPLRule(field=SPLField.YEAR, action=SPLAction.IS_IN_THE_RANGE,
-                       fromvalue=2018, tovalue=2022)
+        rule = SPLRule(
+            field=SPLField.YEAR, action=SPLAction.IS_IN_THE_RANGE, fromvalue=2018, tovalue=2022
+        )
         assert eval_rule(rule, track) is True
 
     def test_not_in_range(self):
         track = _make_track(year=2015)
-        rule = SPLRule(field=SPLField.YEAR, action=SPLAction.IS_NOT_IN_THE_RANGE,
-                       fromvalue=2018, tovalue=2022)
+        rule = SPLRule(
+            field=SPLField.YEAR, action=SPLAction.IS_NOT_IN_THE_RANGE, fromvalue=2018, tovalue=2022
+        )
         assert eval_rule(rule, track) is True
 
     def test_in_range_boundary(self):
         track = _make_track(year=2018)
-        rule = SPLRule(field=SPLField.YEAR, action=SPLAction.IS_IN_THE_RANGE,
-                       fromvalue=2018, tovalue=2022)
+        rule = SPLRule(
+            field=SPLField.YEAR, action=SPLAction.IS_IN_THE_RANGE, fromvalue=2018, tovalue=2022
+        )
         assert eval_rule(rule, track) is True
 
     def test_unknown_int_action(self):
@@ -266,7 +275,7 @@ class TestIntRangeRules:
 
 
 # =========================================================================
-# String rule — unknown action falls through
+# String rule - unknown action falls through
 # =========================================================================
 
 
@@ -296,9 +305,10 @@ class TestUnknownField:
 
 class TestApplyLimit:
     def _tracks(self, n=5):
-        return [_make_track(
-            track_id=i, title=f"T{i}", tracklen=180000, file_size=5_000_000
-        ) for i in range(n)]
+        return [
+            _make_track(track_id=i, title=f"T{i}", tracklen=180000, file_size=5_000_000)
+            for i in range(n)
+        ]
 
     def test_limit_songs(self):
         prefs = SPLPrefs()
@@ -390,12 +400,14 @@ class TestSPLRoundTrip:
         assert parsed[0].fromvalue == 10
 
     def test_write_parse_date_rule(self):
-        rules = [SPLRule(
-            field=SPLField.DATE_ADDED,
-            action=SPLAction.IS_IN_THE_RANGE,
-            fromdate=3600000000,
-            todate=3700000000,
-        )]
+        rules = [
+            SPLRule(
+                field=SPLField.DATE_ADDED,
+                action=SPLAction.IS_IN_THE_RANGE,
+                fromdate=3600000000,
+                todate=3700000000,
+            )
+        ]
         data = write_spl_rules(SPLMatch.AND, rules)
         match, parsed = parse_spl_rules(data)
         assert parsed[0].fromdate == 3600000000
@@ -405,7 +417,12 @@ class TestSPLRoundTrip:
         rules = [
             SPLRule(field=SPLField.ARTIST, action=SPLAction.CONTAINS, string="Beatles"),
             SPLRule(field=SPLField.YEAR, action=SPLAction.IS_GREATER_THAN, fromvalue=1965),
-            SPLRule(field=SPLField.RATING, action=SPLAction.IS_IN_THE_RANGE, fromvalue=60, tovalue=100),
+            SPLRule(
+                field=SPLField.RATING,
+                action=SPLAction.IS_IN_THE_RANGE,
+                fromvalue=60,
+                tovalue=100,
+            ),
         ]
         data = write_spl_rules(SPLMatch.AND, rules)
         match, parsed = parse_spl_rules(data)

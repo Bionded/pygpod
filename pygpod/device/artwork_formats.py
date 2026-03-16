@@ -40,9 +40,14 @@ class ArtworkFormatInfo(NamedTuple):
 
 def bytes_per_pixel(fmt: ThumbFormat) -> float:
     """Get bytes per pixel for a pixel format."""
-    if fmt in (ThumbFormat.RGB565_LE, ThumbFormat.RGB565_BE,
-               ThumbFormat.RGB555_LE, ThumbFormat.RGB555_BE,
-               ThumbFormat.UYVY_LE, ThumbFormat.UYVY_BE):
+    if fmt in (
+        ThumbFormat.RGB565_LE,
+        ThumbFormat.RGB565_BE,
+        ThumbFormat.RGB555_LE,
+        ThumbFormat.RGB555_BE,
+        ThumbFormat.UYVY_LE,
+        ThumbFormat.UYVY_BE,
+    ):
         return 2.0
     if fmt in (ThumbFormat.I420_LE, ThumbFormat.I420_BE):
         return 1.5

@@ -2,8 +2,6 @@
 
 import datetime
 
-import pytest
-
 from pygpod.utils.datetime import MAC_EPOCH_OFFSET, datetime_to_mac, mac_to_datetime, now_mac
 
 
@@ -32,12 +30,12 @@ class TestMacToDatetime:
         assert dt == datetime.datetime.min
 
     def test_negative_handled(self):
-        # Negative timestamp — may return min or a pre-1904 date depending on platform
+        # Negative timestamp - may return min or a pre-1904 date depending on platform
         dt = mac_to_datetime(-1)
         assert isinstance(dt, datetime.datetime)
 
     def test_small_value_pre_1970(self):
-        # Small positive value (before 1970) — should be valid pre-1970 date
+        # Small positive value (before 1970) - should be valid pre-1970 date
         dt = mac_to_datetime(1)
         # 1 second after 1904-01-01, Unix epoch offset makes this very negative
         # Should return min due to OSError on platforms that don't support pre-1970

@@ -688,12 +688,12 @@ def write_spl_rules(match: SPLMatch, rules: List[SPLRule], version: int = 1) -> 
             # Non-string rule: data_len(4) + 6x uint64 values + 5x uint32 unknowns
             # data_len is always 0x44 (68 bytes)
             data += struct.pack(">I", 0x44)
-            data += struct.pack(">q", rule.fromvalue)   # fromvalue (int64)
-            data += struct.pack(">q", rule.fromdate)    # fromdate (int64)
-            data += struct.pack(">Q", rule.fromunits)   # fromunits (uint64)
-            data += struct.pack(">q", rule.tovalue)     # tovalue (int64)
-            data += struct.pack(">q", rule.todate)      # todate (int64)
-            data += struct.pack(">Q", rule.tounits)     # tounits (uint64)
+            data += struct.pack(">q", rule.fromvalue)  # fromvalue (int64)
+            data += struct.pack(">q", rule.fromdate)  # fromdate (int64)
+            data += struct.pack(">Q", rule.fromunits)  # fromunits (uint64)
+            data += struct.pack(">q", rule.tovalue)  # tovalue (int64)
+            data += struct.pack(">q", rule.todate)  # todate (int64)
+            data += struct.pack(">Q", rule.tounits)  # tounits (uint64)
             data += b"\x00" * 20  # 5 x 4-byte unknown fields
 
     return bytes(data)

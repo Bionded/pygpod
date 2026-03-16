@@ -1,8 +1,6 @@
-"""Tests for Track model — full field coverage including read-only defaults."""
+"""Tests for Track model - full field coverage including read-only defaults."""
 
 import struct
-
-import pytest
 
 from pygpod.db.constants import (
     MEDIATYPE_AUDIO,

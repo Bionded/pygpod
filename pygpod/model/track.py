@@ -541,7 +541,7 @@ class Track:
         self._set_field_and_header_u32("stop_time", 0x48, value)
 
     # ========================================================================
-    # Read-only properties (structural — not safe to change)
+    # Read-only properties (structural - not safe to change)
     # ========================================================================
 
     @property

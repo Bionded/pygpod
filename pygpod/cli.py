@@ -134,11 +134,30 @@ def _add_tag_options(parser: argparse.ArgumentParser) -> None:
 def _collect_tag_overrides(args: argparse.Namespace) -> dict:
     """Collect non-None tag overrides from args into a dict for add_track()."""
     tag_keys = [
-        "title", "artist", "album", "genre", "composer", "comment",
-        "albumartist", "grouping", "year", "track_number", "total_tracks",
-        "cd_number", "total_cds", "category", "description", "subtitle",
-        "keywords", "podcast_url", "podcast_rss", "tvshow", "tvepisode",
-        "tvnetwork", "season_number", "episode_number",
+        "title",
+        "artist",
+        "album",
+        "genre",
+        "composer",
+        "comment",
+        "albumartist",
+        "grouping",
+        "year",
+        "track_number",
+        "total_tracks",
+        "cd_number",
+        "total_cds",
+        "category",
+        "description",
+        "subtitle",
+        "keywords",
+        "podcast_url",
+        "podcast_rss",
+        "tvshow",
+        "tvepisode",
+        "tvnetwork",
+        "season_number",
+        "episode_number",
     ]
     overrides = {}
     for key in tag_keys:

@@ -1,4 +1,4 @@
-"""Extended tests for iTunesDB parser — rare record types and edge cases.
+"""Extended tests for iTunesDB parser - rare record types and edge cases.
 
 Targets uncovered lines in parser.py: MHSD types 4/5/6/10, MHIA/MHLI parsing,
 unknown record fallback, zero-length/truncated data, SPLPREF/SPLRULES MHODs,
@@ -757,7 +757,7 @@ class TestParseMhyp:
 
 
 # ---------------------------------------------------------------------------
-# Tests: MHOD type dispatch — SPLPREF, SPLRULES, playlist, unknown
+# Tests: MHOD type dispatch - SPLPREF, SPLRULES, playlist, unknown
 # ---------------------------------------------------------------------------
 
 

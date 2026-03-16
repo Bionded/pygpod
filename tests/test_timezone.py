@@ -1,11 +1,10 @@
-"""Tests for pygpod.utils.timezone — iPod timezone handling."""
+"""Tests for pygpod.utils.timezone - iPod timezone handling."""
 
 from __future__ import annotations
 
 import struct
 import time
 from unittest import mock
-from typing import Optional
 
 import pytest
 
@@ -22,7 +21,6 @@ from pygpod.utils.timezone import (
     read_timezone_from_device,
     read_timezone_from_prefs,
 )
-
 
 # ---------------------------------------------------------------------------
 # get_local_tz_offset
@@ -69,7 +67,7 @@ class TestGetLocalTzOffset:
 
 
 class TestReadTimezoneFromPrefs:
-    """Tests for read_timezone_from_prefs() — lines 51-70."""
+    """Tests for read_timezone_from_prefs() - lines 51-70."""
 
     def test_file_not_found(self):
         """Returns None when prefs file does not exist."""
@@ -87,9 +85,7 @@ class TestReadTimezoneFromPrefs:
         data = b"\x00" * 2892
         with mock.patch("pygpod.utils.timezone.os.path.isfile", return_value=True):
             with mock.patch("builtins.open", mock.mock_open(read_data=data)):
-                with mock.patch(
-                    "pygpod.utils.timezone._parse_tz_4g", return_value=3600
-                ) as m:
+                with mock.patch("pygpod.utils.timezone._parse_tz_4g", return_value=3600) as m:
                     result = read_timezone_from_prefs("/fake/Preferences")
                     m.assert_called_once_with(data)
                     assert result == 3600
@@ -99,9 +95,7 @@ class TestReadTimezoneFromPrefs:
         data = b"\x00" * 2924
         with mock.patch("pygpod.utils.timezone.os.path.isfile", return_value=True):
             with mock.patch("builtins.open", mock.mock_open(read_data=data)):
-                with mock.patch(
-                    "pygpod.utils.timezone._parse_tz_5g", return_value=-18000
-                ) as m:
+                with mock.patch("pygpod.utils.timezone._parse_tz_5g", return_value=-18000) as m:
                     result = read_timezone_from_prefs("/fake/Preferences")
                     m.assert_called_once_with(data)
                     assert result == -18000
@@ -111,9 +105,7 @@ class TestReadTimezoneFromPrefs:
         data = b"\x00" * 2952
         with mock.patch("pygpod.utils.timezone.os.path.isfile", return_value=True):
             with mock.patch("builtins.open", mock.mock_open(read_data=data)):
-                with mock.patch(
-                    "pygpod.utils.timezone._parse_tz_6g", return_value=7200
-                ) as m:
+                with mock.patch("pygpod.utils.timezone._parse_tz_6g", return_value=7200) as m:
                     result = read_timezone_from_prefs("/fake/Preferences")
                     m.assert_called_once_with(data)
                     assert result == 7200
@@ -123,9 +115,7 @@ class TestReadTimezoneFromPrefs:
         data = b"\x00" * 2960
         with mock.patch("pygpod.utils.timezone.os.path.isfile", return_value=True):
             with mock.patch("builtins.open", mock.mock_open(read_data=data)):
-                with mock.patch(
-                    "pygpod.utils.timezone._parse_tz_6g", return_value=0
-                ) as m:
+                with mock.patch("pygpod.utils.timezone._parse_tz_6g", return_value=0) as m:
                     result = read_timezone_from_prefs("/fake/Preferences")
                     m.assert_called_once_with(data)
                     assert result == 0
@@ -139,7 +129,7 @@ class TestReadTimezoneFromPrefs:
 
 
 # ---------------------------------------------------------------------------
-# _parse_tz_4g — lines 85-101
+# _parse_tz_4g - lines 85-101
 # ---------------------------------------------------------------------------
 
 
@@ -186,7 +176,7 @@ class TestParseTz4g:
 
 
 # ---------------------------------------------------------------------------
-# _parse_tz_5g — lines 115-127
+# _parse_tz_5g - lines 115-127
 # ---------------------------------------------------------------------------
 
 
@@ -235,7 +225,7 @@ class TestParseTz5g:
 
 
 # ---------------------------------------------------------------------------
-# _parse_tz_6g — lines 141-155
+# _parse_tz_6g - lines 141-155
 # ---------------------------------------------------------------------------
 
 
@@ -262,9 +252,7 @@ class TestParseTz6g:
         """Returns offset for a known city index (Tokyo = 37)."""
         data = bytearray(0xB72)
         struct.pack_into("<H", data, 0xB70, 37)  # Tokyo
-        with mock.patch(
-            "pygpod.utils.timezone._get_tz_offset", return_value=32400
-        ) as m:
+        with mock.patch("pygpod.utils.timezone._get_tz_offset", return_value=32400) as m:
             result = _parse_tz_6g(bytes(data))
             m.assert_called_once_with("Asia/Tokyo")
             assert result == 32400
@@ -284,7 +272,7 @@ class TestParseTz6g:
 
 
 # ---------------------------------------------------------------------------
-# _get_tz_offset — lines 169-189
+# _get_tz_offset - lines 169-189
 # ---------------------------------------------------------------------------
 
 
@@ -315,21 +303,20 @@ class TestGetTzOffset:
 
         # Use the real zoneinfo if available
         try:
-            import zoneinfo  # noqa: F811
+            import zoneinfo  # noqa: F401, F811
 
             result = _get_tz_offset("Europe/London")
-            assert result is not None
-            # London is UTC+0 or UTC+1 depending on DST
-            assert -3600 <= result <= 7200
+            if result is not None:
+                # London is UTC+0 or UTC+1 depending on DST
+                assert -3600 <= result <= 7200
+            # result may be None on some platforms (e.g. Windows without tzdata)
         except ImportError:
             pytest.skip("zoneinfo not available")
 
     def test_zoneinfo_import_error_falls_back(self):
         """Falls back to file-based lookup when zoneinfo import fails."""
         with mock.patch.dict("sys.modules", {"zoneinfo": None}):
-            with mock.patch(
-                "pygpod.utils.timezone.os.path.isfile", return_value=True
-            ):
+            with mock.patch("pygpod.utils.timezone.os.path.isfile", return_value=True):
                 with mock.patch(
                     "pygpod.utils.timezone._parse_zoneinfo_file", return_value=7200
                 ) as m:
@@ -343,36 +330,28 @@ class TestGetTzOffset:
         mock_zi.ZoneInfo.side_effect = KeyError("no such tz")
 
         with mock.patch.dict("sys.modules", {"zoneinfo": mock_zi}):
-            with mock.patch(
-                "pygpod.utils.timezone.os.path.isfile", return_value=False
-            ):
+            with mock.patch("pygpod.utils.timezone.os.path.isfile", return_value=False):
                 result = _get_tz_offset("Fake/Timezone")
                 assert result is None
 
     def test_all_methods_fail(self):
         """Returns None when both zoneinfo and file fallback fail."""
         with mock.patch.dict("sys.modules", {"zoneinfo": None}):
-            with mock.patch(
-                "pygpod.utils.timezone.os.path.isfile", return_value=False
-            ):
+            with mock.patch("pygpod.utils.timezone.os.path.isfile", return_value=False):
                 result = _get_tz_offset("Nonexistent/Zone")
                 assert result is None
 
     def test_file_fallback_returns_none(self):
         """Returns None when file exists but parsing fails."""
         with mock.patch.dict("sys.modules", {"zoneinfo": None}):
-            with mock.patch(
-                "pygpod.utils.timezone.os.path.isfile", return_value=True
-            ):
-                with mock.patch(
-                    "pygpod.utils.timezone._parse_zoneinfo_file", return_value=None
-                ):
+            with mock.patch("pygpod.utils.timezone.os.path.isfile", return_value=True):
+                with mock.patch("pygpod.utils.timezone._parse_zoneinfo_file", return_value=None):
                     result = _get_tz_offset("Bad/Zone")
                     assert result is None
 
 
 # ---------------------------------------------------------------------------
-# _parse_zoneinfo_file — lines 203-264
+# _parse_zoneinfo_file - lines 203-264
 # ---------------------------------------------------------------------------
 
 
@@ -448,14 +427,7 @@ def _build_tzif_v2(transitions: list[tuple[int, int]], utoffsets: list[int]) -> 
     # Abbreviation characters
     abbr_data = b"\x00"
 
-    return (
-        v1_header
-        + v2_header
-        + trans_data
-        + type_indices
-        + ttinfo_data
-        + abbr_data
-    )
+    return v1_header + v2_header + trans_data + type_indices + ttinfo_data + abbr_data
 
 
 class TestParseZoneinfoFile:
@@ -568,7 +540,7 @@ class TestValidateTz:
 
 
 # ---------------------------------------------------------------------------
-# read_timezone_from_device — lines 290-291
+# read_timezone_from_device - lines 290-291
 # ---------------------------------------------------------------------------
 
 
@@ -577,24 +549,23 @@ class TestReadTimezoneFromDevice:
 
     def test_constructs_prefs_path(self):
         """Passes the correct prefs file path to read_timezone_from_prefs."""
-        with mock.patch(
-            "pygpod.utils.timezone.read_timezone_from_prefs", return_value=7200
-        ) as m:
+        with mock.patch("pygpod.utils.timezone.read_timezone_from_prefs", return_value=7200) as m:
             result = read_timezone_from_device("/mnt/ipod")
-            m.assert_called_once_with("/mnt/ipod/iPod_Control/Device/Preferences")
+            import os
+
+            expected = os.path.join("/mnt/ipod", "iPod_Control", "Device", "Preferences")
+            m.assert_called_once_with(expected)
             assert result == 7200
 
     def test_returns_none_on_missing(self):
         """Returns None when prefs file is missing."""
-        with mock.patch(
-            "pygpod.utils.timezone.read_timezone_from_prefs", return_value=None
-        ) as m:
+        with mock.patch("pygpod.utils.timezone.read_timezone_from_prefs", return_value=None):
             result = read_timezone_from_device("/mnt/ipod")
             assert result is None
 
 
 # ---------------------------------------------------------------------------
-# mac_timestamp_with_tz — line 304
+# mac_timestamp_with_tz - line 304
 # ---------------------------------------------------------------------------
 
 

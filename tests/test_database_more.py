@@ -50,9 +50,7 @@ class TestPodcastType3RebuildEmptyAlbum:
         db = Database(ipod)
 
         # Add a podcast track with NO album (empty string)
-        track = db.add_track(
-            mp3, media_type=0x00000004, title="NoAlbumPod", album=""
-        )
+        track = db.add_track(mp3, media_type=0x00000004, title="NoAlbumPod", album="")
         assert track.is_podcast
 
         # Save triggers _rebuild_type3_podcasts which groups by album
@@ -94,9 +92,7 @@ class TestSortIndexesEmptyFields:
             db.remove_track(t)
 
         # Add track with every sortable field empty
-        db.add_track(
-            mp3, title="", artist="", album="", genre="", composer=""
-        )
+        db.add_track(mp3, title="", artist="", album="", genre="", composer="")
         # Should not crash during save (which rebuilds sort indexes)
         db.save()
 

@@ -2,8 +2,6 @@
 
 import struct
 
-import pytest
-
 from pygpod.model.chapterdata import (
     Chapter,
     ChapterData,
@@ -11,7 +9,6 @@ from pygpod.model.chapterdata import (
     write_chapter_data,
     write_chapter_data_atom,
 )
-
 
 # =========================================================================
 # Chapter
@@ -83,7 +80,7 @@ class TestChapterData:
     def test_remove_chapter(self):
         cd = ChapterData()
         ch1 = cd.add_chapter("A", 1)
-        ch2 = cd.add_chapter("B", 5000)
+        cd.add_chapter("B", 5000)
         assert cd.chapter_count == 2
 
         result = cd.remove_chapter(ch1)
@@ -161,11 +158,13 @@ class TestParseChapterData:
         return buf
 
     def test_parse_basic(self):
-        data = self._build_binary([
-            ("Introduction", 1),
-            ("Main Content", 60000),
-            ("Conclusion", 180000),
-        ])
+        data = self._build_binary(
+            [
+                ("Introduction", 1),
+                ("Main Content", 60000),
+                ("Conclusion", 180000),
+            ]
+        )
         cd = parse_chapter_data(data)
         assert cd is not None
         assert cd.chapter_count == 3
@@ -190,10 +189,12 @@ class TestParseChapterData:
         assert cd.chapter_count == 0
 
     def test_parse_unicode_titles(self):
-        data = self._build_binary([
-            ("Розділ 1", 1),
-            ("日本語チャプター", 30000),
-        ])
+        data = self._build_binary(
+            [
+                ("Розділ 1", 1),
+                ("日本語チャプター", 30000),
+            ]
+        )
         cd = parse_chapter_data(data)
         assert cd.chapters[0].title == "Розділ 1"
         assert cd.chapters[1].title == "日本語チャプター"
@@ -316,7 +317,7 @@ class TestWriteChapterDataAtom:
         assert unk024 == cd.unk024
 
         # After 12-byte header: sean atom
-        sean_size = struct.unpack_from(">I", data, 12)[0]
+        struct.unpack_from(">I", data, 12)[0]
         sean_magic = data[16:20]
         assert sean_magic == b"sean"
 

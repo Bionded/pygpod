@@ -47,7 +47,7 @@ class DatabaseConfig:
     mhyp_sort_order: int = 1
 
     # -- Album / artist list generation --
-    generate_album_list: bool = True   # MHSD type 4
+    generate_album_list: bool = True  # MHSD type 4
     generate_artist_list: bool = True  # MHSD type 8
 
     # -- Chapter data format --
@@ -77,4 +77,3 @@ class DatabaseConfig:
     # Set to an int seed for reproducible random values (DBIDs, playlist IDs).
     # None means use system randomness.
     random_seed: Optional[int] = None
-

@@ -10,7 +10,6 @@ import os
 import pathlib
 import random
 import struct
-import tempfile
 from typing import Any, Dict, List, Optional
 
 from ..db.constants import (
@@ -185,7 +184,8 @@ class Database:
                 self._modified = True
                 logger.info(
                     "Merged play counts: %d tracks updated from %d entries",
-                    updated, len(entries),
+                    updated,
+                    len(entries),
                 )
 
                 # Delete the play count files so they aren't re-applied
@@ -363,8 +363,8 @@ class Database:
     def _get_artwork_manager(self):
         """Lazily create and return the ArtworkManager instance."""
         if not hasattr(self, "_artwork_manager") or self._artwork_manager is None:
-            from .artwork_manager import ArtworkManager
             from ..device.models import IpodGeneration
+            from .artwork_manager import ArtworkManager
 
             generation = self._device.generation if self._device else None
             if generation is None:
@@ -730,10 +730,7 @@ class Database:
             # Find matching type 3 MHYP
             mhyp3 = None
             for mhyp in mhlp3.children:
-                if (
-                    mhyp.magic == MHYP_MAGIC
-                    and mhyp.fields.get("playlist_id") == pid
-                ):
+                if mhyp.magic == MHYP_MAGIC and mhyp.fields.get("playlist_id") == pid:
                     mhyp3 = mhyp
                     break
             if mhyp3 is None:
@@ -741,9 +738,7 @@ class Database:
 
             # Collect track IDs from type 2
             track_ids = [
-                c.fields.get("track_id", 0)
-                for c in mhyp2.children
-                if c.magic == MHIP_MAGIC
+                c.fields.get("track_id", 0) for c in mhyp2.children if c.magic == MHIP_MAGIC
             ]
             if not track_ids:
                 continue
@@ -755,9 +750,7 @@ class Database:
                 album_groups.setdefault(album, []).append(tid)
 
             # Remove old MHIPs from type 3 MHYP
-            mhyp3.children = [
-                c for c in mhyp3.children if c.magic != MHIP_MAGIC
-            ]
+            mhyp3.children = [c for c in mhyp3.children if c.magic != MHIP_MAGIC]
 
             # Create hierarchical MHIPs
             for album_name, tids in sorted(album_groups.items()):
@@ -769,9 +762,7 @@ class Database:
                 for tid in tids:
                     member_id = next_id
                     next_id += 1
-                    member_mhip = self._create_podcast_member_mhip(
-                        member_id, tid, group_id
-                    )
+                    member_mhip = self._create_podcast_member_mhip(member_id, tid, group_id)
                     mhyp3.children.append(member_mhip)
 
             logger.debug(
@@ -1532,9 +1523,7 @@ class Database:
 
         return rec
 
-    def _create_podcast_group_mhip(
-        self, group_id: int, group_name: str
-    ) -> Record:
+    def _create_podcast_group_mhip(self, group_id: int, group_name: str) -> Record:
         """Create a podcast group MHIP (parent node for album/show grouping in type 3)."""
         header_len = DEFAULT_MHIP_HEADER_LEN
         header = bytearray(header_len)
@@ -1561,9 +1550,7 @@ class Database:
         rec.children.append(name_mhod)
         return rec
 
-    def _create_podcast_member_mhip(
-        self, member_id: int, track_id: int, group_ref: int
-    ) -> Record:
+    def _create_podcast_member_mhip(self, member_id: int, track_id: int, group_ref: int) -> Record:
         """Create a podcast member MHIP (child node referencing a track in type 3)."""
         header_len = DEFAULT_MHIP_HEADER_LEN
         header = bytearray(header_len)

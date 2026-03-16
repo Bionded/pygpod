@@ -1,6 +1,5 @@
 """Tests for SysInfo and SysInfoExtended parsing."""
 
-import os
 import plistlib
 
 import pytest
@@ -12,7 +11,6 @@ from pygpod.model.sysinfo import (
     parse_sysinfo_extended,
     read_sysinfo,
 )
-
 
 # =========================================================================
 # Fixtures

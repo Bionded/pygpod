@@ -1,10 +1,7 @@
 """Tests for Play Counts, iTunesStats, PlayCounts.plist, and OTG playlists."""
 
-import os
 import plistlib
 import struct
-
-import pytest
 
 from pygpod.db.playcounts import (
     PlayCountEntry,
@@ -16,7 +13,6 @@ from pygpod.db.playcounts import (
     read_otg_playlists,
     read_play_counts,
 )
-
 
 # =========================================================================
 # Play Counts (binary)
@@ -45,11 +41,13 @@ class TestParsePlayCounts:
         return buf
 
     def test_basic(self):
-        data = self._build([
-            {"play_count": 5, "time_played": 3700000000, "rating": 80},
-            {"play_count": 0, "time_played": 0, "rating": 0},
-            {"play_count": 3, "time_played": 3700001000, "rating": 60, "skip_count": 1},
-        ])
+        data = self._build(
+            [
+                {"play_count": 5, "time_played": 3700000000, "rating": 80},
+                {"play_count": 0, "time_played": 0, "rating": 0},
+                {"play_count": 3, "time_played": 3700001000, "rating": 60, "skip_count": 1},
+            ]
+        )
         entries = parse_play_counts(data)
         assert len(entries) == 3
         assert entries[0].play_count == 5
@@ -67,9 +65,12 @@ class TestParsePlayCounts:
         assert entries[0].time_played == 0
 
     def test_with_bookmark(self):
-        data = self._build([
-            {"play_count": 1, "bookmark_time": 45000},
-        ], entry_size=28)
+        data = self._build(
+            [
+                {"play_count": 1, "bookmark_time": 45000},
+            ],
+            entry_size=28,
+        )
         entries = parse_play_counts(data)
         assert entries[0].bookmark_time == 45000
 
@@ -86,10 +87,12 @@ class TestParsePlayCounts:
 
     def test_truncated_entries(self):
         # Says 10 entries but only data for 2
-        data = self._build([
-            {"play_count": 1},
-            {"play_count": 2},
-        ])
+        data = self._build(
+            [
+                {"play_count": 1},
+                {"play_count": 2},
+            ]
+        )
         # Overwrite entry count to 10
         data = bytearray(data)
         struct.pack_into("<I", data, 8, 10)
@@ -141,10 +144,12 @@ class TestParsePlaycountsPlist:
         return plistlib.dumps({"items": items})
 
     def test_basic(self):
-        data = self._build_plist([
-            {"playcount": 5, "rating": 80, "skipcount": 1, "bookmark": 1000},
-            {"playcount": 0},
-        ])
+        data = self._build_plist(
+            [
+                {"playcount": 5, "rating": 80, "skipcount": 1, "bookmark": 1000},
+                {"playcount": 0},
+            ]
+        )
         entries = parse_playcounts_plist(data)
         assert len(entries) == 2
         assert entries[0].play_count == 5
@@ -264,10 +269,22 @@ class TestApplyPlayCounts:
     def test_apply_basic(self):
         tracks = [self._make_track(play_count=10), self._make_track()]
         entries = [
-            PlayCountEntry(play_count=3, time_played=3700000000, rating=80,
-                           skip_count=0, time_skipped=0, bookmark_time=0),
-            PlayCountEntry(play_count=1, time_played=0, rating=-1,
-                           skip_count=2, time_skipped=3700001000, bookmark_time=5000),
+            PlayCountEntry(
+                play_count=3,
+                time_played=3700000000,
+                rating=80,
+                skip_count=0,
+                time_skipped=0,
+                bookmark_time=0,
+            ),
+            PlayCountEntry(
+                play_count=1,
+                time_played=0,
+                rating=-1,
+                skip_count=2,
+                time_skipped=3700001000,
+                bookmark_time=5000,
+            ),
         ]
         updated = apply_play_counts(tracks, entries)
         assert updated == 2
@@ -337,9 +354,7 @@ class TestReadFromMountpoint:
         """Plist takes priority over iTunesStats and binary."""
         itunes = tmp_path / "iPod_Control" / "iTunes"
         itunes.mkdir(parents=True)
-        (itunes / "PlayCounts.plist").write_bytes(
-            plistlib.dumps({"items": [{"playcount": 99}]})
-        )
+        (itunes / "PlayCounts.plist").write_bytes(plistlib.dumps({"items": [{"playcount": 99}]}))
         (itunes / "iTunesStats").write_text("1\n1\n0\n0\n0\n0\n\n")
 
         entries = read_play_counts(str(tmp_path))
