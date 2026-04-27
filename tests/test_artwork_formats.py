@@ -1,4 +1,5 @@
 """Tests for artwork format tables and ArtworkManager."""
+
 import pytest
 
 
@@ -247,7 +248,8 @@ class TestArtworkManager:
         # Record sizes with both entries present
         sizes_two = {
             f: os.path.getsize(os.path.join(art_dir, f))
-            for f in os.listdir(art_dir) if f.endswith(".ithmb")
+            for f in os.listdir(art_dir)
+            if f.endswith(".ithmb")
         }
 
         mgr.remove_artwork(id1)
