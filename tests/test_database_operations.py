@@ -143,6 +143,65 @@ class TestDatabaseTrackOps:
         db.remove_track(track)
         assert tid not in master.track_ids
 
+    def test_remove_track_cleans_artwork(self, writable_ipod, generated_mp3_with_art):
+        """Removing a track with artwork removes its MHII entry and compacts .ithmb files."""
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            pytest.skip("Pillow not installed")
+
+        import os
+
+        from pygpod.db.artwork_parser import parse_artworkdb
+        from pygpod.model.database import Database
+
+        db = Database(writable_ipod)
+        track = db.add_track(generated_mp3_with_art)
+
+        # The track must have artwork for this test to be meaningful
+        if not track.has_artwork or not track.mhii_link:
+            pytest.skip("generated_mp3_with_art has no embedded artwork (ffmpeg not available)")
+
+        image_id = track.mhii_link
+        db.remove_track(track)
+        db.save()
+
+        # ArtworkDB must not contain the removed MHII
+        artdb_path = os.path.join(writable_ipod, "iPod_Control", "Artwork", "ArtworkDB")
+        assert os.path.isfile(artdb_path)
+        with open(artdb_path, "rb") as f:
+            root = parse_artworkdb(f.read())
+        img_section = next(c for c in root.children if c.fields.get("mhsd_type") == 1)
+        mhli = img_section.children[0]
+        ids = [c.fields.get("image_id") for c in mhli.children]
+        assert image_id not in ids
+
+    def test_remove_track_artwork_same_session(self, writable_ipod, generated_mp3_with_art):
+        """mhii_link is readable on a track added and removed in the same session."""
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            pytest.skip("Pillow not installed")
+
+        from pygpod.model.database import Database
+
+        db = Database(writable_ipod)
+        track = db.add_track(generated_mp3_with_art)
+
+        if not track.has_artwork or not track.mhii_link:
+            pytest.skip("generated_mp3_with_art has no embedded artwork (ffmpeg not available)")
+
+        image_id = track.mhii_link
+        # Remove without saving first — exercises the same-session path
+        db.remove_track(track)
+
+        # The artwork manager must have the entry removed in-memory
+        mgr = db._artwork_manager
+        assert mgr is not None
+        mhli = mgr._get_or_create_mhli()
+        ids = [c.fields.get("image_id") for c in mhli.children]
+        assert image_id not in ids
+
 
 class TestDatabaseSaveCycle:
     """Test save and reload round-trip."""

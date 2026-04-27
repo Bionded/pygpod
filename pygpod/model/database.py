@@ -371,7 +371,6 @@ class Database:
                 generation = IpodGeneration.UNKNOWN
 
             self._artwork_manager = ArtworkManager(self._mountpoint, generation=generation)
-            self._artwork_manager.reset()
         return self._artwork_manager
 
     def _add_artwork_for_track(
@@ -403,17 +402,23 @@ class Database:
             mgr = self._get_artwork_manager()
             image_id = mgr.add_artwork_data(dbid, art_data, save=False)
             if image_id is not None:
-                # Update MHIT fields so iPod knows artwork exists
+                # Update MHIT header bytes so iPod knows artwork exists
                 header = bytearray(mhit.raw_header)
-                if len(header) > 0x82:
+                if len(header) > 0x7D:  # u16 at 0x7C needs bytes 0x7C-0x7D
                     put16lint(header, 0x7C, 1)  # artwork_count
-                if len(header) > 0x84:
+                if len(header) > 0x83:  # u32 at 0x80 needs bytes 0x80-0x83
                     put32lint(header, 0x80, len(art_data))  # artwork_size
-                if len(header) > 0xA5:
+                if len(header) > 0xA4:  # u8 at 0xA4 needs byte 0xA4
                     put8int(header, 0xA4, 1)  # has_artwork
-                if len(header) > 0x164:
+                if len(header) > 0x163:  # u32 at 0x160 needs bytes 0x160-0x163
                     put32lint(header, 0x160, image_id)  # mhii_link
                 mhit.raw_header = bytes(header)
+                # Mirror into fields so Track properties reflect the new state
+                # without requiring a reload (needed for same-session remove_track)
+                mhit.fields["artwork_count"] = 1
+                mhit.fields["artwork_size"] = len(art_data)
+                mhit.fields["has_artwork"] = 1
+                mhit.fields["mhii_link"] = image_id
 
             logger.info("Artwork processed for track dbid=%d (%d bytes)", dbid, len(art_data))
         except Exception:
@@ -442,6 +447,10 @@ class Database:
         # Remove from model
         self._tracks = [t for t in self._tracks if t.track_id != track_id]
         self._track_lookup.pop(track_id, None)
+
+        # Remove artwork from ArtworkDB
+        if self._mountpoint and track.has_artwork and track.mhii_link:
+            self._get_artwork_manager().remove_artwork(track.mhii_link)
 
         # Delete file if requested
         if delete_file and self._mountpoint and track.ipod_path:

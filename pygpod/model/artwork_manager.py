@@ -261,13 +261,95 @@ class ArtworkManager:
         finally:
             os.unlink(tmp_path)
 
+    def remove_artwork(self, image_id: int) -> bool:
+        """Remove artwork entry by image_id.
+
+        Returns True if an entry was found and removed.
+        The .ithmb files are compacted the next time save() is called.
+        """
+        if self._root is None:
+            return False
+        mhli = self._get_or_create_mhli()
+        before = len(mhli.children)
+        mhli.children = [c for c in mhli.children if c.fields.get("image_id") != image_id]
+        removed = len(mhli.children) < before
+        if removed:
+            self._needs_rebuild = True
+            logger.debug("Removed artwork image_id=%d", image_id)
+        return removed
+
     def save(self) -> None:
-        """Write ArtworkDB to disk."""
+        """Write ArtworkDB to disk, compacting .ithmb files if needed."""
         if self._root is None:
             return
+        if getattr(self, "_needs_rebuild", False):
+            self._rebuild_ithmb()
+            self._needs_rebuild = False
         data = write_artworkdb(self._root)
         with open(self._artworkdb_path, "wb") as f:
             f.write(data)
+
+    def _rebuild_ithmb(self) -> None:
+        """Rewrite .ithmb files keeping only data referenced by remaining MHII records.
+
+        Updates MHNI offset fields in-place so the ArtworkDB stays consistent.
+        """
+        # Gather (mhni_record, old_offset, size) grouped by format_id
+        by_format: Dict[int, list] = {}
+        mhli = self._get_or_create_mhli()
+        for mhii in mhli.children:
+            for child in mhii.children:
+                # Support both bare MHNI and MHOD-wrapped MHNI (parser accepts both)
+                if child.magic == MHNI_MAGIC:
+                    mhni_list = [child]
+                elif child.magic == MHOD_MAGIC:
+                    mhni_list = [c for c in child.children if c.magic == MHNI_MAGIC]
+                else:
+                    continue
+                for mhni in mhni_list:
+                    fmt_id = mhni.fields.get("format_id")
+                    old_offset = mhni.fields.get("ithumb_offset", 0)
+                    size = mhni.fields.get("image_size", 0)
+                    if fmt_id is not None and size > 0:
+                        by_format.setdefault(fmt_id, []).append((mhni, old_offset, size))
+
+        new_offsets: Dict[int, int] = {}
+        for fmt_id, entries in by_format.items():
+            ithmb_path = os.path.join(self._artwork_dir, f"F{fmt_id}_1.ithmb")
+            if not os.path.isfile(ithmb_path):
+                continue
+
+            chunks = []
+            with open(ithmb_path, "rb") as f:
+                for mhni, old_offset, size in entries:
+                    f.seek(old_offset)
+                    chunks.append((mhni, f.read(size)))
+
+            new_offset = 0
+            with open(ithmb_path, "wb") as f:
+                for mhni, data in chunks:
+                    f.write(data)
+                    header = bytearray(mhni.raw_header)
+                    put32lint(header, 0x14, new_offset)
+                    mhni.raw_header = bytes(header)
+                    mhni.fields["ithumb_offset"] = new_offset
+                    new_offset += len(data)
+            new_offsets[fmt_id] = new_offset
+
+        # Remove .ithmb files that have no remaining entries
+        if os.path.isdir(self._artwork_dir):
+            for fname in os.listdir(self._artwork_dir):
+                if fname.startswith("F") and fname.endswith(".ithmb"):
+                    parts = fname[1:].replace(".ithmb", "").split("_")
+                    if len(parts) == 2:
+                        try:
+                            if int(parts[0]) not in by_format:
+                                os.unlink(os.path.join(self._artwork_dir, fname))
+                        except ValueError:
+                            pass
+
+        self._ithmb_offsets = new_offsets
+        logger.debug("Rebuilt .ithmb files, %d formats retained", len(new_offsets))
 
     # Keep private alias for backwards compatibility within this class
     _save = save
