@@ -371,7 +371,6 @@ class Database:
                 generation = IpodGeneration.UNKNOWN
 
             self._artwork_manager = ArtworkManager(self._mountpoint, generation=generation)
-            self._artwork_manager.reset()
         return self._artwork_manager
 
     def _add_artwork_for_track(
@@ -442,6 +441,10 @@ class Database:
         # Remove from model
         self._tracks = [t for t in self._tracks if t.track_id != track_id]
         self._track_lookup.pop(track_id, None)
+
+        # Remove artwork from ArtworkDB
+        if self._mountpoint and track.has_artwork and track.mhii_link:
+            self._get_artwork_manager().remove_artwork(track.mhii_link)
 
         # Delete file if requested
         if delete_file and self._mountpoint and track.ipod_path:
