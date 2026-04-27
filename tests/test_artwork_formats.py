@@ -1,4 +1,5 @@
 """Tests for artwork format tables and ArtworkManager."""
+import pytest
 
 
 class TestArtworkFormats:
@@ -259,8 +260,6 @@ class TestArtworkManager:
             assert os.path.getsize(fpath) == size_two // 2
 
     def test_remove_artwork_sets_needs_rebuild(self, tmp_path, writable_ipod):
-        import os
-
         from pygpod.device.models import IpodGeneration
         from pygpod.model.artwork_manager import ArtworkManager
 
