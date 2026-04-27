@@ -404,13 +404,13 @@ class Database:
             if image_id is not None:
                 # Update MHIT header bytes so iPod knows artwork exists
                 header = bytearray(mhit.raw_header)
-                if len(header) > 0x82:
+                if len(header) > 0x7D:  # u16 at 0x7C needs bytes 0x7C-0x7D
                     put16lint(header, 0x7C, 1)  # artwork_count
-                if len(header) > 0x84:
+                if len(header) > 0x83:  # u32 at 0x80 needs bytes 0x80-0x83
                     put32lint(header, 0x80, len(art_data))  # artwork_size
-                if len(header) > 0xA5:
+                if len(header) > 0xA4:  # u8 at 0xA4 needs byte 0xA4
                     put8int(header, 0xA4, 1)  # has_artwork
-                if len(header) > 0x164:
+                if len(header) > 0x163:  # u32 at 0x160 needs bytes 0x160-0x163
                     put32lint(header, 0x160, image_id)  # mhii_link
                 mhit.raw_header = bytes(header)
                 # Mirror into fields so Track properties reflect the new state
