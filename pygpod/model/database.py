@@ -402,7 +402,7 @@ class Database:
             mgr = self._get_artwork_manager()
             image_id = mgr.add_artwork_data(dbid, art_data, save=False)
             if image_id is not None:
-                # Update MHIT fields so iPod knows artwork exists
+                # Update MHIT header bytes so iPod knows artwork exists
                 header = bytearray(mhit.raw_header)
                 if len(header) > 0x82:
                     put16lint(header, 0x7C, 1)  # artwork_count
@@ -413,6 +413,12 @@ class Database:
                 if len(header) > 0x164:
                     put32lint(header, 0x160, image_id)  # mhii_link
                 mhit.raw_header = bytes(header)
+                # Mirror into fields so Track properties reflect the new state
+                # without requiring a reload (needed for same-session remove_track)
+                mhit.fields["artwork_count"] = 1
+                mhit.fields["artwork_size"] = len(art_data)
+                mhit.fields["has_artwork"] = 1
+                mhit.fields["mhii_link"] = image_id
 
             logger.info("Artwork processed for track dbid=%d (%d bytes)", dbid, len(art_data))
         except Exception:

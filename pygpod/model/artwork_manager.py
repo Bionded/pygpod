@@ -298,8 +298,15 @@ class ArtworkManager:
         by_format: Dict[int, list] = {}
         mhli = self._get_or_create_mhli()
         for mhii in mhli.children:
-            for mhod in mhii.children:
-                for mhni in mhod.children:
+            for child in mhii.children:
+                # Support both bare MHNI and MHOD-wrapped MHNI (parser accepts both)
+                if child.magic == MHNI_MAGIC:
+                    mhni_list = [child]
+                elif child.magic == MHOD_MAGIC:
+                    mhni_list = [c for c in child.children if c.magic == MHNI_MAGIC]
+                else:
+                    continue
+                for mhni in mhni_list:
                     fmt_id = mhni.fields.get("format_id")
                     old_offset = mhni.fields.get("ithumb_offset", 0)
                     size = mhni.fields.get("image_size", 0)
