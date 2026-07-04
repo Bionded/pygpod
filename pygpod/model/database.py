@@ -1141,7 +1141,9 @@ class Database:
                     "Or install pyusb for automatic detection:\n"
                     "  pip install pygpod[usb]"
                 )
-            data = update_checksums(data, guid)
+            hash_type=self._device.checksum_type.name
+            #print(hash_type)
+            data = update_checksums(data, guid, hash_type)
 
         db_path = (
             self._device.itunesdb_path()
