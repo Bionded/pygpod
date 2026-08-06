@@ -209,6 +209,16 @@ class TestChecksumDispatcher:
         result = update_checksums(bytes(data))
         assert result[0x72] == 0x01
 
+    def test_update_checksums_hash72_force(self):
+        from pygpod.hash.checksum import update_checksums
+
+        data = bytearray(0xC0)
+        data[0:4] = b"mhbd"
+        # No hash72 signature, but force hash72
+        data[0x72] = 0x00
+        result = update_checksums(bytes(data), hash_type="HASH72")
+        assert result[0x72] == 0x01
+
     def test_update_checksums_hash58(self):
         from pygpod.hash.checksum import update_checksums
 
@@ -217,6 +227,17 @@ class TestChecksumDispatcher:
         # No hash72 signature, but provide GUID
         data[0x72] = 0x00
         result = update_checksums(bytes(data), firewire_guid="000A2700213749FF")
+        # hash58 should be applied
+        assert result[0x58 : 0x58 + 20] != b"\x00" * 20
+
+    def test_update_checksums_hash58_force(self):
+        from pygpod.hash.checksum import update_checksums
+
+        data = bytearray(0xC0)
+        data[0:4] = b"mhbd"
+        # No hash72 signature, but provide GUID, and force hash58
+        data[0x72] = 0x00
+        result = update_checksums(bytes(data), firewire_guid="000A2700213749FF", hash_type="HASH58")
         # hash58 should be applied
         assert result[0x58 : 0x58 + 20] != b"\x00" * 20
 

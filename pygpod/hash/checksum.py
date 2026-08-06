@@ -36,8 +36,6 @@ def update_checksums(db_data: bytes, firewire_guid: Optional[str] = None, hash_t
     elif hash_type == "HASH72":
         logger.debug("Applied hash type: %s", "hash72")
         return compute_hash72(db_data, firewire_guid)
-    """
-    Original hash detection algorithm
     # Check existing hash type by looking at hash72 signature byte
     
     existing_sig = db_data[0x72 : 0x72 + 46]
@@ -54,6 +52,5 @@ def update_checksums(db_data: bytes, firewire_guid: Optional[str] = None, hash_t
 
         logger.debug("Applied hash type: %s", "hash58")
         return compute_hash58(db_data, firewire_guid)
-        """
     # No hash or hash not computable - return as-is
     return db_data

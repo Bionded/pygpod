@@ -1142,7 +1142,6 @@ class Database:
                     "  pip install pygpod[usb]"
                 )
             hash_type=self._device.checksum_type.name
-            #print(hash_type)
             data = update_checksums(data, guid, hash_type)
 
         db_path = (
