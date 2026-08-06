@@ -10,7 +10,9 @@ from .hash72 import compute_hash72
 logger = logging.getLogger(__name__)
 
 
-def update_checksums(db_data: bytes, firewire_guid: Optional[str] = None, hash_type: Optional[str]=None) -> bytes:
+def update_checksums(db_data: bytes,
+                     firewire_guid: Optional[str] = None,
+                     hash_type: Optional[str]=None) -> bytes:
     """Update all checksums in iTunesDB data.
 
     Detects the hashing scheme and applies the appropriate hash.
@@ -23,11 +25,11 @@ def update_checksums(db_data: bytes, firewire_guid: Optional[str] = None, hash_t
     Returns:
         iTunesDB bytes with updated checksums.
     """
-    
+
     logger.info("Updating checksums")
     if len(db_data) < 0x72 + 46:
         return db_data
-    
+
     #New hash algorithm - @WoodcraftWorld
     if hash_type == "HASH58":
         from .hash58 import compute_hash58
@@ -37,7 +39,7 @@ def update_checksums(db_data: bytes, firewire_guid: Optional[str] = None, hash_t
         logger.debug("Applied hash type: %s", "hash72")
         return compute_hash72(db_data, firewire_guid)
     # Check existing hash type by looking at hash72 signature byte
-    
+
     existing_sig = db_data[0x72 : 0x72 + 46]
 
     if existing_sig[0] == 0x01:
