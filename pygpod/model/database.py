@@ -1141,7 +1141,7 @@ class Database:
                     "Or install pyusb for automatic detection:\n"
                     "  pip install pygpod[usb]"
                 )
-            hash_type=self._device.checksum_type.name
+            hash_type = self._device.checksum_type.name
             data = update_checksums(data, guid, hash_type)
 
         db_path = (
