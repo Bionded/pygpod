@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from ..db.constants import MHIP_MAGIC, MHOD_ID_TITLE, MHOD_MAGIC
 from ..db.parser import Record
@@ -20,7 +20,9 @@ class Playlist:
         self, record: Optional[Record] = None, track_lookup: Optional[dict] = None
     ) -> None:
         self._record = record
-        self._track_lookup = track_lookup or {}  # track_id -> Track
+        self._track_lookup = track_lookup if track_lookup is not None else {}  # track_id -> Track
+        # Called after every change; Database sets it to mark itself modified.
+        self._on_change: Optional[Callable[[], None]] = None
 
     @classmethod
     def from_record(cls, record: Record, track_lookup: Optional[dict] = None) -> "Playlist":
@@ -52,6 +54,8 @@ class Playlist:
         ]
         if value:
             self._record.children.insert(0, make_string_mhod(MHOD_ID_TITLE, value))
+        if self._on_change is not None:
+            self._on_change()
 
     @property
     def playlist_id(self) -> int:
@@ -84,6 +88,30 @@ class Playlist:
                 if mhod_type in (50, 51):
                     return True
         return False
+
+    def _spl_body(self, mhod_type: int) -> Optional[bytes]:
+        if not self._record:
+            return None
+        for child in self._record.children:
+            if child.magic == b"mhod" and child.fields.get("mhod_type") == mhod_type:
+                return child.fields.get("raw_body", b"")
+        return None
+
+    @property
+    def smart_rules(self):
+        """(SPLMatch, [SPLRule]) of a smart playlist, None for a normal playlist."""
+        from .smartplaylist import parse_spl_rules
+
+        body = self._spl_body(51)
+        return None if body is None else parse_spl_rules(body)
+
+    @property
+    def smart_prefs(self):
+        """SPLPrefs of a smart playlist (live update, limits), None for a normal playlist."""
+        from .smartplaylist import parse_spl_prefs
+
+        body = self._spl_body(50)
+        return None if body is None else parse_spl_prefs(body)
 
     @property
     def sort_order(self) -> int:

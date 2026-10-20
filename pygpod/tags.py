@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -246,9 +246,134 @@ def check_format_supported(filepath: str, generation=None) -> None:
         fmt_name = UNSUPPORTED_AUDIO_EXTS[ext]
         raise UnsupportedFormatError(
             f"{fmt_name} ({ext}) is not supported by iPod. "
-            f"Convert to MP3 or AAC first. "
-            f"Auto-conversion is not yet implemented."
+            f"Convert to MP3 or AAC first, "
+            f"or pass convert=True to add_track (needs ffmpeg)."
         )
+
+
+class MediaInfo(NamedTuple):
+    """What a media file really contains (from its content, not its extension)."""
+
+    codec: Optional[str]  # mp3 | aac | alac | wav | aiff | flac | vorbis | opus | wma | ... | None
+    sample_rate: int
+    channels: int
+    is_video: bool
+
+
+def probe_media(filepath: str) -> MediaInfo:
+    """Identify codec, sample rate and channels with mutagen (codec None: unknown / no mutagen)."""
+    ext = os.path.splitext(filepath)[1].lower()
+    if not HAS_MUTAGEN:
+        return MediaInfo(None, 0, 0, ext in VIDEO_EXTS)
+    import mutagen
+
+    try:
+        audio = mutagen.File(filepath)
+    except Exception:  # noqa: BLE001 - unreadable = unknown
+        logger.debug("mutagen could not read %s", filepath, exc_info=True)
+        audio = None
+    if audio is None:
+        # mutagen ranks by extension first: FLAC data named .mp3 fails as MP3. Sniff the magic.
+        return MediaInfo(_sniff_codec(filepath), 0, 0, ext in VIDEO_EXTS)
+    name = type(audio).__name__
+    info = audio.info
+    codec: Optional[str] = {
+        "MP3": "mp3",
+        "EasyMP3": "mp3",
+        "WAVE": "wav",
+        "AIFF": "aiff",
+        "FLAC": "flac",
+        "OggVorbis": "vorbis",
+        "OggOpus": "opus",
+        "OggFLAC": "flac",
+        "OggSpeex": "speex",
+        "OggTheora": "theora",
+        "ASF": "wma",
+        "MonkeysAudio": "ape",
+        "WavPack": "wavpack",
+        "Musepack": "musepack",
+        "TrueAudio": "tta",
+        "OptimFROG": "optimfrog",
+        "AAC": "aac",
+        "AC3": "ac3",
+        "DSF": "dsd",
+        "DSDIFF": "dsd",
+    }.get(name)
+    if name in ("MP4", "EasyMP4"):
+        c = (getattr(info, "codec", "") or "").lower()
+        codec = "alac" if c == "alac" else "aac" if c.startswith("mp4a") else c or None
+    return MediaInfo(
+        codec,
+        int(getattr(info, "sample_rate", 0) or 0),
+        int(getattr(info, "channels", 0) or 0),
+        ext in VIDEO_EXTS,
+    )
+
+
+_MAGIC = (
+    (0, b"fLaC", "flac"),
+    (0, b"OggS", "ogg"),
+    (0, b"MAC ", "ape"),
+    (0, b"wvpk", "wavpack"),
+    (0, b"MPCK", "musepack"),
+    (0, b"\x30\x26\xb2\x75\x8e\x66\xcf\x11", "wma"),
+    (0, b"\x1a\x45\xdf\xa3", "matroska"),
+)
+
+
+def _sniff_codec(filepath: str) -> Optional[str]:
+    try:
+        with open(filepath, "rb") as f:
+            head = f.read(16)
+    except OSError:
+        return None
+    for offset, magic, codec in _MAGIC:
+        if head[offset : offset + len(magic)] == magic:
+            return codec
+    return None
+
+
+def validate_media(filepath: str, generation=None) -> MediaInfo:
+    """Raise UnsupportedFormatError unless the file plays on the iPod generation.
+
+    Checks the content (codec, sample rate, channels) rather than the extension,
+    so e.g. FLAC data in an ".mp3" file is refused. Unknown generation: codec
+    rules for all iPods. Without mutagen only the extension check is done.
+    """
+    from .device.models import (
+        MAX_CHANNELS,
+        MAX_SAMPLE_RATE,
+        VIDEO_GENERATIONS,
+        IpodGeneration,
+        supported_audio_codecs,
+    )
+    from .exceptions import UnsupportedFormatError
+
+    check_format_supported(filepath, generation)
+    info = probe_media(filepath)
+    known = generation is not None and generation != IpodGeneration.UNKNOWN
+    if info.is_video:
+        if known and generation not in VIDEO_GENERATIONS:
+            raise UnsupportedFormatError(f"{filepath}: this iPod does not play video")
+        return info
+    if info.codec is None:
+        if HAS_MUTAGEN:
+            raise UnsupportedFormatError(f"{filepath}: not a recognised audio file")
+        return info
+    allowed = supported_audio_codecs(generation if known else IpodGeneration.UNKNOWN)
+    if info.codec not in allowed:
+        what = "Apple Lossless" if info.codec == "alac" else info.codec.upper()
+        plays = ", ".join(sorted(allowed))
+        raise UnsupportedFormatError(
+            f"{filepath}: {what} audio is not supported by this iPod (plays {plays})"
+        )
+    if info.sample_rate > MAX_SAMPLE_RATE:
+        raise UnsupportedFormatError(
+            f"{filepath}: sample rate {info.sample_rate} Hz > {MAX_SAMPLE_RATE} Hz"
+        )
+    if info.channels > MAX_CHANNELS:
+        raise UnsupportedFormatError(f"{filepath}: {info.channels} channels (iPods play stereo)")
+    return info
 
 
 def _detect_filetype(filepath: str) -> str:

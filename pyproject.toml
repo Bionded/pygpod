@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pygpod"
-version = "0.0.6"
+version = "0.1.0"
 description = "Pure Python library for iPod database management - a spiritual successor to libgpod"
 readme = "README.md"
 license = { text = "LGPL-2.1-or-later" }
@@ -14,7 +14,7 @@ authors = [
     {name = "Jörg Schuler/Christophe Fergeau"},
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
@@ -23,6 +23,8 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Topic :: Multimedia :: Sound/Audio",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
@@ -46,6 +48,10 @@ include = ["pygpod*"]
 
 [tool.pytest.ini_options]
 tmp_path_retention_policy = "none"
+markers = [
+    "libgpod: interop with libgpod (needs gcc, pkg-config, libgpod-dev; skipped without them unless PYGPOD_REQUIRE_LIBGPOD=1)",
+    "slow: benchmarks with thousands of tracks (~20 s; deselect with -m 'not slow')",
+]
 filterwarnings = [
     "ignore:Due to '_pack_':DeprecationWarning",
 ]

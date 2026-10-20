@@ -572,7 +572,13 @@ def _cmd_track_export(args: argparse.Namespace) -> int:
     if not track:
         print(f"Track ID {args.track_id} not found.", file=sys.stderr)
         return 1
-    src = ipod_path_to_os(track.ipod_path, mp)
+    from .exceptions import UnsafePathError
+
+    try:
+        src = ipod_path_to_os(track.ipod_path, mp)
+    except UnsafePathError as e:
+        print(f"Refusing to export: {e}", file=sys.stderr)
+        return 1
     shutil.copy2(src, args.destination)
     print(f"Exported: {track} -> {args.destination}")
     return 0

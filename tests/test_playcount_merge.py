@@ -1,4 +1,4 @@
-"""Tests for play count merge into iTunesDB + file deletion on load."""
+"""Tests for play count merge into iTunesDB + file deletion after save."""
 
 import os
 import struct
@@ -63,9 +63,11 @@ class TestPlayCountMergeOnLoad:
         pc_path = _write_play_counts_file(itunes_dir, entries)
         assert os.path.isfile(pc_path)
 
-        # Reload - should merge and delete
-        Database(writable_ipod)
-        assert not os.path.isfile(pc_path), "Play Counts file should be deleted after merge"
+        # Reload merges, but the file is only deleted after a successful save
+        db2 = Database(writable_ipod)
+        assert os.path.isfile(pc_path), "Play Counts file must survive an open without save"
+        db2.save()
+        assert not os.path.isfile(pc_path), "Play Counts file should be deleted after merge + save"
 
     def test_database_marked_modified_after_merge(self, writable_ipod):
         from pygpod.model.database import Database
@@ -166,5 +168,5 @@ class TestPlayCountMergeOnLoad:
             f.write(stats)
         assert os.path.isfile(stats_path)
 
-        Database(writable_ipod)
-        assert not os.path.isfile(stats_path), "iTunesStats should be deleted after merge"
+        Database(writable_ipod).save()
+        assert not os.path.isfile(stats_path), "iTunesStats should be deleted after merge + save"

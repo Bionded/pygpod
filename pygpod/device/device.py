@@ -539,7 +539,7 @@ class StorageInfo:
         music_dir = ipod_ctrl / "Music"
         artwork_dir = ipod_ctrl / "Artwork"
         itunes_dir = ipod_ctrl / "iTunes"
-        photos_dir = ipod_ctrl / "Photos"
+        photos_dirs = (mp / "Photos", ipod_ctrl / "Photos")  # libgpod's place, pygpod's old one
 
         self.music = _dir_size(music_dir)
 
@@ -550,7 +550,7 @@ class StorageInfo:
 
         self.itunes_db = _file_size(itunes_dir / "iTunesDB")
         self.itunes_sd = _file_size(itunes_dir / "iTunesSD")
-        self.photos = _dir_size(photos_dir)
+        self.photos = sum(_dir_size(d) for d in photos_dirs)
         self.other = max(0, self.used - self.music - artwork_total - self.photos)
         self._scanned = True
 

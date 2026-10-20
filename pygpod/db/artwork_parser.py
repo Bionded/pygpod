@@ -7,10 +7,11 @@ The format uses the same MHXX record structure as iTunesDB.
 from __future__ import annotations
 
 import logging
+import struct
 
 from ..exceptions import ParseError
 from ..utils.compat import get16lint, get32lint, get64lint
-from .parser import Record
+from .parser import Record, _advance
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,20 @@ def parse_artworkdb(data: bytes) -> Record:
 
     header_len = get32lint(data, 4)
     total_len = get32lint(data, 8)
+    if header_len < 0x14 or total_len < header_len:
+        raise ParseError(f"Invalid mhfd header: header_len={header_len}, total_len={total_len}")
+    if total_len > len(data):
+        raise ParseError(
+            f"Truncated ArtworkDB: header says {total_len} bytes, file has {len(data)}"
+        )
+    try:
+        return _parse_mhfd(data, header_len, total_len)
+    except (struct.error, IndexError) as e:
+        raise ParseError(f"Malformed ArtworkDB: {e}") from e
 
+
+def _parse_mhfd(data: bytes, header_len: int, total_len: int) -> Record:
+    end = total_len
     root = Record(MHFD_MAGIC, header_len, total_len)
     root.raw_header = bytes(data[:header_len])
     root.raw_bytes = bytes(data[:total_len])
@@ -66,7 +80,7 @@ def parse_artworkdb(data: bytes) -> Record:
 
         child = _parse_artwork_mhsd(data, pos)
         root.children.append(child)
-        pos += child.total_len
+        pos = _advance(data, pos, child, end)
 
     return root
 
@@ -117,7 +131,7 @@ def _parse_mhli(data: bytes, offset: int, end: int) -> Record:
         if data[pos : pos + 4] == MHII_MAGIC:
             child = _parse_mhii(data, pos)
             rec.children.append(child)
-            pos += child.total_len
+            pos = _advance(data, pos, child, end)
         else:
             break
 
@@ -148,11 +162,11 @@ def _parse_mhii(data: bytes, offset: int) -> Record:
         if child_magic == MHNI_MAGIC:
             child = _parse_mhni(data, pos)
             rec.children.append(child)
-            pos += child.total_len
+            pos = _advance(data, pos, child, end)
         elif child_magic == MHOD_MAGIC:
             child = _parse_mhii_mhod(data, pos)
             rec.children.append(child)
-            pos += child.total_len
+            pos = _advance(data, pos, child, end)
         else:
             break
 
@@ -186,7 +200,7 @@ def _parse_mhni(data: bytes, offset: int) -> Record:
         if data[pos : pos + 4] == MHOD_MAGIC:
             child = _parse_artwork_mhod(data, pos)
             rec.children.append(child)
-            pos += child.total_len
+            pos = _advance(data, pos, child, end)
         else:
             break
 
@@ -222,6 +236,14 @@ def _parse_artwork_mhod(data: bytes, offset: int) -> Record:
     rec.raw_header = bytes(data[offset : offset + header_len])
     rec.raw_bytes = bytes(data[offset : offset + total_len])
     rec.fields["mhod_type"] = get32lint(data, offset + 0x0C)
+    if rec.fields["mhod_type"] == 3 and header_len + 12 <= total_len:
+        # .ithmb file name: string_len(4), encoding(4: 2 = UTF-16LE, else UTF-8), unknown(4), string
+        body = offset + header_len
+        length = get32lint(data, body)
+        start = body + 12
+        raw = bytes(data[start : min(start + length, offset + total_len)])
+        codec = "utf-16-le" if data[body + 4] == 2 else "utf-8"
+        rec.fields["string"] = raw.decode(codec, errors="replace")
 
     return rec
 
@@ -243,7 +265,7 @@ def _parse_artwork_mhla(data: bytes, offset: int, end: int) -> Record:
         if data[pos : pos + 4] == MHBA_MAGIC:
             child = _parse_mhba(data, pos)
             rec.children.append(child)
-            pos += child.total_len
+            pos = _advance(data, pos, child, end)
         else:
             break
 
@@ -277,11 +299,11 @@ def _parse_mhba(data: bytes, offset: int) -> Record:
         if child_magic == MHOD_MAGIC:
             child = _parse_mhba_mhod(data, pos)
             rec.children.append(child)
-            pos += child.total_len
+            pos = _advance(data, pos, child, end)
         elif child_magic == b"mhia":
             child = _parse_mhia(data, pos)
             rec.children.append(child)
-            pos += child.total_len
+            pos = _advance(data, pos, child, end)
         else:
             break
 
@@ -344,7 +366,7 @@ def _parse_mhlf(data: bytes, offset: int, end: int) -> Record:
         if data[pos : pos + 4] == MHIF_MAGIC:
             child = _parse_mhif(data, pos)
             rec.children.append(child)
-            pos += child.total_len
+            pos = _advance(data, pos, child, end)
         else:
             break
 

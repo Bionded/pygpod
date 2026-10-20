@@ -140,3 +140,59 @@ def get_cover_art_formats(generation: IpodGeneration) -> Optional[List[ArtworkFo
     Returns None if the generation doesn't support artwork.
     """
     return _GENERATION_COVER_ART.get(generation)
+
+
+# ============================================================================
+# Per-generation photo thumbnail formats (libgpod itdb_device.c *_photo_info).
+# Only pixel formats pygpod can encode are listed; skipped from libgpod's tables:
+# iPod Photo 1013 (220x176 RGB565_BE_90, rotated) and 1019 (720x480 UYVY_BE TV-out),
+# iPod Video 1019 (UYVY_BE TV-out), Nano 4G/5G 1081 (JPEG, unimplemented in libgpod too).
+# ============================================================================
+_PHOTO_PHOTOS = [
+    ArtworkFormatInfo(1009, 42, 30, ThumbFormat.RGB565_LE),
+    ArtworkFormatInfo(1015, 130, 88, ThumbFormat.RGB565_LE),
+]
+_NANO_PHOTOS = [
+    ArtworkFormatInfo(1032, 42, 37, ThumbFormat.RGB565_LE),
+    ArtworkFormatInfo(1023, 176, 132, ThumbFormat.RGB565_BE),
+]
+_VIDEO_PHOTOS = [
+    ArtworkFormatInfo(1036, 50, 41, ThumbFormat.RGB565_LE),
+    ArtworkFormatInfo(1015, 130, 88, ThumbFormat.RGB565_LE),
+    ArtworkFormatInfo(1024, 320, 240, ThumbFormat.RGB565_LE),
+]
+_CLASSIC_PHOTOS = [  # also Nano 3G
+    ArtworkFormatInfo(1067, 720, 480, ThumbFormat.I420_LE),
+    ArtworkFormatInfo(1024, 320, 240, ThumbFormat.RGB565_LE),
+    ArtworkFormatInfo(1066, 64, 64, ThumbFormat.RGB565_LE),
+]
+_NANO4G_PHOTOS = [
+    ArtworkFormatInfo(1024, 320, 240, ThumbFormat.RGB565_LE),
+    ArtworkFormatInfo(1066, 64, 64, ThumbFormat.RGB565_LE),
+    ArtworkFormatInfo(1079, 80, 80, ThumbFormat.RGB565_LE),
+    ArtworkFormatInfo(1083, 240, 320, ThumbFormat.RGB565_LE),
+]
+_NANO5G_PHOTOS = [
+    ArtworkFormatInfo(1087, 384, 384, ThumbFormat.RGB565_LE),
+    ArtworkFormatInfo(1079, 80, 80, ThumbFormat.RGB565_LE),
+    ArtworkFormatInfo(1066, 64, 64, ThumbFormat.RGB565_LE),
+]
+
+_GENERATION_PHOTOS: Dict[IpodGeneration, List[ArtworkFormatInfo]] = {
+    IpodGeneration.PHOTO: _PHOTO_PHOTOS,
+    IpodGeneration.VIDEO_1: _VIDEO_PHOTOS,
+    IpodGeneration.VIDEO_2: _VIDEO_PHOTOS,
+    IpodGeneration.NANO_1: _NANO_PHOTOS,
+    IpodGeneration.NANO_2: _NANO_PHOTOS,
+    IpodGeneration.NANO_3: _CLASSIC_PHOTOS,
+    IpodGeneration.NANO_4: _NANO4G_PHOTOS,
+    IpodGeneration.NANO_5: _NANO5G_PHOTOS,
+    IpodGeneration.CLASSIC_1: _CLASSIC_PHOTOS,
+    IpodGeneration.CLASSIC_2: _CLASSIC_PHOTOS,
+    IpodGeneration.CLASSIC_3: _CLASSIC_PHOTOS,
+}
+
+
+def get_photo_formats(generation: IpodGeneration) -> Optional[List[ArtworkFormatInfo]]:
+    """Photo thumbnail formats for an iPod generation (None: no photo support known)."""
+    return _GENERATION_PHOTOS.get(generation)

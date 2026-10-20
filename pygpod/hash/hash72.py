@@ -41,9 +41,12 @@ AES_KEY = bytes(
 def compute_itunesdb_sha1(data: bytes) -> bytes:
     """Compute SHA1 of iTunesDB with hash-related fields zeroed.
 
-    Before hashing, these fields in the MHBD header are zeroed:
+    Before hashing, these fields in the MHBD header are zeroed (as libgpod's
+    itdb_hash72_compute_itunesdb_sha1 does; verified against libgpod 0.8.3):
     - db_id at offset 0x18 (8 bytes)
-    - hash58 at offset 0x58 (26 bytes)
+    - unk_0x32 at offset 0x32 (20 bytes)
+    - hash58 at offset 0x58 (20 bytes; the timezone offset at 0x6C and the
+      field at 0x70 are part of the hash)
     - hash72 at offset 0x72 (46 bytes)
 
     Args:
@@ -53,12 +56,10 @@ def compute_itunesdb_sha1(data: bytes) -> bytes:
         20-byte SHA1 digest.
     """
     buf = bytearray(data)
-    # Zero db_id (8 bytes at offset 0x18)
-    buf[0x18:0x20] = b"\x00" * 8
-    # Zero hash58 (26 bytes at offset 0x58)
-    buf[0x58:0x72] = b"\x00" * 26
-    # Zero hash72 (46 bytes at offset 0x72)
-    buf[0x72 : 0x72 + 46] = b"\x00" * 46
+    buf[0x18:0x20] = b"\x00" * 8  # db_id
+    buf[0x32:0x46] = b"\x00" * 20  # unk_0x32
+    buf[0x58:0x6C] = b"\x00" * 20  # hash58
+    buf[0x72 : 0x72 + 46] = b"\x00" * 46  # hash72
     return hashlib.sha1(bytes(buf)).digest()
 
 
@@ -124,8 +125,12 @@ def compute_hash72(
 ) -> bytes:
     """Compute and insert hash72 into iTunesDB data.
 
-    If iv and random_bytes are not provided, tries to extract them from
-    the existing hash72 in the data. If that fails, generates new random values.
+    The IV and random part are device-specific: pass them (from HashInfo, or
+    from extract_hash72_params() on a database written by iTunes/libgpod). If
+    they are not provided they are extracted from the existing signature in
+    ``db_data`` (only correct if the content is unchanged since it was
+    signed); without a signature random values are used (with a warning: an
+    iPod rejects such a database).
 
     Args:
         db_data: Raw iTunesDB bytes.
@@ -155,6 +160,7 @@ def compute_hash72(
                 iv = os.urandom(16)
                 random_bytes = os.urandom(12)
         else:
+            logger.warning("hash72 without device IV: using random values; the iPod will reject it")
             iv = os.urandom(16)
             random_bytes = os.urandom(12)
 
@@ -166,6 +172,46 @@ def compute_hash72(
     result[0x72 : 0x72 + 46] = sig
 
     return bytes(result)
+
+
+HASH_INFO_HEADER = b"HASHv0"
+
+
+def extract_hash72_params(signed_db: bytes) -> Optional[Tuple[bytes, bytes]]:
+    """(iv, random_bytes) from a database whose hash72 signature is valid for its own content
+    (written by iTunes or libgpod), or None if it has no hash72 signature."""
+    if len(signed_db) < 0x72 + 46 or signed_db[0x72] != 0x01:
+        return None
+    return hash_extract(signed_db[0x72 : 0x72 + 46], compute_itunesdb_sha1(signed_db))
+
+
+def _uuid_bytes(firewire_guid: str) -> bytes:
+    guid = firewire_guid.lower()
+    if guid.startswith("0x"):
+        guid = guid[2:]
+    return bytes.fromhex(guid)[:20].ljust(20, b"\x00")
+
+
+def read_hash_info(path: str, firewire_guid: Optional[str] = None) -> Optional[Tuple[bytes, bytes]]:
+    """(iv, random_bytes) from a libgpod HashInfo file ("HASHv0", uuid[20], rndpart[12], iv[16]);
+    None if missing, malformed or for another device (uuid != FirewireGuid)."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    if len(data) < 54 or data[:6] != HASH_INFO_HEADER:
+        return None
+    if firewire_guid and data[6:26] != _uuid_bytes(firewire_guid):
+        logger.warning("HashInfo %s belongs to another device", path)
+        return None
+    return data[38:54], data[26:38]
+
+
+def write_hash_info(path: str, firewire_guid: str, iv: bytes, random_bytes: bytes) -> None:
+    """Write a libgpod-compatible HashInfo file."""
+    with open(path, "wb") as f:
+        f.write(HASH_INFO_HEADER + _uuid_bytes(firewire_guid) + random_bytes[:12] + iv[:16])
 
 
 def _get_aes_backend():

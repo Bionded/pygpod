@@ -2,17 +2,15 @@
 
 Provides session-scoped fixtures for iPod filesystem, generated MP3 files,
 and writable iPod directories. All fixtures are built in pure Python using
-pygpod itself - no gcc, libgpod, or ffmpeg required.
-
-If gcc + libgpod + ffmpeg ARE available, the C-based fixture builder is used
-for integration tests (richer fixture with cover art, video tracks, etc.).
+pygpod itself - no gcc, libgpod, or ffmpeg required (ffmpeg, when present,
+only makes the generated MP3s richer). libgpod interop is tested separately
+with integration_tests/libgpod_tool.c (test_libgpod_interop.py).
 """
 
 import os
 import shutil
 import struct
 import subprocess
-import tempfile
 import zlib
 
 import pytest
@@ -30,9 +28,6 @@ def pytest_sessionfinish(session, exitstatus):
 
 # Root of the project
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TEST_FILES_DIR = os.path.join(PROJECT_ROOT, "test_files")
-IPOD_FS_DIR = os.path.join(TEST_FILES_DIR, "ipod_fs")
-C_SOURCE = os.path.join(PROJECT_ROOT, "integration_tests", "build_ipod_mass.c")
 
 # iPod Classic 1G (B029) params for fixture generation
 FIXTURE_MODEL = "B029"
@@ -283,135 +278,6 @@ def _generate_pure_python_fixture(dest_dir):
     return dest_dir
 
 
-# -------------------------------------------------------------------------
-# C-based fixture (richer, for integration tests)
-# -------------------------------------------------------------------------
-
-
-def _generate_c_fixture():
-    """Auto-generate the iPod fixture using the integration C builder.
-
-    Compiles build_ipod_mass.c, generates media files, and creates a
-    complete iPod filesystem at test_files/ipod_fs/.
-
-    Returns the path on success, or None on failure.
-    """
-    if not os.path.isfile(C_SOURCE):
-        return None
-
-    try:
-        cflags = (
-            subprocess.check_output(
-                ["pkg-config", "--cflags", "libgpod-1.0", "glib-2.0"],
-                stderr=subprocess.DEVNULL,
-            )
-            .decode()
-            .strip()
-        )
-        libs = (
-            subprocess.check_output(
-                ["pkg-config", "--libs", "libgpod-1.0", "glib-2.0"],
-                stderr=subprocess.DEVNULL,
-            )
-            .decode()
-            .strip()
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return None
-
-    build_dir = tempfile.mkdtemp(prefix="pygpod_fixture_build_")
-    try:
-        binary = os.path.join(build_dir, "build_ipod_mass")
-        cmd = f"gcc -o {binary} {C_SOURCE} {cflags} {libs}"
-        subprocess.check_call(cmd, shell=True, stderr=subprocess.PIPE)
-
-        media_dir = os.path.join(build_dir, "media")
-        os.makedirs(media_dir)
-        for i in range(21):
-            freq = 220 + i * 40
-            is_video = 10 <= i <= 13
-            ext = "mp4" if is_video else "mp3"
-            path = os.path.join(media_dir, f"media_{i + 1:02d}.{ext}")
-            if is_video:
-                subprocess.run(
-                    [
-                        "ffmpeg",
-                        "-y",
-                        "-f",
-                        "lavfi",
-                        "-i",
-                        "color=c=blue:s=320x240:d=1",
-                        "-f",
-                        "lavfi",
-                        "-i",
-                        f"sine=frequency={freq}:duration=1",
-                        "-codec:v",
-                        "libx264",
-                        "-preset",
-                        "ultrafast",
-                        "-pix_fmt",
-                        "yuv420p",
-                        "-codec:a",
-                        "aac",
-                        "-b:a",
-                        "128k",
-                        "-shortest",
-                        path,
-                    ],
-                    capture_output=True,
-                    check=True,
-                )
-            else:
-                subprocess.run(
-                    [
-                        "ffmpeg",
-                        "-y",
-                        "-f",
-                        "lavfi",
-                        "-i",
-                        f"sine=frequency={freq}:duration=1",
-                        "-codec:a",
-                        "libmp3lame",
-                        "-b:a",
-                        "128k",
-                        "-ar",
-                        "44100",
-                        path,
-                    ],
-                    capture_output=True,
-                    check=True,
-                )
-
-        cover_art = os.path.join(media_dir, "cover_art.png")
-        _make_minimal_png(cover_art)
-
-        os.makedirs(IPOD_FS_DIR, exist_ok=True)
-        result = subprocess.run(
-            [
-                binary,
-                IPOD_FS_DIR,
-                FIXTURE_MODEL,
-                media_dir,
-                FIXTURE_GUID,
-                str(FIXTURE_MUSIC_DIRS),
-                cover_art,
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            shutil.rmtree(IPOD_FS_DIR, ignore_errors=True)
-            return None
-
-        _generate_itunessd(IPOD_FS_DIR)
-        return IPOD_FS_DIR
-    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
-        shutil.rmtree(IPOD_FS_DIR, ignore_errors=True)
-        return None
-    finally:
-        shutil.rmtree(build_dir, ignore_errors=True)
-
-
 def _generate_itunessd(ipod_dir):
     """Generate a minimal iTunesSD file from the iTunesDB tracks."""
     from pygpod.db.itunessd import ITunesSD, ITunesSDTrack
@@ -461,20 +327,7 @@ def _generate_itunessd(ipod_dir):
 
 @pytest.fixture(scope="session")
 def ipod_fs_path(tmp_path_factory):
-    """Path to the iPod filesystem test fixture.
-
-    Tries the C-based builder first (richer fixture). Falls back to
-    pure-Python builder (always works, no external dependencies).
-    """
-    if os.path.isdir(IPOD_FS_DIR):
-        return IPOD_FS_DIR
-
-    # Try C builder
-    result = _generate_c_fixture()
-    if result is not None:
-        return result
-
-    # Fall back to pure Python
+    """Path to the iPod filesystem test fixture (built in pure Python)."""
     dest = str(tmp_path_factory.mktemp("ipod_fixture"))
     return _generate_pure_python_fixture(dest)
 
@@ -588,3 +441,30 @@ def writable_ipod_with_mp3(writable_ipod, tmp_path):
     mp3_path = str(tmp_path / "new_track.mp3")
     _make_minimal_mp3(mp3_path)
     return writable_ipod, mp3_path
+
+
+# -------------------------------------------------------------------------
+# libgpod reference tool (tests marked `libgpod`)
+# -------------------------------------------------------------------------
+LIBGPOD_TOOL_SRC = os.path.join(PROJECT_ROOT, "integration_tests", "libgpod_tool.c")
+
+
+def _unavailable(reason):
+    if os.environ.get("PYGPOD_REQUIRE_LIBGPOD") == "1":
+        pytest.fail(f"libgpod interop required but unavailable: {reason}")
+    pytest.skip(reason)
+
+
+@pytest.fixture(scope="session")
+def tool(tmp_path_factory):
+    if not shutil.which("gcc") or not shutil.which("pkg-config"):
+        _unavailable("gcc/pkg-config not installed")
+    try:
+        flags = subprocess.check_output(
+            ["pkg-config", "--cflags", "--libs", "libgpod-1.0", "glib-2.0"], text=True
+        ).split()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        _unavailable("libgpod-1.0 not found by pkg-config (install libgpod-dev)")
+    binary = str(tmp_path_factory.mktemp("libgpod") / "libgpod_tool")
+    subprocess.run(["gcc", "-Wall", "-o", binary, LIBGPOD_TOOL_SRC, *flags], check=True)
+    return binary

@@ -49,6 +49,11 @@ _COUNT_MAGICS = {b"mhli", b"mhlf", b"mhla"}
 def _write_artwork_record(rec: Record) -> bytes:
     """Write an artwork record, falling back to raw_bytes."""
     if not rec.children:
+        if rec.magic in _COUNT_MAGICS and len(rec.raw_header) >= 12:
+            # An emptied list: raw_bytes would still hold the removed children
+            header = bytearray(rec.raw_header)
+            put32lint(header, 8, 0)
+            return bytes(header)
         return rec.raw_bytes
 
     header = bytearray(rec.raw_header)

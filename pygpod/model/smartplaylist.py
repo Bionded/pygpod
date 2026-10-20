@@ -12,7 +12,7 @@ import random
 import struct
 import time
 from enum import IntEnum
-from typing import TYPE_CHECKING, Callable, Dict, List, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Mapping, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -339,18 +339,36 @@ def _get_track_date(track: "Track", field: int) -> int:
 # ============================================================================
 # Rule Evaluation
 # ============================================================================
-def eval_rule(rule: SPLRule, track: "Track") -> bool:
+_U64 = (1 << 64) - 1
+
+
+def eval_rule(
+    rule: SPLRule, track: "Track", playlists: Optional[Mapping[int, Set[int]]] = None
+) -> bool:
     """Evaluate whether a track matches a single SPL rule.
 
     Args:
         rule: The smart playlist rule.
         track: The track to test.
+        playlists: playlist id -> track ids of its members, for "playlist is / is not"
+            rules (libgpod itdb_splr_eval: the playlist with id ``fromvalue``; an unknown
+            playlist never matches).
 
     Returns:
         True if the track matches the rule.
     """
     field_type = get_field_type(rule.field)
     action = rule.action
+
+    if field_type == SPLFieldType.PLAYLIST:
+        members = playlists.get(rule.fromvalue & _U64) if playlists is not None else None
+        if members is None:
+            return False
+        if action == SPLAction.IS_INT:
+            return track.track_id in members
+        if action == SPLAction.IS_NOT_INT:
+            return track.track_id not in members
+        return False
 
     if field_type == SPLFieldType.STRING:
         return _eval_string_rule(rule, track)
@@ -460,7 +478,10 @@ def _eval_date_rule(rule: SPLRule, track: "Track") -> bool:
 # Smart Playlist Evaluation
 # ============================================================================
 def evaluate_smart_playlist(
-    rules: List[SPLRule], match: SPLMatch, tracks: List["Track"]
+    rules: List[SPLRule],
+    match: SPLMatch,
+    tracks: List["Track"],
+    playlists: Optional[Mapping[int, Set[int]]] = None,
 ) -> List["Track"]:
     """Evaluate all rules against all tracks and return matching ones.
 
@@ -468,6 +489,7 @@ def evaluate_smart_playlist(
         rules: List of SPL rules.
         match: SPLMatch.AND or SPLMatch.OR.
         tracks: List of tracks to evaluate.
+        playlists: playlist id -> member track ids (for playlist rules).
 
     Returns:
         List of tracks that match the rules.
@@ -476,10 +498,10 @@ def evaluate_smart_playlist(
     result = []
     for track in tracks:
         if match == SPLMatch.AND:
-            if all(eval_rule(r, track) for r in rules):
+            if all(eval_rule(r, track, playlists) for r in rules):
                 result.append(track)
         else:  # OR
-            if any(eval_rule(r, track) for r in rules):
+            if any(eval_rule(r, track, playlists) for r in rules):
                 result.append(track)
     return result
 
@@ -500,29 +522,30 @@ def apply_limit(tracks: List["Track"], prefs: SPLPrefs) -> List["Track"]:
     # Sort first
     sorted_tracks = _sort_tracks(tracks, prefs.limitsort)
 
-    # Apply limit
+    # Take tracks in sort order while they fit (libgpod itdb_spl_update: a track that would
+    # exceed the limit is skipped and later, smaller ones may still fit)
     limit_type = prefs.limittype
     limit_value = prefs.limitvalue
-
-    if limit_type == SPLLimitType.SONGS:
-        return sorted_tracks[:limit_value]
-
     result = []
-    accumulated = 0
+    total = 0.0
     for track in sorted_tracks:
-        if limit_type == SPLLimitType.MINUTES:
-            accumulated += track.duration_ms / 60000.0
-        elif limit_type == SPLLimitType.HOURS:
-            accumulated += track.duration_ms / 3600000.0
-        elif limit_type == SPLLimitType.MB:
-            accumulated += track.file_size / (1024 * 1024)
-        elif limit_type == SPLLimitType.GB:
-            accumulated += track.file_size / (1024 * 1024 * 1024)
-
-        if accumulated > limit_value:
+        if total >= limit_value:
             break
-        result.append(track)
-
+        if limit_type == SPLLimitType.SONGS:
+            value = 1.0
+        elif limit_type == SPLLimitType.MINUTES:
+            value = track.duration_ms / 60000.0
+        elif limit_type == SPLLimitType.HOURS:
+            value = track.duration_ms / 3600000.0
+        elif limit_type == SPLLimitType.MB:
+            value = track.file_size / (1024 * 1024)
+        elif limit_type == SPLLimitType.GB:
+            value = track.file_size / (1024 * 1024 * 1024)
+        else:
+            continue
+        if total + value <= limit_value:
+            total += value
+            result.append(track)
     return result
 
 
@@ -534,23 +557,27 @@ def _sort_tracks(tracks: List["Track"], sort_order: int) -> List["Track"]:
         random.shuffle(result)
         return result
 
-    reverse = bool(sort_order & 0x80000000)
+    opposite = bool(sort_order & 0x80000000)
     base = sort_order & 0x7FFFFFFF
 
-    key_funcs: Dict[int, Callable] = {
+    # Names ascending (libgpod compTitle/compAlbum/... are strcmp; case-insensitive here, as on the
+    # iPod); "most" sorts descending, their "least" opposites (high bit) ascending.
+    names: Dict[int, Callable] = {
         SPLLimitSort.SONG_NAME: lambda t: (t.title or "").lower(),
         SPLLimitSort.ALBUM: lambda t: (t.album or "").lower(),
         SPLLimitSort.ARTIST: lambda t: (t.artist or "").lower(),
         SPLLimitSort.GENRE: lambda t: (t.genre or "").lower(),
+    }
+    numbers: Dict[int, Callable] = {
         0x10: lambda t: t.record.fields.get("time_added", 0) if t.record else 0,
         0x14: lambda t: t.play_count,
         0x15: lambda t: t.record.fields.get("time_played", 0) if t.record else 0,
         0x17: lambda t: t.rating,
     }
-
-    key_fn = key_funcs.get(base)
-    if key_fn:
-        result.sort(key=key_fn, reverse=not reverse)
+    if base in names:
+        result.sort(key=names[base], reverse=opposite)
+    elif base in numbers:
+        result.sort(key=numbers[base], reverse=not opposite)
     return result
 
 
@@ -688,11 +715,13 @@ def write_spl_rules(match: SPLMatch, rules: List[SPLRule], version: int = 1) -> 
             # Non-string rule: data_len(4) + 6x uint64 values + 5x uint32 unknowns
             # data_len is always 0x44 (68 bytes)
             data += struct.pack(">I", 0x44)
-            data += struct.pack(">q", rule.fromvalue)  # fromvalue (int64)
-            data += struct.pack(">q", rule.fromdate)  # fromdate (int64)
+            # 64-bit values are written as raw bits (libgpod put64bint): playlist ids are
+            # unsigned and may exceed 2**63
+            data += struct.pack(">Q", rule.fromvalue & _U64)  # fromvalue
+            data += struct.pack(">Q", rule.fromdate & _U64)  # fromdate
             data += struct.pack(">Q", rule.fromunits)  # fromunits (uint64)
-            data += struct.pack(">q", rule.tovalue)  # tovalue (int64)
-            data += struct.pack(">q", rule.todate)  # todate (int64)
+            data += struct.pack(">Q", rule.tovalue & _U64)  # tovalue
+            data += struct.pack(">Q", rule.todate & _U64)  # todate
             data += struct.pack(">Q", rule.tounits)  # tounits (uint64)
             data += b"\x00" * 20  # 5 x 4-byte unknown fields
 
@@ -721,6 +750,8 @@ def parse_spl_prefs(data: bytes) -> SPLPrefs:
     prefs.matchcheckedonly = bool(data[12])
     if len(data) > 13:
         prefs.limitsort_opposite = bool(data[13])
+        if prefs.limitsort_opposite:  # libgpod: the "least ..." sorts carry the high bit in memory
+            prefs.limitsort |= 0x80000000
 
     return prefs
 
@@ -744,5 +775,5 @@ def write_spl_prefs(prefs: SPLPrefs, padded_size: int = 14) -> bytes:
     data[4] = prefs.limitsort & 0xFF
     struct.pack_into("<I", data, 8, prefs.limitvalue)
     data[12] = int(prefs.matchcheckedonly)
-    data[13] = int(prefs.limitsort_opposite)
+    data[13] = int(prefs.limitsort_opposite or bool(prefs.limitsort & 0x80000000))
     return bytes(data)

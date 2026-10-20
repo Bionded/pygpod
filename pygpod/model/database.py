@@ -9,8 +9,10 @@ import logging
 import os
 import pathlib
 import random
+import shutil
+import stat
 import struct
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from ..db.constants import (
     DEFAULT_MHBD_HEADER_LEN,
@@ -64,18 +66,51 @@ from ..db.constants import (
     MHYP_MAGIC,
 )
 from ..db.parser import Record, parse_itunesdb
+from ..db.playcounts import (
+    PLAY_COUNTS_COMMIT_FILE,
+    OTGFile,
+    OTGSkippedEntry,
+    PendingPlayCount,
+    PlayCountEntry,
+    PlayCountSource,
+    apply_play_counts,
+    file_sha256,
+    read_commit_marker,
+    read_otg_files,
+    read_play_count_source,
+    remove_consumed_files,
+    remove_file,
+    sha256_hex,
+    write_commit_marker,
+)
+from ..db.transaction import Transaction
+from ..db.transaction import recover as recover_interrupted_commit
+from ..db.writelock import writer_lock
 from ..db.writer import make_string_mhod, write_itunesdb
 from ..device.device import Device
 from ..device.fileutils import copy_track_to_ipod
-from ..device.mountpoint import find_itunesdb, validate_mountpoint
-from ..exceptions import DatabaseError, HashError, MountPointError, TrackError
+from ..device.mountpoint import _build_empty_itunesdb, find_itunesdb, validate_mountpoint
+from ..exceptions import (
+    ArtworkError,
+    ConflictError,
+    DatabaseError,
+    DeviceError,
+    HashError,
+    MountPointError,
+    PlaylistError,
+    TrackError,
+    UnsupportedFormatError,
+)
 from ..hash.checksum import update_checksums
-from ..tags import extract_artwork, filetype_marker, read_tags
+from ..tags import extract_artwork, filetype_marker, read_tags, validate_media
 from ..utils.compat import put8int, put16lint, put32lint, put64lint, put_float
 from ..utils.datetime import now_mac
 from .config import DatabaseConfig
 from .playlist import Playlist
 from .track import Track
+
+# read_tags keys that describe the audio data (taken from a converted file, not from its original)
+_AUDIO_PROPERTIES = {"bitrate", "samplerate", "duration_ms", "file_size", "filetype"}
 
 logger = logging.getLogger(__name__)
 
@@ -92,10 +127,20 @@ class Database:
 
         db.add_track("/path/to/song.mp3")
         db.save()
+
+    Play counts: the iPod records plays, skips, ratings and bookmarks since the
+    last sync in a separate file (Play Counts / iTunesStats / PlayCounts.plist).
+    With ``apply_play_counts=True`` (default) they are merged into the tracks on
+    open; with ``False`` they are only read, see pending_play_counts(),
+    merge_play_counts() and clear_play_counts(). The file is deleted only after
+    the next successful save(), so a session that does not save loses nothing.
     """
 
     def __init__(
-        self, mountpoint: Optional[str] = None, config: Optional[DatabaseConfig] = None
+        self,
+        mountpoint: Optional[str] = None,
+        config: Optional[DatabaseConfig] = None,
+        apply_play_counts: bool = True,
     ) -> None:
         self._mountpoint = mountpoint
         self._config = config or DatabaseConfig()
@@ -107,10 +152,19 @@ class Database:
         self._raw_data: Optional[bytes] = None
         self._modified = False
         self._rng = random.Random(self._config.random_seed)
+        self._pc_source: Optional[PlayCountSource] = None
+        self._pc_pending: List[PlayCountEntry] = []
+        self._pc_consume = False
+        self._otg_files: List[OTGFile] = []
+        self._otg_tracks: List[Track] = []
+        self._otg_consume: List[OTGFile] = []
+        self._otg_resolved: Dict[str, List[Track]] = {}
+        self._otg_skipped: List[OTGSkippedEntry] = []
+        self._ids: Optional[List[Any]] = None
 
         if mountpoint:
             logger.info("Opening database at %s", mountpoint)
-            self._load_from_mountpoint(mountpoint)
+            self._load_from_mountpoint(mountpoint, apply_play_counts)
 
     @classmethod
     def from_file(cls, path: str, config: Optional[DatabaseConfig] = None) -> "Database":
@@ -130,6 +184,15 @@ class Database:
         db._raw_data = None
         db._modified = False
         db._rng = random.Random(db._config.random_seed)
+        db._pc_source = None
+        db._pc_pending = []
+        db._pc_consume = False
+        db._otg_files = []
+        db._otg_tracks = []
+        db._otg_consume = []
+        db._otg_resolved = {}
+        db._otg_skipped = []
+        db._ids = None
 
         with open(path, "rb") as f:
             data = f.read()
@@ -139,13 +202,14 @@ class Database:
         db._build_model()
         return db
 
-    def _load_from_mountpoint(self, mountpoint: str) -> None:
+    def _load_from_mountpoint(self, mountpoint: str, apply_play_counts: bool = True) -> None:
         """Load database from iPod mount point."""
         if not validate_mountpoint(mountpoint):
             raise MountPointError(
                 f"Not a valid iPod mount point: {mountpoint}\n"
                 f"Expected to find iPod_Control/iTunes/ directory."
             )
+        recover_interrupted_commit(mountpoint)
 
         self._device = Device.from_mountpoint(mountpoint)
         db_path = find_itunesdb(mountpoint)
@@ -160,52 +224,231 @@ class Database:
         self._build_model()
         logger.info("Loaded %d tracks, %d playlists", len(self._tracks), len(self._playlists))
 
-        # Apply play counts from device
-        if mountpoint:
-            self._apply_play_counts(mountpoint)
+        self._load_play_counts(mountpoint)
+        self._load_otg(mountpoint)
+        if apply_play_counts:
+            self.merge_play_counts()
 
-    def _apply_play_counts(self, mountpoint: str) -> None:
-        """Read, apply, and delete play count data from device.
+    # ---- Play counts ----
 
-        The iPod writes play counts to separate files (Play Counts,
-        iTunesStats, PlayCounts.plist) between syncs. We merge them
-        into the iTunesDB and delete the files so they aren't applied
-        again on next load.
+    def _itunes_dir(self) -> str:
+        assert self._mountpoint is not None
+        return os.path.join(self._mountpoint, "iPod_Control", "iTunes")
+
+    def _load_play_counts(self, mountpoint: str) -> None:
+        """Read the iPod's play count file without consuming it.
+
+        Finishes an interrupted consume first: if the commit marker says the
+        current play count file is already merged into the current iTunesDB
+        (a previous save() stopped before deleting it), the file is not applied
+        again but deleted now.
         """
+        itunes_dir = os.path.join(mountpoint, "iPod_Control", "iTunes")
         try:
-            from ..db.playcounts import apply_play_counts, read_play_counts
-
-            entries = read_play_counts(mountpoint)
-            if not entries:
-                return
-
-            updated = apply_play_counts(self._tracks, entries)
-            if updated > 0:
-                self._modified = True
-                logger.info(
-                    "Merged play counts: %d tracks updated from %d entries",
-                    updated,
-                    len(entries),
-                )
-
-                # Delete the play count files so they aren't re-applied
-                itunes_dir = os.path.join(mountpoint, "iPod_Control", "iTunes")
-                for fname in ("Play Counts", "iTunesStats", "PlayCounts.plist"):
-                    fpath = os.path.join(itunes_dir, fname)
-                    if os.path.isfile(fpath):
-                        try:
-                            os.unlink(fpath)
-                            logger.debug("Deleted %s", fpath)
-                        except OSError:
-                            logger.debug("Failed to delete %s", fpath, exc_info=True)
+            source = read_play_count_source(mountpoint)
         except Exception:
-            logger.debug("Failed to apply play counts", exc_info=True)
+            logger.warning("Failed to read play counts", exc_info=True)
+            source = None
+
+        marker = read_commit_marker(itunes_dir)
+        if marker is not None:
+            committed = marker.get("itunesdb_sha256") == sha256_hex(self._raw_data or b"")
+            if (
+                committed
+                and source is not None
+                and marker.get("file") == source.name
+                and marker.get("file_sha256") == source.sha256
+            ):
+                logger.info("Play counts in %s were already merged; finishing cleanup", source.name)
+                source = None
+                if remove_consumed_files(
+                    itunes_dir, marker["file"], marker["file_sha256"], marker["others"]
+                ):
+                    remove_file(os.path.join(itunes_dir, PLAY_COUNTS_COMMIT_FILE))
+            else:
+                # Either the save never committed (old iTunesDB still in place) or
+                # the play count file was rewritten since: the counts are not applied yet.
+                remove_file(os.path.join(itunes_dir, PLAY_COUNTS_COMMIT_FILE))
+
+        if source is None:
+            return
+        self._pc_source = source
+        self._pc_pending = list(source.entries)
+
+    # ---- On-The-Go playlists ----
+
+    def _load_otg(self, mountpoint: str) -> None:
+        """Read the iPod's OTG playlist files (not imported until asked)."""
+        try:
+            self._otg_files = read_otg_files(mountpoint)
+        except Exception:
+            logger.warning("Failed to read OTG playlists", exc_info=True)
+            self._otg_files = []
+        self._otg_tracks = list(self._tracks)  # OTG entries are positions in this order
+
+    def _otg_entry_problem(self, index: int, live: Set[int]) -> Optional[str]:
+        """Why an OTG entry cannot be imported (None if it can)."""
+        from ..exceptions import UnsafePathError
+        from ..utils.encoding import ipod_path_to_os
+
+        if index >= len(self._otg_tracks):
+            return "no such track"
+        track = self._otg_tracks[index]
+        if id(track) not in live:
+            return "track was removed"
+        if not track.ipod_path or self._mountpoint is None:
+            return "track has no file"
+        try:
+            path = ipod_path_to_os(track.ipod_path, self._mountpoint)
+            st = os.stat(path)
+        except UnsafePathError:
+            return "unsafe file path"
+        except FileNotFoundError:
+            return "file missing"
+        except OSError as e:
+            return f"file unreadable ({e.strerror or e})"
+        if not stat.S_ISREG(st.st_mode):
+            return "not a regular file"
+        if st.st_size == 0:
+            return "file is empty"
+        if track.file_size and st.st_size < track.file_size:
+            return f"file truncated ({st.st_size} of {track.file_size} bytes)"
+        if not os.access(path, os.R_OK):
+            return "file unreadable"
+        return None
+
+    def _otg_resolve(self, f: OTGFile) -> List[Track]:
+        """The importable tracks of an OTG file; bad entries are logged and left out once."""
+        if f.name not in self._otg_resolved:
+            tracks: List[Track] = []
+            live = {id(t) for t in self._tracks}
+            for pos, index in enumerate(f.indices):
+                problem = self._otg_entry_problem(index, live)
+                if problem is None:
+                    tracks.append(self._otg_tracks[index])
+                    continue
+                self._otg_skipped.append(OTGSkippedEntry(f.name, pos, index, problem))
+                logger.warning(
+                    "%s entry %d (track %d) left out: %s", f.name, pos + 1, index, problem
+                )
+            self._otg_resolved[f.name] = tracks
+        return self._otg_resolved[f.name]
+
+    def pending_otg_playlists(self) -> List[List[Track]]:
+        """On-The-Go playlists made on the iPod and not imported yet, as track lists.
+
+        Entries whose track does not exist or whose file is missing or broken (empty,
+        truncated, unreadable) are left out and logged; see otg_skipped_entries().
+        Playlists with no valid entry are left out.
+        """
+        return [tracks for f in self._otg_files if (tracks := self._otg_resolve(f))]
+
+    def otg_skipped_entries(self) -> List[OTGSkippedEntry]:
+        """On-The-Go entries left out so far because their track or file is bad."""
+        for f in self._otg_files:
+            self._otg_resolve(f)
+        return list(self._otg_skipped)
+
+    def import_otg_playlists(self, name: str = "OTG Playlist {n}") -> List[Playlist]:
+        """Create a playlist per On-The-Go playlist (``name`` formatted with n = 1, 2, ...).
+
+        Bad entries (see pending_otg_playlists()) are left out and logged; the valid
+        ones are imported. The OTG files are deleted by the next successful save(), in
+        the same transaction as the iTunesDB, so a crash never imports them twice.
+        Calling it again before the save imports nothing.
+        """
+        created: List[Playlist] = []
+        for f in self._otg_files:
+            tracks = self._otg_resolve(f)
+            if tracks:
+                pl = self.create_playlist(name.format(n=len(created) + 1))
+                for t in tracks:
+                    self.add_track_to_playlist(pl, t)
+                created.append(pl)
+            self._otg_consume.append(f)
+        self._otg_files = []
+        if self._otg_consume:
+            self._modified = True
+        return created
+
+    def clear_otg_playlists(self) -> None:
+        """Drop the On-The-Go playlists without importing them (deleted by the next save())."""
+        self._otg_consume += self._otg_files
+        if self._otg_files:
+            self._modified = True
+        self._otg_files = []
+
+    def pending_play_counts(self) -> List[PendingPlayCount]:
+        """Play count updates read from the iPod that are not merged yet.
+
+        Matched to tracks by position (the iPod writes one entry per track in
+        database order); entries without any change are skipped.
+        """
+        from ..db.playcounts import match_play_counts
+
+        result: List[PendingPlayCount] = []
+        for track, e in match_play_counts(self._tracks, self._pc_pending):
+            if (
+                e.play_count > 0
+                or e.time_played > 0
+                or e.rating >= 0
+                or e.skip_count > 0
+                or e.time_skipped > 0
+                or e.bookmark_time > 0
+            ):
+                result.append(PendingPlayCount(track, *e[:6]))
+        return result
+
+    def merge_play_counts(self) -> int:
+        """Merge pending play counts into the tracks (in memory).
+
+        The play count file is deleted after the next successful save().
+
+        Returns:
+            Number of tracks updated.
+        """
+        if self._pc_source is None or not self._pc_pending:
+            return 0
+        updated = apply_play_counts(self._tracks, self._pc_pending)
+        self._pc_pending = []
+        self._pc_consume = True
+        self._modified = True
+        logger.info("Merged play counts from %s: %d tracks updated", self._pc_source.name, updated)
+        return updated
+
+    def clear_play_counts(self) -> None:
+        """Drop pending play counts without merging them.
+
+        For callers that apply the values themselves. The play count file is
+        deleted after the next successful save().
+        """
+        if self._pc_source is None:
+            return
+        self._pc_pending = []
+        self._pc_consume = True
+        self._modified = True
+
+    def _finish_play_count_cleanup(self) -> None:
+        """Delete all play count files seen at open and the commit marker (after save).
+
+        Like libgpod, every variant (Play Counts, iTunesStats, PlayCounts.plist) is
+        removed, not only the one that was read; a file the iPod rewrote since is kept.
+        """
+        source = self._pc_source
+        if source is None:
+            return
+        itunes_dir = self._itunes_dir()
+        if remove_consumed_files(itunes_dir, source.name, source.sha256, source.others):
+            remove_file(os.path.join(itunes_dir, PLAY_COUNTS_COMMIT_FILE))
+        self._pc_source = None
+        self._pc_consume = False
 
     def _build_model(self) -> None:
         """Build high-level model objects from parsed records."""
         self._tracks = []
         self._playlists = []
         self._track_lookup = {}
+        self._ids = None
 
         if not self._root:
             return
@@ -217,6 +460,7 @@ class Database:
                 mhlt = mhsd.children[0]
                 for mhit_rec in mhlt.children:
                     track = Track.from_record(mhit_rec)
+                    track._on_change = self._mark_modified
                     self._tracks.append(track)
                     self._track_lookup[track.track_id] = track
 
@@ -227,6 +471,7 @@ class Database:
                 mhlp = mhsd.children[0]
                 for mhyp_rec in mhlp.children:
                     pl = Playlist.from_record(mhyp_rec, self._track_lookup)
+                    pl._on_change = self._mark_modified
                     self._playlists.append(pl)
 
     # ---- Public Properties ----
@@ -284,15 +529,45 @@ class Database:
         """Get a track by its ID."""
         return self._track_lookup.get(track_id)
 
-    def add_track(self, filepath: str, **kwargs: Any) -> Track:
+    # Keyword arguments of add_track() applied through Track setters after the
+    # record is created (the rest go into the MHIT/MHODs directly).
+    _POST_SETTERS = (
+        "rating",
+        "play_count",
+        "skip_count",
+        "bookmark_time",
+        "time_played",
+        "remember_position",
+        "skip_when_shuffling",
+        "mark_unplayed",
+    )
+
+    def add_track(
+        self, filepath: str, copy: bool = True, convert: bool = False, **kwargs: Any
+    ) -> Track:
         """Add a track to the iPod.
 
         If mutagen is installed, tags are read automatically from the file.
-        Additional/override metadata can be passed as keyword arguments.
+        Additional/override metadata can be passed as keyword arguments and
+        always wins over the file's tags.
 
         Args:
             filepath: Path to the audio file to add.
-            **kwargs: Optional metadata overrides (title, artist, album, etc.)
+            copy: Copy the file to iPod_Control/Music/Fxx (default). False: the
+                file is already on the iPod (must be inside the mount point's
+                iPod_Control/Music) and is referenced in place.
+            convert: Convert audio this iPod cannot play (FLAC, Ogg, Opus, WMA,
+                > 48 kHz, > 2 channels ...) with ffmpeg instead of refusing it:
+                lossless sources become Apple Lossless where the iPod plays it,
+                everything else AAC (see pygpod.convert). Tags and artwork come
+                from the original file. Needs copy=True.
+            **kwargs: Metadata overrides: title, artist, album, albumartist
+                (alias album_artist), genre, composer, comment, grouping, year,
+                track_number, total_tracks, cd_number, total_cds, compilation,
+                media_type, category, description, podcast_url, podcast_rss,
+                rating (0-100), play_count, skip_count, bookmark_time (ms),
+                time_played (datetime), remember_position, skip_when_shuffling,
+                mark_unplayed, cover_art (image path or bytes).
 
         Returns:
             The new Track object.
@@ -306,34 +581,70 @@ class Database:
         if not self._mountpoint:
             raise TrackError("Cannot add tracks without a mount point")
 
-        # Check format is iPod-compatible
-        from ..tags import check_format_supported
+        # Check the content plays on this iPod before anything is copied or added
+        generation = self._device.generation if self._device else None
+        converted = None
+        try:
+            validate_media(filepath, generation)
+        except UnsupportedFormatError:
+            if not convert:
+                raise
+            if not copy:
+                raise TrackError(f"convert=True needs copy=True: {filepath}") from None
+            from ..convert import convert_for_ipod
 
-        check_format_supported(filepath)
+            converted = convert_for_ipod(filepath, generation)
+        try:
+            return self._add_track_file(filepath, converted, copy, kwargs)
+        finally:
+            if converted is not None:
+                os.unlink(converted)
 
-        # Read tags
+    def _add_track_file(
+        self, filepath: str, converted: Optional[str], copy: bool, kwargs: dict
+    ) -> Track:
+        """add_track after validation: `converted` (or the original) is copied, tags come from
+        the original."""
+        source = converted or filepath
+        if converted is not None:
+            validate_media(converted, self._device.generation if self._device else None)
+
+        # Read tags (the converted file's audio properties, the original's text tags)
         tags = read_tags(filepath)
+        if converted is not None:
+            tags.update({k: v for k, v in read_tags(converted).items() if k in _AUDIO_PROPERTIES})
+        if "album_artist" in kwargs:
+            kwargs["albumartist"] = kwargs.pop("album_artist")
+        post = {k: kwargs.pop(k) for k in self._POST_SETTERS if k in kwargs}
         tags.update(kwargs)  # User overrides
 
-        # Copy file to iPod
         num_dirs = self._device.music_dirs if self._device else 50
         cfg = self._config
-        ipod_path = copy_track_to_ipod(
-            filepath,
-            self._mountpoint,
-            num_dirs,
-            prefix=cfg.filename_prefix,
-            rand_len=cfg.filename_rand_len,
-            charset=cfg.filename_charset,
-            rng=self._rng,
-        )
+        if copy:
+            ipod_path = copy_track_to_ipod(
+                source,
+                self._mountpoint,
+                num_dirs,
+                prefix=cfg.filename_prefix,
+                rand_len=cfg.filename_rand_len,
+                charset=cfg.filename_charset,
+                rng=self._rng,
+            )
+        else:
+            from ..utils.encoding import os_path_to_ipod
+
+            music = os.path.realpath(os.path.join(self._mountpoint, "iPod_Control", "Music"))
+            real = os.path.realpath(filepath)
+            if os.path.commonpath([music, real]) != music:
+                raise TrackError(f"copy=False needs a file inside {music}: {filepath}")
+            ipod_path = os_path_to_ipod(real, os.path.realpath(self._mountpoint))
 
         # Generate track ID and DBID
         track_id = self._next_track_id()
         dbid = self._next_dbid()
 
         # Create MHIT record
-        mhit = self._create_mhit(track_id, dbid, tags, ipod_path, filepath)
+        mhit = self._create_mhit(track_id, dbid, tags, ipod_path, source)
 
         # Add to track list MHSD
         mhlt = self._get_or_create_mhlt()
@@ -341,8 +652,15 @@ class Database:
 
         # Create Track model object
         track = Track.from_record(mhit)
+        for key, value in post.items():
+            setattr(track, key, value)
+        track._on_change = self._mark_modified
         self._tracks.append(track)
         self._track_lookup[track_id] = track
+        index = self._id_index()
+        index[0].add(track_id)
+        index[1].add(dbid)
+        index[2] = max(index[2], track_id)
 
         # Add to master playlist (in all playlist MHSDs)
         self._add_to_master_playlists(track_id)
@@ -392,37 +710,64 @@ class Database:
             return
 
         try:
-            art_data = extract_artwork(filepath)
-            if not art_data and cover_art and os.path.isfile(cover_art):
-                with open(cover_art, "rb") as f:
-                    art_data = f.read()
+            if isinstance(cover_art, (bytes, bytearray)):
+                art_data = bytes(cover_art)  # explicit image wins over embedded art
+            else:
+                art_data = extract_artwork(filepath)
+                if not art_data and cover_art and os.path.isfile(cover_art):
+                    with open(cover_art, "rb") as f:
+                        art_data = f.read()
             if not art_data:
                 return
-
-            mgr = self._get_artwork_manager()
-            image_id = mgr.add_artwork_data(dbid, art_data, save=False)
-            if image_id is not None:
-                # Update MHIT header bytes so iPod knows artwork exists
-                header = bytearray(mhit.raw_header)
-                if len(header) > 0x7D:  # u16 at 0x7C needs bytes 0x7C-0x7D
-                    put16lint(header, 0x7C, 1)  # artwork_count
-                if len(header) > 0x83:  # u32 at 0x80 needs bytes 0x80-0x83
-                    put32lint(header, 0x80, len(art_data))  # artwork_size
-                if len(header) > 0xA4:  # u8 at 0xA4 needs byte 0xA4
-                    put8int(header, 0xA4, 1)  # has_artwork
-                if len(header) > 0x163:  # u32 at 0x160 needs bytes 0x160-0x163
-                    put32lint(header, 0x160, image_id)  # mhii_link
-                mhit.raw_header = bytes(header)
-                # Mirror into fields so Track properties reflect the new state
-                # without requiring a reload (needed for same-session remove_track)
-                mhit.fields["artwork_count"] = 1
-                mhit.fields["artwork_size"] = len(art_data)
-                mhit.fields["has_artwork"] = 1
-                mhit.fields["mhii_link"] = image_id
-
+            self._attach_artwork(mhit, dbid, art_data)
             logger.info("Artwork processed for track dbid=%d (%d bytes)", dbid, len(art_data))
         except Exception:
             logger.debug("Failed to process artwork", exc_info=True)
+
+    @staticmethod
+    def _set_artwork_fields(mhit: Record, count: int, size: int, image_id: int) -> None:
+        header = bytearray(mhit.raw_header)
+        if len(header) > 0x7D:  # u16 at 0x7C needs bytes 0x7C-0x7D
+            put16lint(header, 0x7C, count)  # artwork_count
+        if len(header) > 0x83:  # u32 at 0x80 needs bytes 0x80-0x83
+            put32lint(header, 0x80, size)  # artwork_size
+        if len(header) > 0xA4:  # u8 at 0xA4 needs byte 0xA4
+            put8int(header, 0xA4, 1 if count else 0)  # has_artwork
+        if len(header) > 0x163:  # u32 at 0x160 needs bytes 0x160-0x163
+            put32lint(header, 0x160, image_id)  # mhii_link
+        mhit.raw_header = bytes(header)
+        # Mirror into fields so Track properties reflect the new state
+        # without requiring a reload (needed for same-session remove_track)
+        mhit.fields["artwork_count"] = count
+        mhit.fields["artwork_size"] = size
+        mhit.fields["has_artwork"] = 1 if count else 0
+        mhit.fields["mhii_link"] = image_id
+
+    def _attach_artwork(self, mhit: Record, dbid: int, art_data: bytes) -> bool:
+        image_id = self._get_artwork_manager().add_artwork_data(dbid, art_data, save=False)
+        if image_id is None:
+            return False
+        self._set_artwork_fields(mhit, 1, len(art_data), image_id)
+        return True
+
+    def set_artwork(self, track: Track, image: Optional[bytes]) -> None:
+        """Replace a track's cover art with ``image`` (JPEG/PNG bytes); None removes it.
+
+        Written with the next save().
+
+        Raises:
+            ArtworkError: the image could not be converted (e.g. Pillow missing).
+        """
+        if not self._mountpoint or track.record is None:
+            raise TrackError("Cannot set artwork without a mount point")
+        mgr = self._get_artwork_manager()
+        if track.has_artwork and track.mhii_link:
+            mgr.remove_artwork(track.mhii_link)
+        self._set_artwork_fields(track.record, 0, 0, 0)
+        if image:
+            if not self._attach_artwork(track.record, track.dbid, image):
+                raise ArtworkError("could not create artwork thumbnails (is Pillow installed?)")
+        self._modified = True
 
     def remove_track(self, track: Track, delete_file: bool = False) -> None:
         """Remove a track from the database.
@@ -430,41 +775,230 @@ class Database:
         Args:
             track: Track to remove.
             delete_file: If True, also delete the file from the iPod.
+
+        Raises:
+            UnsafePathError: delete_file is set and the track's path points
+                outside the mount point (nothing is changed).
         """
-        track_id = track.track_id
+        self.remove_tracks([track], delete_files=delete_file)
 
-        # Remove from playlists
-        self._remove_from_all_playlists(track_id)
+    def remove_tracks(self, tracks: Iterable[Track], delete_files: bool = False) -> None:
+        """Remove several tracks in one pass over the track list and the playlists.
 
-        # Remove from track list
+        Same effect as remove_track() per track, but linear in the size of the database
+        instead of per track (removing thousands of tracks one by one is quadratic).
+
+        Raises:
+            UnsafePathError: delete_files is set and a track's path points outside the
+                mount point (nothing is changed).
+        """
+        tracks = list(tracks)
+        if not tracks:
+            return
+        # Validate every file path before changing anything (raises UnsafePathError)
+        fpaths: List[str] = []
+        if delete_files and self._mountpoint:
+            from ..utils.encoding import ipod_path_to_os
+
+            fpaths = [ipod_path_to_os(t.ipod_path, self._mountpoint) for t in tracks if t.ipod_path]
+
+        ids = {t.track_id for t in tracks}
+        self._remove_from_all_playlists(ids)
         mhlt = self._get_or_create_mhlt()
         mhlt.children = [
             c
             for c in mhlt.children
-            if not (c.magic == MHIT_MAGIC and c.fields.get("track_id") == track_id)
+            if not (c.magic == MHIT_MAGIC and c.fields.get("track_id") in ids)
         ]
-
-        # Remove from model
-        self._tracks = [t for t in self._tracks if t.track_id != track_id]
-        self._track_lookup.pop(track_id, None)
-
-        # Remove artwork from ArtworkDB
-        if self._mountpoint and track.has_artwork and track.mhii_link:
-            self._get_artwork_manager().remove_artwork(track.mhii_link)
-
-        # Delete file if requested
-        if delete_file and self._mountpoint and track.ipod_path:
-            from ..utils.encoding import ipod_path_to_os
-
-            fpath = ipod_path_to_os(track.ipod_path, self._mountpoint)
+        self._tracks = [t for t in self._tracks if t.track_id not in ids]
+        index = self._ids
+        for t in tracks:
+            self._track_lookup.pop(t.track_id, None)
+            if index is not None:
+                index[0].discard(t.track_id)
+                index[1].discard(t.dbid)
+            if self._mountpoint and t.has_artwork and t.mhii_link:
+                self._get_artwork_manager().remove_artwork(t.mhii_link)
+        for fpath in fpaths:
             try:
                 os.unlink(fpath)
             except OSError:
                 logger.warning("Failed to delete track file %s", fpath, exc_info=True)
-
         self._modified = True
 
     # ---- Playlist Operations ----
+
+    def get_playlist(self, name: str) -> Optional[Playlist]:
+        """First non-master playlist with this name, or None."""
+        for pl in self._playlists:
+            if not pl.is_master and pl.name == name:
+                return pl
+        return None
+
+    def set_playlist(self, name: str, tracks: List[Track]) -> Playlist:
+        """Create the playlist ``name`` or replace its members with ``tracks`` (in order)."""
+        pl = self.get_playlist(name)
+        if pl is None:
+            pl = self.create_playlist(name)
+        current = [self._track_lookup[tid] for tid in pl.track_ids if tid in self._track_lookup]
+        if [t.track_id for t in current] == [t.track_id for t in tracks]:
+            return pl
+        for t in current:
+            self.remove_track_from_playlist(pl, t)
+        for t in tracks:
+            self.add_track_to_playlist(pl, t)
+        self._modified = True
+        return pl
+
+    def delete_playlist_by_name(self, name: str) -> bool:
+        """Delete every non-master playlist called ``name``; True if one existed."""
+        found = [pl for pl in self._playlists if not pl.is_master and pl.name == name]
+        for pl in found:
+            self.delete_playlist(pl)
+        return bool(found)
+
+    # Average iTunesDB bytes per track, measured with typical metadata (MHIT,
+    # string MHODs, master playlist entries in MHSD 2 and 3, sort indexes,
+    # album list). Used when the database has no tracks to measure yet.
+    DEFAULT_BYTES_PER_TRACK = 1450
+
+    def estimate_db_size(self, extra_tracks: int = 0, extra_playlist_entries: int = 0) -> int:
+        """Estimated iTunesDB size in bytes after adding tracks.
+
+        Serialises the current database and extrapolates per track from it
+        (or DEFAULT_BYTES_PER_TRACK for an empty database); playlist entries
+        beyond the master playlist cost ~ 2 x 120 bytes each (MHIP + MHOD in
+        both playlist sections). Use it to reserve space for the commit.
+        """
+        base = len(self._prepare_for_save())
+        n = len(self._tracks)
+        if n >= 200:  # small databases overstate it (one album/artist entry per track)
+            entries = sum(len(pl.track_ids) for pl in self._playlists if not pl.is_master)
+            per_track = (base - len(_build_empty_itunesdb()) - entries * 240) / n
+            per_track = max(per_track, 600)
+        else:
+            per_track = self.DEFAULT_BYTES_PER_TRACK
+        return int(base + extra_tracks * per_track + extra_playlist_entries * 240)
+
+    def free_space(self) -> int:
+        """Free bytes on the iPod's filesystem."""
+        if not self._mountpoint:
+            raise DatabaseError("No mount point")
+        return shutil.disk_usage(self._mountpoint).free
+
+    # ---- Smart playlists ----
+
+    def _playlist_records(self, playlist_id: int) -> List[Record]:
+        """The playlist's MHYP records in MHSD type 2 and its type 3 mirror."""
+        out = []
+        for mhsd in self._root.children if self._root else []:
+            if mhsd.fields.get("mhsd_type") in (2, 3) and mhsd.children:
+                for mhyp in mhsd.children[0].children:
+                    if mhyp.magic == MHYP_MAGIC and mhyp.fields.get("playlist_id") == playlist_id:
+                        out.append(mhyp)
+        return out
+
+    def _set_spl_mhods(self, playlist: Playlist, match, rules, prefs) -> None:
+        from .smartplaylist import write_spl_prefs, write_spl_rules
+
+        body50 = write_spl_prefs(prefs, padded_size=96)  # libgpod writes 96-byte prefs
+        body51 = write_spl_rules(match, rules)
+        for rec in self._playlist_records(playlist.playlist_id):
+            rec.children = [
+                c
+                for c in rec.children
+                if not (c.magic == MHOD_MAGIC and c.fields.get("mhod_type") in (50, 51))
+            ]
+            m50 = self._make_raw_mhod(50, body50)
+            m50.fields["raw_body"] = body50
+            m51 = self._make_raw_mhod(51, body51)
+            m51.fields["raw_body"] = body51
+            rec.children[1:1] = [m50, m51]  # after the title, as libgpod writes them
+        self._modified = True
+
+    def create_smart_playlist(
+        self, name: str, rules: list, match=None, prefs=None, refresh: bool = True
+    ) -> Playlist:
+        """Create a smart playlist (rules in MHOD 51, preferences in MHOD 50).
+
+        Args:
+            name: Playlist name.
+            rules: List of smartplaylist.SPLRule.
+            match: SPLMatch.AND (default) or OR.
+            prefs: SPLPrefs (default: live update, rules checked, no limit).
+            refresh: Fill the members now (refresh_smart_playlist).
+        """
+        from .smartplaylist import SPLMatch, SPLPrefs
+
+        pl = self.create_playlist(name)
+        self._set_spl_mhods(
+            pl, SPLMatch.AND if match is None else match, rules, prefs or SPLPrefs()
+        )
+        if refresh:
+            self.refresh_smart_playlist(pl)
+        return pl
+
+    def update_smart_playlist(
+        self, playlist: Playlist, rules=None, match=None, prefs=None, refresh: bool = True
+    ) -> None:
+        """Change rules, match operator and/or preferences of a (smart) playlist."""
+        from .smartplaylist import SPLMatch, SPLPrefs
+
+        current = playlist.smart_rules or (SPLMatch.AND, [])
+        self._set_spl_mhods(
+            playlist,
+            current[0] if match is None else match,
+            current[1] if rules is None else rules,
+            prefs or playlist.smart_prefs or SPLPrefs(),
+        )
+        if refresh:
+            self.refresh_smart_playlist(playlist)
+
+    def refresh_smart_playlist(self, playlist: Playlist) -> List[Track]:
+        """Re-evaluate a smart playlist and replace its members (like libgpod's itdb_spl_update).
+
+        Rules are applied when ``checkrules`` is set, unchecked tracks are skipped
+        with ``matchcheckedonly``, then the limit (sort + count/size/time) when
+        ``checklimits`` is set. Returns the new members.
+        """
+        from .smartplaylist import apply_limit, evaluate_smart_playlist
+
+        spl = playlist.smart_rules
+        prefs = playlist.smart_prefs
+        if spl is None or prefs is None:
+            raise PlaylistError(f"{playlist.name!r} is not a smart playlist")
+        match, rules = spl
+        tracks = list(self._tracks)
+        if prefs.matchcheckedonly:
+            tracks = [t for t in tracks if t.checked]
+        if prefs.checkrules and rules:
+            members = {pl.playlist_id: set(pl.track_ids) for pl in self._playlists}
+            tracks = evaluate_smart_playlist(rules, match, tracks, members)
+        tracks = apply_limit(tracks, prefs)
+        current = [self._track_lookup[i] for i in playlist.track_ids if i in self._track_lookup]
+        if [t.track_id for t in current] != [t.track_id for t in tracks]:
+            for t in current:
+                self.remove_track_from_playlist(playlist, t)
+            for t in tracks:
+                self.add_track_to_playlist(playlist, t)
+        return tracks
+
+    def refresh_smart_playlists(self, live_only: bool = True) -> int:
+        """Refresh every smart playlist (only live-updating ones by default); returns how many.
+
+        save() and save_to_file() call this with live_only=True unless told not to.
+        """
+        n = 0
+        for pl in self._playlists:
+            prefs = pl.smart_prefs
+            if (
+                prefs is not None
+                and pl.smart_rules is not None
+                and (prefs.liveupdate or not live_only)
+            ):
+                self.refresh_smart_playlist(pl)
+                n += 1
+        return n
 
     def create_playlist(self, name: str, podcast: bool = False) -> Playlist:
         """Create a new playlist.
@@ -488,6 +1022,7 @@ class Database:
         mhlp3.children.append(mhyp3)
 
         pl = Playlist.from_record(mhyp, self._track_lookup)
+        pl._on_change = self._mark_modified
         self._playlists.append(pl)
         self._modified = True
         return pl
@@ -512,7 +1047,7 @@ class Database:
         """Add a track to a playlist."""
         if not playlist.record:
             return
-        pos = sum(1 for c in playlist.record.children if c.magic == MHIP_MAGIC)
+        pos = self._mhip_count(playlist.record)
         mhip = self._create_mhip(track.track_id, position=pos)
         playlist.record.children.append(mhip)
         # Update MHIP count
@@ -963,23 +1498,34 @@ class Database:
 
     # ---- Album / Artist List Generation ----
 
+    @staticmethod
+    def _album_key(track: Track) -> tuple:
+        """Album identity: (album, album artist) when the album artist is set; a compilation is one
+        album regardless of track artists; otherwise (album, track artist)."""
+        album = track.album or ""
+        if track.albumartist:
+            return (album, track.albumartist, False)
+        if track.compilation:
+            return (album, "", True)
+        return (album, track.artist or "", False)
+
     def _rebuild_album_list(self) -> None:
         """Rebuild MHSD type 4 album list from track metadata.
 
         Creates MHIA records with MHOD types 200 (album name) and
-        201 (album artist) for each unique (album, artist) pair.
+        201 (album artist) for each album (see _album_key).
         Also updates MHIT offset 0x120 with album_id links.
         """
         enc = self._config.string_encoding
 
-        # Collect unique albums: (album, artist) -> album_id
-        albums = {}  # (album, artist) -> int
+        albums: Dict[tuple, int] = {}  # album key -> 1-based album_id
+        track_album: Dict[int, int] = {}  # id(mhit record) -> album_id
         for track in self._tracks:
-            album = track.album or ""
-            artist = track.artist or ""
-            key = (album, artist)
+            key = self._album_key(track)
             if key not in albums:
-                albums[key] = len(albums) + 1  # 1-based IDs
+                albums[key] = len(albums) + 1
+            if track.record is not None:
+                track_album[id(track.record)] = albums[key]
 
         mhsd4 = self._get_or_create_mhsd(4)
 
@@ -991,7 +1537,7 @@ class Database:
         # libgpod uses 88-byte MHIA headers for album list records
         ALBUM_MHIA_HEADER_LEN = 88
 
-        for (album, artist), album_id in albums.items():
+        for (album, artist, _compilation), album_id in albums.items():
             mhia = Record(MHIA_MAGIC, ALBUM_MHIA_HEADER_LEN, 0)
             header = bytearray(ALBUM_MHIA_HEADER_LEN)
             header[0:4] = MHIA_MAGIC
@@ -1004,7 +1550,7 @@ class Database:
             if album:
                 mhod200 = make_string_mhod(MHOD_ID_ALBUM_ALBUM, album, encoding=enc)
                 mhia.children.append(mhod200)
-            # MHOD type 201: album artist
+            # MHOD type 201: album artist (none for a compilation without album artist)
             if artist:
                 mhod201 = make_string_mhod(MHOD_ID_ALBUM_ARTIST, artist, encoding=enc)
                 mhia.children.append(mhod201)
@@ -1018,9 +1564,7 @@ class Database:
         for mhit in mhlt.children:
             if mhit.magic != MHIT_MAGIC:
                 continue
-            album_name = mhit.get_mhod(MHOD_ID_ALBUM) or ""
-            artist_name = mhit.get_mhod(MHOD_ID_ARTIST) or ""
-            album_id = albums.get((album_name, artist_name), 0)
+            album_id = track_album.get(id(mhit), 0)
             if album_id and len(mhit.raw_header) > 0x124:
                 header = bytearray(mhit.raw_header)
                 put32lint(header, 0x120, album_id)
@@ -1086,8 +1630,6 @@ class Database:
         if not self._root:
             raise DatabaseError("No database loaded")
 
-        self._save_artwork_db()
-
         self._upgrade_header_sizes()
         self._ensure_playlist_prefs()
         self._ensure_type3_mirror()
@@ -1111,11 +1653,51 @@ class Database:
 
         return write_itunesdb(self._root)
 
-    def save(self) -> None:
-        """Save the database back to the iPod."""
+    def save(self, refresh_smart_playlists: bool = True, force: bool = False) -> None:
+        """Save the database back to the iPod.
+
+        Live-updating smart playlists are refreshed first (like libgpod's itdb_write,
+        which calls itdb_spl_update_live); pass ``refresh_smart_playlists=False`` to keep
+        their stored members. Non-live smart playlists and normal playlists are never touched.
+
+        Concurrency: the save holds ``iPod_Control/iTunes/pygpod.lock`` (see db/writelock.py) and
+        raises ConflictError when the iTunesDB on the iPod is no longer the one this object loaded
+        or last saved (another writer saved meanwhile) - reopen and redo the changes, or pass
+        ``force=True`` to overwrite.
+
+        Crash-safe: checksum inputs are validated before anything is written,
+        then iTunesDB, ArtworkDB and compacted .ithmb files are committed
+        together (see db/transaction.py). On any failure nothing is replaced
+        and the exception propagates.
+        """
         logger.info("Saving database")
         if not self._mountpoint:
             raise DatabaseError("No mount point - use save_to_file() instead")
+        with writer_lock(self._itunes_dir()):
+            if not force:
+                self._check_not_modified()
+            self._save_locked(refresh_smart_playlists)
+
+    def _check_not_modified(self) -> None:
+        """ConflictError when the iTunesDB on disk differs from the one loaded / last saved."""
+        path = (
+            str(self._device.itunesdb_path())
+            if self._device
+            else os.path.join(self._itunes_dir(), "iTunesDB")
+        )
+        on_disk = file_sha256(path)
+        if self._raw_data is None:
+            if on_disk is not None:
+                raise ConflictError(
+                    f"{path} was created by another writer since the database was opened"
+                )
+            return
+        if on_disk is not None and on_disk != sha256_hex(self._raw_data):
+            raise ConflictError(f"{path} was changed by another writer since it was loaded")
+
+    def _save_locked(self, refresh_smart_playlists: bool) -> None:
+        if refresh_smart_playlists:
+            self.refresh_smart_playlists(live_only=True)
 
         data = self._prepare_for_save()
 
@@ -1142,7 +1724,8 @@ class Database:
                     "  pip install pygpod[usb]"
                 )
             hash_type = self._device.checksum_type.name
-            data = update_checksums(data, guid, hash_type)
+            params = self._hash72_params(guid) if hash_type == "HASH72" else None
+            data = update_checksums(data, guid, hash_type, hash72_params=params)
 
         db_path = (
             self._device.itunesdb_path()
@@ -1150,21 +1733,93 @@ class Database:
             else pathlib.Path(self._mountpoint) / "iPod_Control" / "iTunes" / "iTunesDB"
         )
 
-        with open(db_path, "wb") as f:
-            f.write(data)
+        itunessd = self._shuffle_db()  # raises for shuffles whose format is not supported
+        consume = self._pc_consume and self._pc_source is not None
+        tx = Transaction(self._mountpoint)
+        try:
+            if getattr(self, "_artwork_manager", None) is not None:
+                self._artwork_manager.stage(tx)
+            tx.stage_with(str(db_path), lambda path: self._write_db_file(path, data))
+            if itunessd is not None:
+                assert self._device is not None
+                tx.stage_bytes(str(self._device.itunessd_path()), itunessd)
+            if consume:
+                assert self._pc_source is not None
+                write_commit_marker(self._itunes_dir(), self._pc_source, sha256_hex(data))
+            for f in self._otg_consume:
+                path = os.path.join(self._itunes_dir(), f.name)
+                if file_sha256(path) == f.sha256:  # rewritten by the iPod since: keep it
+                    tx.delete_on_commit(path)
+            tx.commit()
+        except BaseException:
+            tx.abort()
+            raise
 
         self._raw_data = data
         self._modified = False
+        self._otg_consume = []
         logger.debug("Database saved to %s", db_path)
+        if consume:
+            self._finish_play_count_cleanup()
+
+    @staticmethod
+    def _write_db_file(path: str, data: bytes) -> None:
+        with open(path, "wb") as f:
+            f.write(data)
+
+    def _shuffle_db(self) -> Optional[bytes]:
+        """The iTunesSD for an iPod shuffle 1G/2G (written with the iTunesDB, like libgpod);
+        None for other iPods.
+
+        Raises:
+            DeviceError: shuffle 3G/4G (iTunesSD format not supported) - nothing is written.
+        """
+        from ..db.itunessd import ITunesSD
+        from ..device.models import IpodGeneration
+
+        if not self._device or not self._device.is_shuffle:
+            return None
+        gen = self._device.generation
+        if gen not in (IpodGeneration.SHUFFLE_1, IpodGeneration.SHUFFLE_2):
+            raise DeviceError(
+                f"{gen.name}: the iPod shuffle 3G/4G iTunesSD format is not supported; "
+                "the shuffle would not see the changes"
+            )
+        return ITunesSD.from_tracks(self._tracks).write()
+
+    def _hash72_params(self, guid: str) -> tuple:
+        """The device's hash72 IV and random part: from iPod_Control/Device/HashInfo, else
+        extracted once from the database as read (signed by iTunes/libgpod) and stored in
+        HashInfo, like libgpod does.
+
+        Raises:
+            HashError: neither is available (a random IV would make the iPod reject the database).
+        """
+        from ..hash.hash72 import extract_hash72_params, read_hash_info, write_hash_info
+
+        assert self._device is not None
+        path = str(self._device.device_dir / "HashInfo")
+        params = read_hash_info(path, guid)
+        if params is not None:
+            return params
+        params = extract_hash72_params(self._raw_data or b"")
+        if params is None:
+            raise HashError(
+                "This iPod needs hash72, but there is no iPod_Control/Device/HashInfo and "
+                "the database on it was not signed by iTunes. Sync it with iTunes once "
+                "(or copy a HashInfo file)."
+            )
+        try:
+            write_hash_info(path, guid, *params)
+        except OSError:
+            logger.warning("could not write %s", path, exc_info=True)
+        return params
 
     def _save_artwork_db(self) -> None:
         """Write ArtworkDB to disk once (artwork was already processed per-track)."""
-        if hasattr(self, "_artwork_manager") and self._artwork_manager is not None:
-            try:
-                self._artwork_manager.save()
-                logger.info("ArtworkDB saved")
-            except Exception:
-                logger.warning("ArtworkDB save failed", exc_info=True)
+        if getattr(self, "_artwork_manager", None) is not None:
+            self._artwork_manager.save()
+            logger.info("ArtworkDB saved")
 
     def _try_resolve_guid(self) -> Optional[str]:
         """Try to get FirewireGuid from USB and write SysInfo for future use."""
@@ -1190,9 +1845,15 @@ class Database:
             logger.debug("USB GUID resolution failed", exc_info=True)
         return None
 
-    def save_to_file(self, path: str) -> None:
-        """Save the database to a specific file path."""
+    def save_to_file(self, path: str, refresh_smart_playlists: bool = True) -> None:
+        """Save the database to a specific file path (and the ArtworkDB, if loaded).
+
+        Refreshes live-updating smart playlists first, like save().
+        """
+        if refresh_smart_playlists:
+            self.refresh_smart_playlists(live_only=True)
         data = self._prepare_for_save()
+        self._save_artwork_db()
         with open(path, "wb") as f:
             f.write(data)
 
@@ -1202,28 +1863,56 @@ class Database:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Save on a normal exit if anything changed; never save after an exception."""
         if self._modified and exc_type is None:
             self.save()
 
+    @property
+    def modified(self) -> bool:
+        """True if there are unsaved changes (tracks, playlists, play counts)."""
+        return self._modified
+
+    def _mark_modified(self) -> None:
+        self._modified = True
+
     # ---- Internal Helpers ----
 
+    def _id_index(self) -> List[Any]:
+        """[set of track ids, set of dbids, highest track id] - built once, kept up to date by
+        add_track/remove_tracks, dropped when the model is rebuilt."""
+        if self._ids is None:
+            tids = {t.track_id for t in self._tracks}
+            self._ids = [
+                tids,
+                {t.dbid for t in self._tracks},
+                max(tids, default=self._config.track_id_start - 1),
+            ]
+        return self._ids
+
     def _next_track_id(self) -> int:
-        """Generate the next unique track ID."""
-        existing = {t.track_id for t in self._tracks}
-        tid = max(existing, default=self._config.track_id_start - 1) + 1
-        if tid < self._config.track_id_start:
-            tid = self._config.track_id_start
-        while tid in existing:
+        """Generate the next unique track ID (above every ID used in this session)."""
+        tids, _, highest = self._id_index()
+        tid = max(highest + 1, self._config.track_id_start)
+        while tid in tids:
             tid += 1
         return tid
 
     def _next_dbid(self) -> int:
         """Generate a unique 64-bit DBID."""
-        existing = {t.dbid for t in self._tracks}
+        dbids = self._id_index()[1]
         while True:
             dbid = self._rng.getrandbits(64)
-            if dbid not in existing and dbid != 0:
+            if dbid not in dbids and dbid != 0:
                 return dbid
+
+    @staticmethod
+    def _mhip_count(rec: Record) -> int:
+        """Number of MHIP children of a playlist record: MHODs come first, then MHIPs."""
+        children = rec.children
+        k = 0
+        while k < len(children) and children[k].magic != MHIP_MAGIC:
+            k += 1
+        return len(children) - k
 
     def _get_or_create_mhlt(self) -> Record:
         """Get the track list record, creating if needed."""
@@ -1403,6 +2092,13 @@ class Database:
         rec.fields["track_number"] = tags.get("track_number", 0)
         rec.fields["total_tracks"] = tags.get("total_tracks", 0)
         rec.fields["year"] = tags.get("year", 0)
+        rec.fields["compilation"] = 1 if tags.get("compilation") else 0
+        # mirror the header flags set above, so Track properties are right before a reload
+        if header_len > 0xA8 and is_podcast_or_audiobook:
+            rec.fields["skip_when_shuffling"] = 1
+            rec.fields["remember_position"] = 1
+        if header_len > 0xB2:
+            rec.fields["mark_unplayed"] = 0x02 if is_podcast_or_audiobook else cfg.mark_unplayed
         rec.fields["bitrate"] = tags.get("bitrate", 0)
         rec.fields["samplerate"] = (sr << 16) & 0xFFFFFFFF
         rec.fields["time_added"] = now
@@ -1650,7 +2346,7 @@ class Database:
                 mhlp = mhsd.children[0]
                 for mhyp in mhlp.children:
                     if mhyp.fields.get("playlist_type") == 1:
-                        pos = sum(1 for c in mhyp.children if c.magic == MHIP_MAGIC)
+                        pos = self._mhip_count(mhyp)
                         mhip = self._create_mhip(track_id, position=pos)
                         mhyp.children.append(mhip)
                         break
@@ -1662,7 +2358,7 @@ class Database:
                 mhlp = mhsd.children[0]
                 for mhyp in mhlp.children:
                     if mhyp.fields.get("playlist_id") == playlist_id:
-                        pos = sum(1 for c in mhyp.children if c.magic == MHIP_MAGIC)
+                        pos = self._mhip_count(mhyp)
                         mhip = self._create_mhip(track_id, position=pos)
                         mhyp.children.append(mhip)
                         return
@@ -1681,8 +2377,8 @@ class Database:
                         ]
                         return
 
-    def _remove_from_all_playlists(self, track_id: int) -> None:
-        """Remove a track from all playlists."""
+    def _remove_from_all_playlists(self, track_ids: Set[int]) -> None:
+        """Remove tracks from all playlists (one pass per playlist)."""
         for mhsd in self._root.children:
             mhsd_type = mhsd.fields.get("mhsd_type")
             if mhsd_type in (2, 3) and mhsd.children:
@@ -1691,7 +2387,7 @@ class Database:
                     mhyp.children = [
                         c
                         for c in mhyp.children
-                        if not (c.magic == MHIP_MAGIC and c.fields.get("track_id") == track_id)
+                        if not (c.magic == MHIP_MAGIC and c.fields.get("track_id") in track_ids)
                     ]
 
     def _make_basic_header(self, magic: bytes, header_len: int) -> bytes:

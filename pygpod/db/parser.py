@@ -83,6 +83,26 @@ class Record:
         return f"<Record {m} header={self.header_len} total={self.total_len}{extra}>"
 
 
+def _advance(data: bytes, pos: int, child: "Record", end: int) -> int:
+    """Position after ``child``; raises ParseError unless the record is sane.
+
+    Every loop over child records advances through here, so a zero, undersized
+    or oversized length can never stall a loop or read past the parent record.
+    """
+    limit = min(end, len(data))
+    if child.header_len < 12 or child.total_len < child.header_len:
+        raise ParseError(
+            f"Invalid {child.magic!r} record at offset {pos}: "
+            f"header_len={child.header_len}, total_len={child.total_len}"
+        )
+    if pos + child.total_len > limit:
+        raise ParseError(
+            f"{child.magic!r} record at offset {pos} (length {child.total_len}) "
+            f"extends beyond its parent/file end at {limit}"
+        )
+    return pos + child.total_len
+
+
 def _parse_mhod_children(data: bytes, rec: Record, pos: int, end: int, count: int) -> int:
     """Parse MHOD children into rec, returning new position."""
     for _ in range(count):
@@ -92,7 +112,7 @@ def _parse_mhod_children(data: bytes, rec: Record, pos: int, end: int, count: in
             break
         mhod = _parse_mhod(data, pos)
         rec.children.append(mhod)
-        pos += mhod.total_len
+        pos = _advance(data, pos, mhod, end)
     return pos
 
 
@@ -114,7 +134,16 @@ def parse_itunesdb(data: bytes) -> Record:
     if data[0:4] != MHBD_MAGIC:
         raise ParseError(f"Invalid magic: expected 'mhbd', got {data[0:4]!r}")
 
-    return _parse_mhbd(data, 0)
+    header_len = get32lint(data, 4)
+    total_len = get32lint(data, 8)
+    if header_len < 0x26 or total_len < header_len:
+        raise ParseError(f"Invalid mhbd header: header_len={header_len}, total_len={total_len}")
+    if total_len > len(data):
+        raise ParseError(f"Truncated iTunesDB: header says {total_len} bytes, file has {len(data)}")
+    try:
+        return _parse_mhbd(data, 0)
+    except (struct.error, IndexError) as e:
+        raise ParseError(f"Malformed iTunesDB: {e}") from e
 
 
 def _parse_mhbd(data: bytes, offset: int) -> Record:
@@ -170,7 +199,7 @@ def _parse_mhbd(data: bytes, offset: int) -> Record:
             break
         child = _parse_mhsd(data, pos)
         rec.children.append(child)
-        pos += child.total_len
+        pos = _advance(data, pos, child, end)
 
     logger.debug("Parsed %d MHSD sections", len(rec.children))
     return rec
@@ -234,7 +263,7 @@ def _parse_mhlt(data: bytes, offset: int, end: int) -> Record:
             break
         track = _parse_mhit(data, pos)
         rec.children.append(track)
-        pos += track.total_len
+        pos = _advance(data, pos, track, end)
 
     # Store total bytes consumed
     rec.raw_bytes = bytes(data[offset:pos])
@@ -460,7 +489,7 @@ def _parse_mhlp(data: bytes, offset: int, end: int) -> Record:
             break
         playlist = _parse_mhyp(data, pos)
         rec.children.append(playlist)
-        pos += playlist.total_len
+        pos = _advance(data, pos, playlist, end)
 
     rec.raw_bytes = bytes(data[offset:pos])
     logger.debug("Parsed %d playlists", num_playlists)
@@ -507,7 +536,7 @@ def _parse_mhyp(data: bytes, offset: int) -> Record:
             break
         mhip = _parse_mhip(data, pos)
         rec.children.append(mhip)
-        pos += mhip.total_len
+        pos = _advance(data, pos, mhip, end)
 
     return rec
 
@@ -554,7 +583,7 @@ def _parse_mhla(data: bytes, offset: int, end: int) -> Record:
         if magic == MHIA_MAGIC:
             album = _parse_mhia(data, pos)
             rec.children.append(album)
-            pos += album.total_len
+            pos = _advance(data, pos, album, end)
         else:
             # Unknown album record type - try to read its size and skip
             if pos + 12 <= len(data):
@@ -564,7 +593,7 @@ def _parse_mhla(data: bytes, offset: int, end: int) -> Record:
                     child.raw_bytes = bytes(data[pos : pos + child_total])
                     child.raw_header = bytes(data[pos : pos + child.header_len])
                     rec.children.append(child)
-                    pos += child_total
+                    pos = _advance(data, pos, child, end)
                 else:
                     break
             else:
@@ -611,7 +640,7 @@ def _parse_mhli(data: bytes, offset: int, end: int) -> Record:
         if magic == MHII_MAGIC:
             artist = _parse_mhii(data, pos)
             rec.children.append(artist)
-            pos += artist.total_len
+            pos = _advance(data, pos, artist, end)
         else:
             # Unknown record type - try to read its size and skip
             if pos + 12 <= len(data):
@@ -621,7 +650,7 @@ def _parse_mhli(data: bytes, offset: int, end: int) -> Record:
                     child.raw_bytes = bytes(data[pos : pos + child_total])
                     child.raw_header = bytes(data[pos : pos + child.header_len])
                     rec.children.append(child)
-                    pos += child_total
+                    pos = _advance(data, pos, child, end)
                 else:
                     break
             else:

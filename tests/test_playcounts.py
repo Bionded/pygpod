@@ -210,10 +210,11 @@ class TestParseOTGPlaylists:
         assert parse_otg_playlists(data) == []
 
     def test_reversed_magic(self):
+        # libgpod process_OTG_file: reversed magic -> fcontents_set_reversed, all fields big-endian
         data = b"ophm"
-        data += struct.pack("<III", 0x14, 4, 2)
+        data += struct.pack(">III", 0x14, 4, 2)
         data += b"\x00" * 4  # pad header to 0x14
-        data += struct.pack("<II", 5, 10)
+        data += struct.pack(">II", 5, 10)
         playlists = parse_otg_playlists(data)
         assert len(playlists) == 1
         assert playlists[0] == [5, 10]
@@ -352,15 +353,15 @@ class TestReadFromMountpoint:
         assert len(entries) == 1
         assert entries[0].play_count == 7
 
-    def test_read_plist_priority(self, tmp_path):
-        """Plist takes priority over iTunesStats and binary."""
+    def test_read_priority_like_libgpod(self, tmp_path):
+        """libgpod's order: Play Counts, then iTunesStats, then PlayCounts.plist."""
         itunes = tmp_path / "iPod_Control" / "iTunes"
         itunes.mkdir(parents=True)
         (itunes / "PlayCounts.plist").write_bytes(plistlib.dumps({"items": [{"playcount": 99}]}))
         (itunes / "iTunesStats").write_text("1\n1\n0\n0\n0\n0\n\n")
 
         entries = read_play_counts(str(tmp_path))
-        assert entries[0].play_count == 99  # plist wins
+        assert entries[0].play_count == 1  # iTunesStats before the plist
 
     def test_read_none_found(self, tmp_path):
         itunes = tmp_path / "iPod_Control" / "iTunes"

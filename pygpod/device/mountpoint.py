@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import pathlib
-from typing import Optional
+from typing import Dict, List, NamedTuple, Optional
 
 from ..exceptions import MountPointError
 from ..utils.compat import put16lint, put32lint, put64lint
@@ -60,16 +60,77 @@ def find_itunesdb(mountpoint: str) -> Optional[pathlib.Path]:
     return itunesdb
 
 
-def init_ipod(mountpoint: str, model: str = "classic_6g", music_dirs: int = 50) -> None:
-    """Initialize a fresh iPod directory structure with an empty iTunesDB.
+SYSINFO_FILES = ("SysInfo", "SysInfoExtended")
+
+
+class InitAction(NamedTuple):
+    """One step of init_ipod(): ``op`` is "mkdir", "write", "delete" or "keep"."""
+
+    op: str
+    path: str
+
+
+def read_sysinfo_files(mountpoint: str) -> Dict[str, bytes]:
+    """Contents of iPod_Control/Device/SysInfo and SysInfoExtended (those that exist).
+
+    Read them before the data partition is reformatted and pass them to
+    ``init_ipod(..., sysinfo_files=...)`` so the device identity (FirewireGuid,
+    model, serial) survives.
+    """
+    out: Dict[str, bytes] = {}
+    ipod_control = _find_ipod_control(pathlib.Path(mountpoint))
+    if ipod_control is None:
+        return out
+    device_dir = _find_ci(ipod_control, "Device")
+    if device_dir is None:
+        return out
+    for name in SYSINFO_FILES:
+        path = _find_ci(device_dir, name)
+        if path is not None and path.is_file():
+            out[name] = path.read_bytes()
+    return out
+
+
+def init_ipod(
+    mountpoint: str,
+    model: str = "classic_6g",
+    music_dirs: int = 50,
+    *,
+    name: str = "iPod",
+    reset: bool = False,
+    keep_sysinfo: bool = True,
+    sysinfo_files: Optional[Dict[str, bytes]] = None,
+    artworkdb: bool = True,
+    dry_run: bool = False,
+) -> List[InitAction]:
+    """Initialize an iPod directory structure with an empty iTunesDB.
 
     Creates all necessary directories and writes a minimal iTunesDB
-    containing only a master playlist, ready for adding tracks.
+    containing only a master playlist named ``name`` (the device name shown
+    by the iPod and iTunes), plus an empty ArtworkDB.
+
+    Never formats or partitions anything: to start from a fresh filesystem the
+    caller formats the data partition first and passes the SysInfo files read
+    before formatting (see read_sysinfo_files()).
 
     Args:
         mountpoint: Path to the iPod mount root.
-        model: iPod model identifier (used for directory count).
+        model: iPod model identifier (kept for compatibility, unused).
         music_dirs: Number of Fxx music directories to create.
+        name: Device name (master playlist name) for a newly written iTunesDB.
+        reset: Start from zero: delete iPod_Control/iTunes, Artwork and Music
+            contents (tracks, databases, play counts) and write a new empty
+            database. iPod_Control/Device is kept (SysInfo files subject to
+            ``keep_sysinfo``). Without ``reset`` an existing iTunesDB is kept.
+        keep_sysinfo: Keep existing SysInfo/SysInfoExtended (with ``reset``);
+            False deletes them.
+        sysinfo_files: SysInfo file contents to (re)write, e.g. read before a
+            format. Written as given, overriding existing files.
+        artworkdb: Also write an empty ArtworkDB when none exists (or on reset).
+        dry_run: Only report what would be done; nothing is touched.
+
+    Returns:
+        The actions performed (or planned, with ``dry_run``), in order.
 
     Raises:
         MountPointError: If the mountpoint doesn't exist.
@@ -78,33 +139,87 @@ def init_ipod(mountpoint: str, model: str = "classic_6g", music_dirs: int = 50) 
     if not mp.exists():
         raise MountPointError(f"Mount point does not exist: {mountpoint}")
 
-    # Create directory structure
-    itunes_dir = mp / "iPod_Control" / "iTunes"
+    ipod_control = _find_ipod_control(mp) or mp / "iPod_Control"
+    itunes_dir = _find_ci(ipod_control, "iTunes") or ipod_control / "iTunes"
+    device_dir = _find_ci(ipod_control, "Device") or ipod_control / "Device"
+    artwork_dir = _find_ci(ipod_control, "Artwork") or ipod_control / "Artwork"
+    music_dir = _find_ci(ipod_control, "Music") or ipod_control / "Music"
+    actions: List[InitAction] = []
+
+    # Reset: everything below iTunes/Artwork/Music goes; Device stays except unwanted SysInfo
+    if reset:
+        for top in (itunes_dir, artwork_dir, music_dir):
+            if top.is_dir() and not top.is_symlink():
+                for path in sorted(top.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+                    actions.append(InitAction("delete", str(path)))
+        if device_dir.is_dir():
+            for child in sorted(device_dir.iterdir()):
+                is_sysinfo = child.name in SYSINFO_FILES
+                keep = is_sysinfo and keep_sysinfo
+                if is_sysinfo and not keep:
+                    actions.append(InitAction("delete", str(child)))
+                else:
+                    actions.append(InitAction("keep", str(child)))
+
     dirs = [
         itunes_dir,
-        mp / "iPod_Control" / "Device",
-        mp / "iPod_Control" / "Artwork",
+        device_dir,
+        artwork_dir,
         mp / "Calendars",
         mp / "Contacts",
         mp / "Notes",
     ]
-
-    # Create Fxx music directories
     for i in range(music_dirs):
-        dirs.append(mp / "iPod_Control" / "Music" / f"F{i:02d}")
-
+        dirs.append(music_dir / f"F{i:02d}")
+    deleted = {a.path for a in actions if a.op == "delete"}
     for d in dirs:
-        d.mkdir(parents=True, exist_ok=True)
+        if not d.is_dir() or str(d) in deleted:
+            actions.append(InitAction("mkdir", str(d)))
 
-    # Create empty iTunesDB
-    db_path = itunes_dir / "iTunesDB"
-    if not db_path.exists():
-        data = _build_empty_itunesdb()
-        db_path.write_bytes(data)
-        logger.info("Created empty iTunesDB at %s", db_path)
+    for fname, data in (sysinfo_files or {}).items():
+        if fname not in SYSINFO_FILES:
+            raise ValueError(f"not a SysInfo file name: {fname!r}")
+        actions.append(InitAction("write", str(device_dir / fname)))
+
+    db_path = _find_ci(itunes_dir, "iTunesDB") or itunes_dir / "iTunesDB"
+    if reset or not db_path.exists():
+        actions.append(InitAction("write", str(itunes_dir / "iTunesDB")))
+    art_path = _find_ci(artwork_dir, "ArtworkDB") or artwork_dir / "ArtworkDB"
+    if artworkdb and (reset or not art_path.exists()):
+        actions.append(InitAction("write", str(artwork_dir / "ArtworkDB")))
+
+    if dry_run:
+        return actions
+
+    for action in actions:
+        path = pathlib.Path(action.path)
+        if action.op == "delete":
+            if path.is_dir() and not path.is_symlink():
+                path.rmdir()
+            else:
+                path.unlink()
+        elif action.op == "mkdir":
+            path.mkdir(parents=True, exist_ok=True)
+        elif action.op == "write":
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.name == "iTunesDB":
+                path.write_bytes(_build_empty_itunesdb(name))
+                logger.info("Created empty iTunesDB at %s (name %r)", path, name)
+            elif path.name == "ArtworkDB":
+                path.write_bytes(_build_empty_artworkdb(str(mp)))
+            else:
+                path.write_bytes((sysinfo_files or {})[path.name])
+    return actions
 
 
-def _build_empty_itunesdb() -> bytes:
+def _build_empty_artworkdb(mountpoint: str) -> bytes:
+    from ..db.artwork_writer import write_artworkdb
+    from ..model.artwork_manager import ArtworkManager
+
+    return write_artworkdb(ArtworkManager(mountpoint)._create_empty_artworkdb())
+
+
+def _build_empty_itunesdb(name: str = "iPod") -> bytes:
     """Build a minimal valid iTunesDB with an empty master playlist.
 
     Uses header sizes matching libgpod / iPod firmware expectations:
@@ -166,7 +281,7 @@ def _build_empty_itunesdb() -> bytes:
         put32lint(mhyp, 0x2C, 1)
         return bytes(mhyp) + mhod_data
 
-    name_mhod_data = _make_name_mhod("iPod")
+    name_mhod_data = _make_name_mhod(name)
 
     # --- Master playlist for type 2 and type 3 ---
     # Both share the same playlist_id (libgpod behavior)

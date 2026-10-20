@@ -232,12 +232,6 @@ def create_thumbnail(
     Returns:
         Raw pixel data in the target format, or None if Pillow not available.
     """
-    try:
-        from PIL import Image  # type: ignore
-    except ImportError:
-        logger.debug("Pillow not installed, cannot create artwork thumbnail")
-        return None
-
     fmt = ARTWORK_FORMATS.get(format_id)
     if fmt is None:
         return None
@@ -245,7 +239,16 @@ def create_thumbnail(
     w = target_width or fmt[0]
     h = target_height or fmt[1]
     logger.debug("Processing artwork format %d: %dx%d", format_id, w, h)
-    pixel_fmt = fmt[2]
+    return render_thumbnail(image_path, w, h, fmt[2])
+
+
+def render_thumbnail(image_path: str, w: int, h: int, pixel_fmt: PixelFormat) -> Optional[bytes]:
+    """Scale/crop an image to ``w`` x ``h``, encode it as ``pixel_fmt`` (None without Pillow)."""
+    try:
+        from PIL import Image  # type: ignore
+    except ImportError:
+        logger.debug("Pillow not installed, cannot create a thumbnail")
+        return None
 
     img = Image.open(image_path).convert("RGB")
 
