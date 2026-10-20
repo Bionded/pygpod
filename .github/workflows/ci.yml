@@ -43,6 +43,15 @@ jobs:
             ubuntu: ubuntu-latest
           - python-version: "3.13"
             ubuntu: ubuntu-latest
+          - python-version: "3.14"
+            ubuntu: ubuntu-latest
+          - python-version: "3.15"
+            ubuntu: ubuntu-latest
+          # not released yet: test against the newest pre-release, do not fail CI
+          - python-version: "3.16"
+            ubuntu: ubuntu-latest
+            experimental: true
+    continue-on-error: ${{ matrix.experimental == true }}
 
     steps:
       - uses: actions/checkout@v4
@@ -50,6 +59,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
 
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
@@ -78,7 +88,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.12", "3.13"]
+        python-version: ["3.8", "3.15"]
 
     steps:
       - uses: actions/checkout@v4
@@ -86,6 +96,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
 
       - name: Install ffmpeg
         run: brew install ffmpeg
@@ -102,7 +113,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.10", "3.15"]
 
     steps:
       - uses: actions/checkout@v4
@@ -110,6 +121,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
 
       - name: Install ffmpeg
         run: choco install ffmpeg -y
