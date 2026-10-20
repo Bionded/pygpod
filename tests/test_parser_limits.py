@@ -1,5 +1,6 @@
 """Malformed record lengths must raise ParseError quickly, never hang (task: parser limits)."""
 
+import faulthandler
 import os
 import signal
 import struct
@@ -15,6 +16,11 @@ from pygpod.exceptions import ParseError
 @pytest.fixture(autouse=True)
 def deadline():
     """Fail a test that runs longer than 5 s (no pytest-timeout dependency)."""
+    if not hasattr(signal, "SIGALRM"):  # Windows: no alarm, abort the run with tracebacks
+        faulthandler.dump_traceback_later(5, exit=True)
+        yield
+        faulthandler.cancel_dump_traceback_later()
+        return
 
     def expired(signum, frame):
         raise TimeoutError("parser did not terminate")

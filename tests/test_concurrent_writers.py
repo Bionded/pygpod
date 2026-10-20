@@ -2,6 +2,7 @@
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -50,7 +51,7 @@ def test_live_lock_refuses_and_stale_lock_is_recovered(writable_ipod, monkeypatc
     holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
         with open(_lock(writable_ipod), "w") as f:
-            json.dump({"pid": holder.pid, "host": os.uname().nodename, "time": time.time()}, f)
+            json.dump({"pid": holder.pid, "host": socket.gethostname(), "time": time.time()}, f)
         with pytest.raises(ConflictError, match="another process"):
             db.save()
     finally:
@@ -88,7 +89,7 @@ def test_lock_released_when_save_fails(writable_ipod, monkeypatch):
 def _dead_lock(path):
     dead = subprocess.Popen([sys.executable, "-c", "pass"])
     dead.wait()
-    data = json.dumps({"pid": dead.pid, "host": os.uname().nodename, "time": time.time()})
+    data = json.dumps({"pid": dead.pid, "host": socket.gethostname(), "time": time.time()})
     with open(path, "w") as f:
         f.write(data)
     return data.encode()

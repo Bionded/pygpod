@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sys
 import time
 import uuid
 from contextlib import contextmanager
@@ -26,6 +27,8 @@ STALE_AFTER_S = 600.0
 
 
 def _alive(pid: int) -> bool:
+    if sys.platform == "win32":
+        return _alive_windows(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -33,6 +36,29 @@ def _alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _alive_windows(pid: int) -> bool:
+    # os.kill(pid, 0) on Windows is TerminateProcess(pid, 0): it would kill the lock holder
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    process_query_limited_information, error_access_denied, still_active = 0x1000, 5, 259
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return ctypes.get_last_error() == error_access_denied
+    try:
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return True
+        return code.value == still_active  # an exited process lingers while handles are open
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def _read(path: str) -> bytes | None:

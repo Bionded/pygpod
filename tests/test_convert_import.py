@@ -1,6 +1,7 @@
 """add_track(convert=True): unplayable audio is converted with ffmpeg (syncDirector task 58)."""
 
 import os
+import re
 import shutil
 import subprocess
 
@@ -17,14 +18,26 @@ from .test_media_validation import _ipod, _state
 pytestmark = pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg needed")
 
 
+def _vorbis_encoder():
+    # Homebrew's slimmed ffmpeg ships without libvorbis; fall back to the
+    # built-in (experimental) encoder, which handles our stereo test tone.
+    encoders = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True
+    ).stdout
+    if re.search(r"\blibvorbis\b", encoders):
+        return ["libvorbis"]
+    return ["vorbis", "-strict", "experimental"]
+
+
 def _make(path, codec, rate=44100, channels=2, title="Пісня"):
     layout = {1: "mono", 2: "stereo", 6: "5.1"}[channels]
+    codec_args = _vorbis_encoder() if codec == "vorbis" else [codec]
     subprocess.run(
         [
             "ffmpeg", "-v", "quiet", "-y", "-f", "lavfi",
             "-i", f"sine=frequency=440:duration=1:sample_rate={rate}",
             "-af", f"aformat=channel_layouts={layout}",
-            "-c:a", codec,
+            "-c:a", *codec_args,
             "-metadata", f"title={title}", "-metadata", "artist=Океан Ельзи",
             "-metadata", "album=Зоря", "-metadata", "track=3/9",
             str(path),
@@ -65,7 +78,7 @@ def test_flac_becomes_alac_on_a_classic_with_the_original_tags(tmp_path, monkeyp
 
 def test_lossy_and_unplayable_alac_become_aac(tmp_path):
     mp = _ipod(tmp_path, "8737")  # 2nd generation: no ALAC
-    ogg = _make(tmp_path / "a.ogg", "libvorbis", title="Vorbis")
+    ogg = _make(tmp_path / "a.ogg", "vorbis", title="Vorbis")
     flac = _make(tmp_path / "b.flac", "flac", title="Lossless")
     db = Database(mp)
     db.add_track(ogg, convert=True)
