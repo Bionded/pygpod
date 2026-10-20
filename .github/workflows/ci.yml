@@ -47,10 +47,6 @@ jobs:
             ubuntu: ubuntu-latest
           - python-version: "3.15"
             ubuntu: ubuntu-latest
-          # not released yet: test against the newest pre-release, do not fail CI
-          - python-version: "3.16"
-            ubuntu: ubuntu-latest
-            experimental: true
     continue-on-error: ${{ matrix.experimental == true }}
 
     steps:
