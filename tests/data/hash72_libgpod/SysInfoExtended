@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>FireWireGUID</key><string>000A270012345678</string>
+<key>SerialNumber</key><string>5U8401ABC</string>
+<key>FamilyID</key><integer>13</integer>
+<key>DBVersion</key><integer>4</integer>
+</dict></plist>

@@ -112,7 +112,7 @@ def test_itunessd_synthetic():
 
     sd2 = ITunesSD.parse(data)
     assert len(sd2.tracks) == 1
-    assert sd2.tracks[0].filename == ":iPod_Control:Music:F00:test.mp3"
+    assert sd2.tracks[0].filename == "/iPod_Control/Music/F00/test.mp3"  # shuffle form (libgpod)
     assert sd2.tracks[0].file_type == 1
     assert sd2.tracks[0].volume == 100
 

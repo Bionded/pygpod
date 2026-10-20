@@ -24,16 +24,17 @@ from __future__ import annotations
 
 import logging
 
-__version__ = "0.0.6"
+__version__ = "0.1.0"
 
 logger = logging.getLogger(__name__)
 
 from .db.photodb import Photo, PhotoAlbum, PhotoDB
-from .db.playcounts import read_otg_playlists, read_play_counts
+from .db.playcounts import OTGSkippedEntry, PendingPlayCount, read_otg_playlists, read_play_counts
 from .device.device import Device
 from .device.mountpoint import init_ipod, validate_mountpoint
 from .exceptions import (
     ArtworkError,
+    ConflictError,
     DatabaseError,
     DependencyError,
     DeviceError,
@@ -43,6 +44,7 @@ from .exceptions import (
     PlaylistError,
     PyGpodError,
     TrackError,
+    UnsafePathError,
     UnsupportedFormatError,
     WriteError,
 )
@@ -305,6 +307,9 @@ __all__ = [
     "Photo",
     "PhotoAlbum",
     "read_play_counts",
+    "OTGSkippedEntry",
+    "PendingPlayCount",
+    "UnsafePathError",
     "read_otg_playlists",
     "init_ipod",
     "validate_mountpoint",
@@ -313,6 +318,7 @@ __all__ = [
     "DatabaseError",
     "ParseError",
     "WriteError",
+    "ConflictError",
     "DeviceError",
     "MountPointError",
     "HashError",

@@ -388,8 +388,8 @@ class TestParseMhbdChildren:
         struct.pack_into("<I", header, 0x14, 1)  # claims 1 child
         # But actual data is only header_len + 5 bytes (not enough for a child)
         data = bytes(header) + b"\x00" * 5
-        root = parse_itunesdb(data)
-        assert len(root.children) == 0
+        with pytest.raises(ParseError, match="Truncated"):
+            parse_itunesdb(data)
 
 
 # ---------------------------------------------------------------------------

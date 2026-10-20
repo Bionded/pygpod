@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import datetime
 import logging
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from ..db.constants import (
     MEDIATYPE_AUDIO,
@@ -42,7 +42,7 @@ from ..db.constants import (
     MHOD_MAGIC,
 )
 from ..db.parser import Record
-from ..utils.datetime import mac_to_datetime
+from ..utils.datetime import datetime_to_mac, mac_to_datetime
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,12 @@ class Track:
 
     def __init__(self, record: Optional[Record] = None) -> None:
         self._record = record
+        # Called after every change; Database sets it to mark itself modified.
+        self._on_change: Optional[Callable[[], None]] = None
+
+    def _touch(self) -> None:
+        if self._on_change is not None:
+            self._on_change()
 
     @classmethod
     def from_record(cls, record: Record) -> "Track":
@@ -92,6 +98,7 @@ class Track:
         ]
         if value:
             self._record.children.append(make_string_mhod(mhod_type, value))
+        self._touch()
 
     def _set_header_u8(self, offset: int, value: int) -> None:
         """Set a uint8 in the MHIT raw header."""
@@ -103,6 +110,7 @@ class Track:
         if len(header) > offset:
             put8int(header, offset, value)
             self._record.raw_header = bytes(header)
+            self._touch()
 
     def _set_header_u16(self, offset: int, value: int) -> None:
         """Set a uint16 LE in the MHIT raw header."""
@@ -114,6 +122,7 @@ class Track:
         if len(header) > offset + 1:
             put16lint(header, offset, value)
             self._record.raw_header = bytes(header)
+            self._touch()
 
     def _set_header_u32(self, offset: int, value: int) -> None:
         """Set a uint32 LE in the MHIT raw header."""
@@ -125,6 +134,7 @@ class Track:
         if len(header) > offset + 3:
             put32lint(header, offset, value)
             self._record.raw_header = bytes(header)
+            self._touch()
 
     def _set_field_and_header_u32(self, key: str, offset: int, value: int) -> None:
         if self._record:
@@ -624,6 +634,10 @@ class Track:
     def skip_count(self) -> int:
         return self._get_field("skip_count", 0)
 
+    @skip_count.setter
+    def skip_count(self, value: int) -> None:
+        self._set_field_and_header_u32("skip_count", 0x9C, value)
+
     @property
     def app_rating(self) -> int:
         return self._get_field("app_rating", 0)
@@ -638,7 +652,12 @@ class Track:
 
     @property
     def bookmark_time(self) -> int:
+        """Resume position in milliseconds (audiobooks/podcasts with remember_position)."""
         return self._get_field("bookmark_time", 0)
+
+    @bookmark_time.setter
+    def bookmark_time(self, value: int) -> None:
+        self._set_field_and_header_u32("bookmark_time", 0x6C, value)
 
     # ---- Artwork (read-only) ----
 
@@ -712,6 +731,11 @@ class Track:
     @property
     def time_played(self) -> datetime.datetime:
         return mac_to_datetime(self._get_field("time_played"))
+
+    @time_played.setter
+    def time_played(self, value: datetime.datetime) -> None:
+        """Last played time (inverse of the getter: aware datetimes recommended)."""
+        self._set_field_and_header_u32("time_played", 0x58, datetime_to_mac(value))
 
     @property
     def time_released(self) -> datetime.datetime:

@@ -8,7 +8,8 @@ from __future__ import annotations
 import logging
 import pathlib
 import plistlib
-from typing import Any, Dict, Optional
+import re
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -137,12 +138,50 @@ def parse_sysinfo_extended(path: str) -> Dict[str, Any]:
     if not p.exists():
         return {}
 
+    data = p.read_bytes()
     try:
-        with open(p, "rb") as f:
-            return plistlib.load(f)
+        return plistlib.loads(data)
+    except Exception:
+        pass
+    try:
+        return plistlib.loads(drop_keys_in_arrays(data))
     except Exception:
         logger.warning("Failed to parse SysInfoExtended plist: %s", path, exc_info=True)
         return {}
+
+
+_TAG = re.compile(rb"<(/?)([A-Za-z]+)[^>]*?(/?)>")
+
+
+def drop_keys_in_arrays(data: bytes) -> bytes:
+    """Remove ``<key>...</key>`` elements that sit directly inside an ``<array>``.
+
+    iPods (e.g. the Classic 7G over SCSI) write ImageSpecifications as an array of
+    ``<key>N</key><dict>...</dict>`` pairs, which strict plist parsers reject;
+    libgpod's itdb_plist.c parse_array silently skips such keys. Same here.
+    """
+    out = bytearray()
+    stack: List[bytes] = []
+    pos = 0
+    skip_from: Optional[int] = None
+    for m in _TAG.finditer(data):
+        closing, name, selfclosing = m.group(1), m.group(2), m.group(3)
+        if closing:
+            if name == b"key" and skip_from is not None:
+                pos = m.end()
+                skip_from = None
+            if stack and stack[-1] == name:
+                stack.pop()
+            continue
+        if name == b"key" and stack and stack[-1] == b"array" and not selfclosing:
+            out += data[pos : m.start()]
+            skip_from = m.start()
+            pos = m.start()
+            continue
+        if not selfclosing and skip_from is None:
+            stack.append(name)
+    out += data[pos:] if skip_from is None else b""
+    return bytes(out)
 
 
 def read_sysinfo(mountpoint: str) -> SysInfo:

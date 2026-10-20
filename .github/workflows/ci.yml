@@ -139,32 +139,12 @@ jobs:
       - name: Install Python deps
         run: pip install -e ".[all]" pytest pytest-cov
 
-      - name: Run all tests (with libgpod fixture builder)
+      - name: Run all tests
         run: python -m pytest tests/ -v --tb=short
 
-      - name: Verify hash58 matches libgpod
-        run: |
-          cat > /tmp/test_hash.c << 'EOF'
-          #include <gpod/itdb.h>
-          #include <glib.h>
-          #include <stdio.h>
-          #include <string.h>
-          int main(int argc, char **argv) {
-              const char *mp = argv[1];
-              Itdb_iTunesDB *itdb = itdb_parse(mp, NULL);
-              if (!itdb) { fprintf(stderr, "parse failed\n"); return 1; }
-              if (!itdb_write(itdb, NULL)) { fprintf(stderr, "write failed\n"); return 1; }
-              char path[512];
-              snprintf(path, sizeof(path), "%s/iPod_Control/iTunes/iTunesDB", mp);
-              FILE *f = fopen(path, "rb");
-              unsigned char buf[128];
-              fread(buf, 1, 128, f);
-              fclose(f);
-              printf("hash58: ");
-              for (int i=0x58; i<0x58+20; i++) printf("%02x", buf[i]);
-              printf("\n");
-              itdb_free(itdb);
-              return 0;
-          }
-          EOF
-          gcc -o /tmp/test_hash /tmp/test_hash.c $(pkg-config --cflags --libs libgpod-1.0 glib-2.0) || echo "Compile skipped"
+      # pygpod <-> libgpod interop (integration_tests/libgpod_tool.c): libgpod-written DBs read by pygpod
+      # with identical hash58, pygpod-written DBs parsed by libgpod. Fails (does not skip) if it cannot run.
+      - name: Verify against libgpod
+        env:
+          PYGPOD_REQUIRE_LIBGPOD: "1"
+        run: python -m pytest tests/ -m libgpod -v --tb=short

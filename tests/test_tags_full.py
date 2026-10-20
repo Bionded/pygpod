@@ -123,7 +123,7 @@ class TestFormatValidation:
             check_format_supported(str(tmp_path / "song.flac"))
         msg = str(exc_info.value)
         assert "Convert to MP3 or AAC" in msg
-        assert "not yet implemented" in msg
+        assert "convert=True" in msg
 
 
 # =========================================================================

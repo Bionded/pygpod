@@ -1,8 +1,10 @@
 """Photo database support - full CRUD for photos and photo albums.
 
 Ported from libgpod's itdb_photoalbum.c. The PhotoDB is stored in
-iPod_Control/Photos/Photo Database and uses a similar MHXX binary
-format to the main ArtworkDB.
+``<mountpoint>/Photos/Photo Database`` (thumbnails in ``Photos/Thumbs``; libgpod
+itdb_get_photos_dir) and uses a similar MHXX binary format to the main ArtworkDB.
+pygpod before syncDirector task 53 wrote ``iPod_Control/Photos`` instead: that is
+still read when ``Photos`` has no database, and the next save moves it.
 
 Photo IDs start at 0x40, Album IDs at 0x64.
 Album types: 1 = Photo Library (master), 2 = normal album.
@@ -12,9 +14,12 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import shutil
 import struct
-from typing import List, Optional
+from typing import Dict, List, Optional
 
+from ..device.artwork_formats import ArtworkFormatInfo, ThumbFormat, get_photo_formats
 from ..exceptions import ArtworkError
 from ..utils.compat import put16lint, put32lint, put64lint
 from .artwork_parser import parse_artworkdb
@@ -29,8 +34,8 @@ ALBUM_ID_START = 0x64
 ALBUM_TYPE_MASTER = 1
 ALBUM_TYPE_NORMAL = 2
 
-# Photo thumbnail format IDs for iPod Classic
-PHOTO_FORMAT_IDS = [1042, 1043, 1044]  # 320x240, 130x88, 56x56 - all RGB565_LE
+# .ithmb file reference in a thumbnail's file name MHOD: ":F1024_1.ithmb" or ":Thumbs:F1024_1.ithmb"
+_ITHMB_NAME = re.compile(r"F(\d+)_(\d+)\.ithmb$")
 
 
 class Photo:
@@ -55,7 +60,8 @@ class PhotoThumbnail:
         self.height: int = 0
         self.image_offset: int = 0
         self.image_size: int = 0
-        self.ithmb_file: int = 0
+        self.ithmb_file: int = 1  # the N of F<format>_<N>.ithmb
+        self._pixel_data: Optional[bytes] = None  # set for thumbnails not written yet
 
     def read_data(self, photos_dir: str) -> Optional[bytes]:
         """Read raw pixel data from .ithmb file."""
@@ -105,8 +111,12 @@ class PhotoDB:
     Provides CRUD operations for photos and photo albums.
     """
 
-    def __init__(self, mountpoint: Optional[str] = None) -> None:
+    def __init__(self, mountpoint: Optional[str] = None, generation=None) -> None:
+        """``generation`` (IpodGeneration) picks the photo formats; default: detected from the
+        mount point."""
         self._mountpoint = mountpoint
+        self._generation = generation
+        self._read_dir: Optional[str] = None  # where existing thumbnails are read from
         self._photos: List[Photo] = []
         self._albums: List[PhotoAlbum] = []
         self._next_photo_id = PHOTO_ID_START
@@ -119,8 +129,14 @@ class PhotoDB:
 
     def _load(self, mountpoint: str) -> None:
         """Load photo database from iPod."""
-        photos_dir = os.path.join(mountpoint, "iPod_Control", "Photos")
+        photos_dir = photos_dir_for(mountpoint)
         db_path = os.path.join(photos_dir, "Photo Database")
+        if not os.path.isfile(db_path) and os.path.isfile(
+            os.path.join(_legacy_dir(mountpoint), "Photo Database")
+        ):
+            photos_dir = _legacy_dir(mountpoint)
+            db_path = os.path.join(photos_dir, "Photo Database")
+        self._read_dir = photos_dir
 
         if not os.path.isfile(db_path):
             return
@@ -163,7 +179,11 @@ class PhotoDB:
                             thumb.height = mhni.fields.get("image_height", 0)
                             thumb.image_offset = mhni.fields.get("ithumb_offset", 0)
                             thumb.image_size = mhni.fields.get("image_size", 0)
-                            thumb.ithmb_file = mhni.fields.get("format_id", 0)
+                            for mhod in mhni.children:
+                                name = mhod.fields.get("string", "")
+                                m = _ITHMB_NAME.search(name) if mhod.magic == b"mhod" else None
+                                if m:
+                                    thumb.ithmb_file = int(m.group(2))
                             photo.thumbnails.append(thumb)
 
                     self._photos.append(photo)
@@ -213,11 +233,11 @@ class PhotoDB:
             for thumb in photo.thumbnails:
                 # Build ithmb filename: ":F{format_id}_{file}.ithmb"
                 ithmb_name = f":F{thumb.format_id}_{thumb.ithmb_file}.ithmb"
-                fname_bytes = ithmb_name.encode("utf-8")
+                fname_bytes = ithmb_name.encode("utf-16-le")
 
-                # MHOD type=3 (filename string, child of MHNI)
+                # MHOD type=3 (filename string, child of MHNI): UTF-16LE, encoding 2 (libgpod)
                 mhod3_hlen = 0x18
-                mhod3_body = struct.pack("<IbBhI", len(fname_bytes), 1, 0, 0, 0) + fname_bytes
+                mhod3_body = struct.pack("<III", len(fname_bytes), 2, 0) + fname_bytes
                 # Pad to 4-byte boundary
                 pad = (4 - (mhod3_hlen + len(mhod3_body)) % 4) % 4
                 mhod3_body += b"\x00" * pad
@@ -395,11 +415,10 @@ class PhotoDB:
 
         mhif_list = []
         for fmt_id in sorted(format_ids):
-            total_size = 0
-            for photo in self._photos:
-                for thumb in photo.thumbnails:
-                    if thumb.format_id == fmt_id:
-                        total_size += thumb.image_size
+            # size of one thumbnail of this format (libgpod's mhif image_size)
+            total_size = next(
+                t.image_size for p in self._photos for t in p.thumbnails if t.format_id == fmt_id
+            )
 
             mhif_hlen = 0x7C  # libgpod padded size
             mhif_h = bytearray(mhif_hlen)
@@ -453,6 +472,17 @@ class PhotoDB:
         root.children = [mhsd1, mhsd2, mhsd3]
         return root
 
+    def _photo_formats(self) -> List[ArtworkFormatInfo]:
+        generation = self._generation
+        if generation is None and self._mountpoint:
+            from ..device.device import Device
+
+            generation = Device.from_mountpoint(self._mountpoint).generation
+        formats = get_photo_formats(generation) if generation is not None else None
+        if not formats:
+            raise ArtworkError(f"no photo thumbnail formats known for this iPod ({generation})")
+        return formats
+
     # ---- Public API ----
 
     @property
@@ -500,28 +530,34 @@ class PhotoDB:
 
         photo = Photo()
         photo.photo_id = self._next_photo_id
-        self._next_photo_id += 1
         photo.original_path = image_path
 
-        # Generate thumbnails for each photo format
-        from ..model.artwork import ARTWORK_FORMATS, create_thumbnail
+        # One thumbnail per photo format of the device (libgpod tables)
+        from ..model.artwork import PixelFormat, render_thumbnail
 
-        for fmt_id in PHOTO_FORMAT_IDS:
-            fmt_info = ARTWORK_FORMATS.get(fmt_id)
-            if not fmt_info:
+        pixel = {
+            ThumbFormat.RGB565_LE: PixelFormat.RGB565_LE,
+            ThumbFormat.RGB565_BE: PixelFormat.RGB565_BE,
+            ThumbFormat.I420_LE: PixelFormat.I420,
+        }
+        for fmt in self._photo_formats():
+            if fmt.pixel_format not in pixel:
                 continue
-            w, h, pix_fmt, bpp = fmt_info
-            pixel_data = create_thumbnail(image_path, fmt_id)
-            if pixel_data:
-                thumb = PhotoThumbnail()
-                thumb.format_id = fmt_id
-                thumb.width = w
-                thumb.height = h
-                thumb.image_size = len(pixel_data)
-                thumb.image_offset = 0  # Will be set during save
-                thumb.ithmb_file = 1  # File index
-                thumb._pixel_data = pixel_data
-                photo.thumbnails.append(thumb)
+            pixel_data = render_thumbnail(
+                image_path, fmt.width, fmt.height, pixel[fmt.pixel_format]
+            )
+            if not pixel_data:
+                continue
+            thumb = PhotoThumbnail()
+            thumb.format_id = fmt.format_id
+            thumb.width = fmt.width
+            thumb.height = fmt.height
+            thumb.image_size = len(pixel_data)
+            thumb._pixel_data = pixel_data
+            photo.thumbnails.append(thumb)
+        if not photo.thumbnails:
+            raise ArtworkError(f"no photo thumbnail could be made from {image_path}")
+        self._next_photo_id += 1
 
         self._photos.append(photo)
 
@@ -606,49 +642,90 @@ class PhotoDB:
         return None
 
     def save(self) -> None:
-        """Save the photo database back to the iPod."""
+        """Save the photo database back to the iPod.
+
+        Every thumbnail (new ones and those already on the iPod) is read first, then written to
+        fresh ``F<format>_<N>.ithmb`` files under a file index no current thumbnail uses, then the
+        database is replaced atomically, then .ithmb files nothing refers to are deleted. Existing
+        images are never overwritten in place; removed photos' data is dropped.
+        """
         if not self._mountpoint:
             raise ArtworkError("No mount point set")
 
-        photos_dir = os.path.join(self._mountpoint, "iPod_Control", "Photos")
+        photos_dir = photos_dir_for(self._mountpoint)
         thumbs_dir = os.path.join(photos_dir, "Thumbs")
+        read_dir = self._read_dir or photos_dir
+        moving = read_dir != photos_dir
+
+        # 1. all pixel data in memory before any file changes
+        pixels: Dict[int, bytes] = {}  # id(thumb) -> data
+        for photo in self._photos:
+            kept = []
+            for thumb in photo.thumbnails:
+                data = thumb._pixel_data or thumb.read_data(read_dir)
+                if data is None:
+                    logger.warning(
+                        "photo %d: thumbnail %d unreadable, dropped",
+                        photo.photo_id,
+                        thumb.format_id,
+                    )
+                    continue
+                pixels[id(thumb)] = data
+                kept.append(thumb)
+            photo.thumbnails = kept
+
+        # 2. new .ithmb files under an unused index per format
+        by_format: Dict[int, List[PhotoThumbnail]] = {}
         os.makedirs(thumbs_dir, exist_ok=True)
-
-        # Compute offsets and write .ithmb files
-        ithmb_offsets: dict = {}  # format_id -> current offset
-        ithmb_data: dict = {}  # format_id -> bytearray
-
         for photo in self._photos:
             for thumb in photo.thumbnails:
-                pixel_data = getattr(thumb, "_pixel_data", None)
-                if not pixel_data:
-                    continue
-                fmt_id = thumb.format_id
-                if fmt_id not in ithmb_data:
-                    ithmb_data[fmt_id] = bytearray()
-                    ithmb_offsets[fmt_id] = 0
-                thumb.image_offset = ithmb_offsets[fmt_id]
-                ithmb_data[fmt_id].extend(pixel_data)
-                ithmb_offsets[fmt_id] += len(pixel_data)
+                by_format.setdefault(thumb.format_id, []).append(thumb)
+        for fmt_id, thumbs in by_format.items():
+            used = {t.ithmb_file for t in thumbs if t._pixel_data is None and not moving}
+            index = next(i for i in range(1, len(used) + 2) if i not in used)
+            blob = bytearray()
+            for thumb in thumbs:
+                thumb.image_offset = len(blob)
+                thumb.image_size = len(pixels[id(thumb)])
+                blob += pixels[id(thumb)]
+            _atomic_write(os.path.join(thumbs_dir, f"F{fmt_id}_{index}.ithmb"), bytes(blob))
+            for thumb in thumbs:
+                thumb.ithmb_file = index
+                thumb._pixel_data = None
 
-        # Write .ithmb files
-        for fmt_id, data in ithmb_data.items():
-            ithmb_path = os.path.join(thumbs_dir, f"F{fmt_id}_1.ithmb")
-            with open(ithmb_path, "wb") as f:
-                f.write(data)
-
-        # Always rebuild root to update offsets
+        # 3. the database, then 4. unreferenced .ithmb files
         self._root = self._build_root()
-        if self._root is None:
-            return
-
-        data = write_artworkdb(self._root)
-
-        os.makedirs(photos_dir, exist_ok=True)
-        db_path = os.path.join(photos_dir, "Photo Database")
-
-        with open(db_path, "wb") as f:
-            f.write(data)
+        _atomic_write(os.path.join(photos_dir, "Photo Database"), write_artworkdb(self._root))
+        referenced = {
+            f"F{t.format_id}_{t.ithmb_file}.ithmb" for p in self._photos for t in p.thumbnails
+        }
+        for name in os.listdir(thumbs_dir):
+            if _ITHMB_NAME.fullmatch(name) and name not in referenced:
+                os.unlink(os.path.join(thumbs_dir, name))
+        if moving:  # the database moved to Photos/: drop pygpod's old iPod_Control/Photos copy
+            shutil.rmtree(read_dir, ignore_errors=True)
+        self._read_dir = photos_dir
 
     def __repr__(self) -> str:
         return f"<PhotoDB {len(self._photos)} photos, {len(self._albums)} albums>"
+
+
+def _atomic_write(path: str, data: bytes) -> None:
+    tmp = path + ".pygpod-tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def photos_dir_for(mountpoint: str) -> str:
+    """``<mountpoint>/Photos``, matching an existing directory case-insensitively (FAT)."""
+    for name in os.listdir(mountpoint) if os.path.isdir(mountpoint) else []:
+        if name.lower() == "photos" and os.path.isdir(os.path.join(mountpoint, name)):
+            return os.path.join(mountpoint, name)
+    return os.path.join(mountpoint, "Photos")
+
+
+def _legacy_dir(mountpoint: str) -> str:
+    return os.path.join(mountpoint, "iPod_Control", "Photos")

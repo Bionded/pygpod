@@ -1,6 +1,6 @@
 # pygpod
 
-> **Pre-alpha release.** This project is under active development. APIs may change, bugs are expected, and not all features are implemented yet. Use at your own risk.
+> **Beta release.** This project is under active development. APIs may change, bugs are expected, and not all features are implemented yet. Use at your own risk.
 
 Pure Python library for iPod database management - a spiritual successor to [libgpod](https://sourceforge.net/projects/gtkpod/).
 
@@ -57,6 +57,9 @@ print(f"Added: {track}")
 
 # With metadata overrides
 db.add_track("/path/to/other.mp3", artist="Custom Artist", title="Custom Title")
+
+# FLAC, Ogg, Opus, hi-res ... converted with ffmpeg (ALAC where the iPod plays it, else AAC)
+db.add_track("/path/to/song.flac", convert=True)
 
 db.save()
 ```
@@ -135,7 +138,7 @@ db.tracks          # list of Track objects
 db.playlists       # list of Playlist objects
 db.master_playlist # the library playlist
 db.device          # Device info (model, capabilities)
-db.add_track(path, **metadata_overrides)
+db.add_track(path, convert=False, **metadata_overrides)
 db.remove_track(track, delete_file=False)
 db.create_playlist(name)
 db.delete_playlist(playlist)

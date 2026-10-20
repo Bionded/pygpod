@@ -192,7 +192,7 @@ class TestDatabaseTrackOps:
             pytest.skip("generated_mp3_with_art has no embedded artwork (ffmpeg not available)")
 
         image_id = track.mhii_link
-        # Remove without saving first — exercises the same-session path
+        # Remove without saving first - exercises the same-session path
         db.remove_track(track)
 
         # The artwork manager must have the entry removed in-memory

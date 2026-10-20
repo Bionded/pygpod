@@ -396,8 +396,8 @@ class TestPlaylistSetters:
 
     def test_rename_unicode(self):
         pl = self._make_playlist("Test")
-        pl.name = "Депрессивная рефлексия"
-        assert pl.name == "Депрессивная рефлексия"
+        pl.name = "Депресивна рефлексія"
+        assert pl.name == "Депресивна рефлексія"
 
     def test_name_inserted_at_front(self):
         pl = self._make_playlist("Test")

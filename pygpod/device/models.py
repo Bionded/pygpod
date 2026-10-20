@@ -167,6 +167,28 @@ VIDEO_GENERATIONS = {
     IpodGeneration.CLASSIC_3,
 }
 
+# Generations whose firmware cannot play Apple Lossless (ALAC came with firmware for the 3G,
+# mini, 4G and later; the 1G/2G and the first two shuffles never got it).
+NO_ALAC_GENERATIONS = {
+    IpodGeneration.FIRST,
+    IpodGeneration.SECOND,
+    IpodGeneration.SHUFFLE_1,
+    IpodGeneration.SHUFFLE_2,
+}
+
+# Audio codecs every iPod plays (as detected by tags.probe_media)
+BASE_AUDIO_CODECS = frozenset({"mp3", "aac", "wav", "aiff"})
+MAX_SAMPLE_RATE = 48000
+MAX_CHANNELS = 2
+
+
+def supported_audio_codecs(gen: "IpodGeneration") -> frozenset:
+    """Audio codecs the generation's firmware plays: mp3, aac, wav, aiff (+ alac)."""
+    if gen in NO_ALAC_GENERATIONS:
+        return BASE_AUDIO_CODECS
+    return BASE_AUDIO_CODECS | {"alac"}
+
+
 # Generations that support podcasts
 PODCAST_GENERATIONS = {
     IpodGeneration.FOURTH,

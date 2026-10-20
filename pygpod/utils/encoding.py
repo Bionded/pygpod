@@ -55,12 +55,31 @@ def ipod_path_to_os(ipod_path: str, mountpoint: str) -> str:
 
     Returns:
         OS-native path string.
+
+    Raises:
+        UnsafePathError: if the path could leave the mount point: empty, NUL,
+            backslash or slash inside a component, ``.``/``..`` components, or a
+            symlink that resolves outside the mount point. Paths come from the
+            iTunesDB on the device, so they are untrusted.
     """
+    import os
     import pathlib
+
+    from ..exceptions import UnsafePathError
 
     # Strip leading colon and split
     parts = ipod_path.lstrip(":").split(":")
-    return str(pathlib.Path(mountpoint).joinpath(*parts))
+    if not ipod_path or "\x00" in ipod_path:
+        raise UnsafePathError(f"invalid iPod path: {ipod_path!r}")
+    for part in parts:
+        if part in ("", ".", "..") or "/" in part or "\\" in part:
+            raise UnsafePathError(f"invalid iPod path: {ipod_path!r}")
+    path = pathlib.Path(mountpoint).joinpath(*parts)
+    root = os.path.realpath(mountpoint)
+    resolved = os.path.realpath(path)
+    if os.path.commonpath([root, resolved]) != root:
+        raise UnsafePathError(f"iPod path resolves outside the mount point: {ipod_path!r}")
+    return str(path)
 
 
 def os_path_to_ipod(os_path: str, mountpoint: str) -> str:

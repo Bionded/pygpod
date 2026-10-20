@@ -19,6 +19,10 @@ class WriteError(DatabaseError):
     """Error writing a binary database file."""
 
 
+class ConflictError(WriteError):
+    """The database on the iPod changed since it was loaded, or another writer holds the lock."""
+
+
 class DeviceError(PyGpodError):
     """Error related to iPod device detection or configuration."""
 
@@ -51,5 +55,9 @@ class UnsupportedFormatError(TrackError):
     """Audio/video format not supported by iPod.
 
     The file must be converted to a supported format (MP3, AAC, ALAC, WAV, AIFF)
-    before adding to the iPod. Auto-conversion is not yet implemented.
+    before adding to the iPod, or added with ``add_track(..., convert=True)`` (ffmpeg).
     """
+
+
+class UnsafePathError(PyGpodError, ValueError):
+    """A path read from the database would point outside the iPod mount point."""
