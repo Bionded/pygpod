@@ -24,10 +24,13 @@ MHFD header layout (132 bytes, from libgpod db-itunes-parser.h):
 
 from __future__ import annotations
 
+import functools
+import hashlib
 import logging
 import os
 import shutil
-from typing import Dict, List, Optional
+import tempfile
+from typing import IO, Dict, List, Optional, Set, Tuple
 
 from ..db.artwork_parser import (
     MHFD_MAGIC,
@@ -50,7 +53,8 @@ from ..device.artwork_formats import (
     image_data_size,
 )
 from ..device.models import IpodGeneration
-from ..model.artwork import PixelFormat, render_fitted_thumbnail
+from ..exceptions import ArtworkDBError
+from ..model.artwork import PixelFormat, _open_rgb, render_fitted_thumbnail
 from ..tags import extract_artwork
 from ..utils.compat import put8int, put16lint, put32lint, put64lint
 
@@ -67,6 +71,19 @@ _THUMB_TO_PIXEL: Dict[ThumbFormat, PixelFormat] = {
     ThumbFormat.I420_LE: PixelFormat.I420,
     ThumbFormat.I420_BE: PixelFormat.I420,
 }
+
+
+class _IthmbFile:
+    """Where stage() puts new thumbnails in one .ithmb file."""
+
+    def __init__(self, name: str, path: str, old_size: Optional[int]) -> None:
+        self.name = name
+        self.path = path
+        self.old_size = old_size  # None: the file is new (or written anew), staged whole
+        self.end = old_size or 0
+        self.holes: Optional[List[int]] = None
+        self.block = 0
+        self.writes: List[Tuple[int, Record, int, int]] = []  # (offset, mhni, spool pos, size)
 
 
 class ArtworkManager:
@@ -89,16 +106,27 @@ class ArtworkManager:
         self._artworkdb_path = os.path.join(self._artwork_dir, "ArtworkDB")
         self._root: Optional[Record] = None
         self._next_image_id = 1
-        self._ithmb_offsets: Dict[int, int] = {}  # format_id -> current write offset
         self._formats: Optional[List[ArtworkFormatInfo]] = list(formats) if formats else None
-        # Free thumbnail slots per format that the ArtworkDB on disk does not reference
-        # (reusable without staging); slots freed in this session join after the commit.
-        self._holes: Dict[int, List[int]] = {}
-        self._hole_block: Dict[int, int] = {}
-        self._pending_holes: Dict[int, List[int]] = {}
+        # Thumbnails added since the last save: (mhni, spool offset, size). The bytes wait in
+        # a spool (memory, a temporary file for big batches) and get their .ithmb slot only
+        # in stage(), i.e. after the caller's conflict check and under its write lock, so
+        # adding a cover changes no file on the iPod.
+        self._pending: List[Tuple[Record, int, int]] = []
+        self._spool: Optional[IO[bytes]] = None
+        # Slots the ArtworkDB on disk references, per .ithmb file (lower-case name): what a
+        # save must not overwrite before its commit. And the hash of that ArtworkDB, to
+        # notice when another writer replaced it meanwhile.
+        self._disk_slots: Dict[str, Set[Tuple[int, int]]] = {}
+        self._disk_sha: Optional[str] = None
+        self._fresh = False  # start_empty(): the next save writes every .ithmb file anew
+        self._needs_rebuild = False
+        # Set when the ArtworkDB exists but cannot be read: nothing is added to or written
+        # over it (that would drop every cover it holds) until start_empty() is called.
+        self.load_error: Optional[ArtworkDBError] = None
+        # No ArtworkDB on disk: image ids start at 1 again, so the caller clears the tracks'
+        # references to images of a lost ArtworkDB (they would show the new covers).
+        self.created_new = not os.path.exists(self._artworkdb_path)
         self._load()
-        if self._root is not None:
-            self._holes = self._compute_holes()
 
     @property
     def formats(self) -> List[ArtworkFormatInfo]:
@@ -116,7 +144,7 @@ class ArtworkManager:
         return self._formats
 
     def reset(self) -> None:
-        """Delete all artwork files and start fresh."""
+        """Delete all artwork files and start fresh (immediately, not with a save)."""
         if os.path.isdir(self._artwork_dir):
             for fname in os.listdir(self._artwork_dir):
                 fpath = os.path.join(self._artwork_dir, fname)
@@ -125,43 +153,55 @@ class ArtworkManager:
                     logger.debug("Deleted %s", fpath)
         self._root = None
         self._next_image_id = 1
-        self._ithmb_offsets.clear()
+        self._drop_pending()
+        self._disk_slots = {}
+        self._disk_sha = None
+        self._fresh = False
+        self.load_error = None
+
+    def start_empty(self) -> None:
+        """Replace the ArtworkDB by an empty one with the next save (also an unreadable one).
+
+        Every image is dropped; the .ithmb files are written anew and the ones no new image
+        uses are deleted when the save commits. The caller clears the tracks' artwork
+        references.
+        """
+        self.load_error = None
+        self._root = self._create_empty_artworkdb()
+        self._drop_pending()
+        self._fresh = True
+        self._needs_rebuild = True
+
+    def require_readable(self) -> None:
+        """Raise ArtworkDBError when the ArtworkDB on disk could not be read."""
+        if self.load_error is not None:
+            raise self.load_error
 
     def _load(self) -> None:
-        """Load existing ArtworkDB if present."""
-        if os.path.isfile(self._artworkdb_path):
-            try:
-                with open(self._artworkdb_path, "rb") as f:
-                    data = f.read()
-                self._root = parse_artworkdb(data)
-                # Find max image_id
-                for mhsd in self._root.children:
-                    if mhsd.fields.get("mhsd_type") == 1 and mhsd.children:
-                        mhli = mhsd.children[0]
-                        for mhii in mhli.children:
-                            iid = mhii.fields.get("image_id", 0)
-                            if iid >= self._next_image_id:
-                                self._next_image_id = iid + 1
-                logger.debug("Loaded ArtworkDB, next_image_id=%d", self._next_image_id)
-            except Exception:
-                logger.debug("Failed to load ArtworkDB, creating new", exc_info=True)
-                self._root = None
-
-        # Scan existing .ithmb files for current sizes
-        if os.path.isdir(self._artwork_dir):
-            for fname in os.listdir(self._artwork_dir):
-                if fname.startswith("F") and fname.endswith(".ithmb"):
-                    parts = fname[1:].replace(".ithmb", "").split("_")
-                    if len(parts) == 2:
-                        try:
-                            fmt_id = int(parts[0])
-                            fpath = os.path.join(self._artwork_dir, fname)
-                            size = os.path.getsize(fpath)
-                            self._ithmb_offsets[fmt_id] = max(
-                                self._ithmb_offsets.get(fmt_id, 0), size
-                            )
-                        except ValueError:
-                            pass
+        """Load the existing ArtworkDB. Only a missing file means "create a new one": an
+        unreadable one sets ``load_error`` (see require_readable())."""
+        if not os.path.exists(self._artworkdb_path):
+            return
+        try:
+            with open(self._artworkdb_path, "rb") as f:
+                data = f.read()
+            self._root = parse_artworkdb(data)
+        except Exception as e:  # noqa: BLE001 - any parse or read error: keep the file
+            logger.warning("ArtworkDB %s cannot be read: %s", self._artworkdb_path, e)
+            logger.debug("ArtworkDB read error", exc_info=True)
+            self._root = None
+            self.load_error = ArtworkDBError(
+                f"{self._artworkdb_path} cannot be read ({e}); covers cannot be changed "
+                "until Database.reset_artwork() replaces it with an empty one"
+            )
+            return
+        self._disk_sha = hashlib.sha256(data).hexdigest()
+        self._disk_slots = self._slots(self._root)
+        for mhii in self._images(self._root):
+            iid = mhii.fields.get("image_id", 0)
+            if iid >= self._next_image_id:
+                self._next_image_id = iid + 1
+        logger.debug("Loaded ArtworkDB, next_image_id=%d", self._next_image_id)
 
     def add_artwork(self, dbid: int, filepath: str) -> Optional[int]:
         """Extract artwork from audio file and add to ArtworkDB.
@@ -178,6 +218,9 @@ class ArtworkManager:
     def add_artwork_data(self, dbid: int, art_data: bytes, save: bool = True) -> Optional[int]:
         """Add raw image data as artwork for a track.
 
+        The thumbnails are rendered now and written to the .ithmb files by the next
+        save() / stage(); until then no file on the iPod changes.
+
         Args:
             dbid: Track database ID.
             art_data: Raw image bytes (JPEG/PNG).
@@ -186,14 +229,22 @@ class ArtworkManager:
 
         Returns:
             image_id if successful, None on failure.
+
+        Raises:
+            ArtworkDBError: the ArtworkDB on disk cannot be read (nothing is changed).
         """
+        self.require_readable()
         try:
             from PIL import Image  # type: ignore  # noqa: F401
         except ImportError:
             logger.warning("Pillow not installed, cannot create artwork thumbnails")
             return None
 
-        os.makedirs(self._artwork_dir, exist_ok=True)
+        # Decode and render every format first: an invalid image raises (or yields None)
+        # before anything in the ArtworkDB changed.
+        rendered = self._render(art_data)
+        if not rendered:
+            return None
 
         if self._root is None:
             self._root = self._create_empty_artworkdb()
@@ -202,72 +253,10 @@ class ArtworkManager:
         self._next_image_id += 1
 
         mhni_records = []
-
-        for fmt in self.formats:
-            pixel_fmt = _THUMB_TO_PIXEL.get(fmt.pixel_format)
-            if pixel_fmt is None:
-                continue
-            # scaled to fit and centred in the slot like libgpod, or cropped to fill it when
-            # the format says so
-            fitted = render_fitted_thumbnail(
-                art_data,
-                fmt.width,
-                fmt.height,
-                pixel_fmt,
-                crop=fmt.crop,
-                back_color=fmt.back_color,
-                row_width=aligned_width(fmt),
-            )
-            if fitted is None or not fitted.data:
-                continue
-            thumb_data = fitted.data
-            geometry = (
-                fitted.width,
-                fitted.height,
-                fitted.horizontal_padding,
-                fitted.vertical_padding,
-            )
-
-            # Pad to block_size
-            block_size = image_data_size(fmt)
-            if len(thumb_data) < block_size:
-                thumb_data = thumb_data + b"\x00" * (block_size - len(thumb_data))
-
-            # Write to .ithmb file: into a free slot if there is one, else at the end
-            ithmb_path = os.path.join(self._artwork_dir, f"F{fmt.format_id}_1.ithmb")
-            holes = self._holes.get(fmt.format_id)
-            if (
-                holes
-                and self._hole_block.get(fmt.format_id) == len(thumb_data)
-                and os.path.isfile(ithmb_path)
-            ):
-                offset = holes.pop(0)
-                with open(ithmb_path, "r+b") as f:
-                    f.seek(offset)
-                    f.write(thumb_data)
-                mhni_records.append(
-                    self._create_mhni(fmt.format_id, offset, len(thumb_data), *geometry)
-                )
-                continue
-            offset = self._ithmb_offsets.get(fmt.format_id, 0)
-
-            if os.path.isfile(ithmb_path):
-                with open(ithmb_path, "r+b") as f:
-                    f.seek(offset)
-                    f.write(thumb_data)
-            else:
-                with open(ithmb_path, "wb") as f:
-                    if offset > 0:
-                        f.write(b"\x00" * offset)
-                    f.write(thumb_data)
-
-            self._ithmb_offsets[fmt.format_id] = offset + len(thumb_data)
-
-            mhni = self._create_mhni(fmt.format_id, offset, len(thumb_data), *geometry)
+        for fmt, thumb_data, geometry in rendered:
+            mhni = self._create_mhni(fmt.format_id, 0, len(thumb_data), *geometry)
+            self._pending.append((mhni, self._spool_add(thumb_data), len(thumb_data)))
             mhni_records.append(mhni)
-
-        if not mhni_records:
-            return None
 
         # Create MHII record
         mhii = self._create_mhii(image_id, dbid, mhni_records, source_size=len(art_data))
@@ -294,27 +283,88 @@ class ArtworkManager:
         )
         return image_id
 
+    def _render(self, art_data: bytes) -> List[Tuple[ArtworkFormatInfo, bytes, Tuple[int, ...]]]:
+        """(format, thumbnail bytes padded to the format's block, geometry) per format.
+
+        Raises what Pillow raises for data that is not an image; changes no state.
+        """
+        out: List[Tuple[ArtworkFormatInfo, bytes, Tuple[int, ...]]] = []
+        source = None
+        for fmt in self.formats:
+            pixel_fmt = _THUMB_TO_PIXEL.get(fmt.pixel_format)
+            if pixel_fmt is None:
+                continue
+            # scaled to fit and centred in the slot like libgpod, or cropped to fill it when
+            # the format says so
+            if source is None:
+                source = _open_rgb(art_data)  # decoded once for all formats
+            fitted = render_fitted_thumbnail(
+                source,
+                fmt.width,
+                fmt.height,
+                pixel_fmt,
+                crop=fmt.crop,
+                back_color=fmt.back_color,
+                row_width=aligned_width(fmt),
+            )
+            if fitted is None or not fitted.data:
+                continue
+            thumb_data = fitted.data
+            block_size = image_data_size(fmt)
+            if len(thumb_data) < block_size:
+                thumb_data = thumb_data + b"\x00" * (block_size - len(thumb_data))
+            geometry = (
+                fitted.width,
+                fitted.height,
+                fitted.horizontal_padding,
+                fitted.vertical_padding,
+            )
+            out.append((fmt, thumb_data, geometry))
+        return out
+
+    # Pending thumbnails stay in memory up to this size, beyond it in a temporary file.
+    SPOOL_MEMORY = 16 * 1024 * 1024
+
+    def _spool_add(self, data: bytes) -> int:
+        if self._spool is None:
+            self._spool = tempfile.SpooledTemporaryFile(max_size=self.SPOOL_MEMORY)
+        self._spool.seek(0, os.SEEK_END)
+        pos = self._spool.tell()
+        self._spool.write(data)
+        return pos
+
+    def _spool_read(self, pos: int, size: int) -> bytes:
+        assert self._spool is not None
+        self._spool.seek(pos)
+        return self._spool.read(size)
+
+    def _drop_pending(self) -> None:
+        self._pending = []
+        if self._spool is not None:
+            self._spool.close()
+            self._spool = None
+
     def remove_artwork(self, image_id: int) -> bool:
         """Remove artwork entry by image_id.
 
         Returns True if an entry was found and removed. Its thumbnail slots become
         reusable after the next save(); the .ithmb files are compacted only when
-        most of them is unused and the disk has room for it (see stage()).
+        most of them is unused and the disk has room for it (see stage()). False
+        without a change when the ArtworkDB cannot be read.
         """
         if self._root is None:
             return False
         mhli = self._get_or_create_mhli()
+        dropped = set()
         for mhii in mhli.children:
             if mhii.fields.get("image_id") == image_id:
-                for mhni in self._mhnis(mhii):
-                    fmt_id = mhni.fields.get("format_id")
-                    if fmt_id is not None and mhni.fields.get("image_size", 0) > 0:
-                        offset = mhni.fields.get("ithumb_offset", 0)
-                        self._pending_holes.setdefault(fmt_id, []).append(offset)
+                dropped.update(id(mhni) for mhni in self._mhnis(mhii))
         before = len(mhli.children)
         mhli.children = [c for c in mhli.children if c.fields.get("image_id") != image_id]
         removed = len(mhli.children) < before
         if removed:
+            # thumbnails not saved yet are simply forgotten
+            self._pending = [p for p in self._pending if id(p[0]) not in dropped]
             self._needs_rebuild = True
             logger.debug("Removed artwork image_id=%d", image_id)
         return removed
@@ -332,24 +382,217 @@ class ArtworkManager:
             raise
 
     def stage(self, tx: Transaction) -> None:
-        """Stage the ArtworkDB (and compacted .ithmb files) into a transaction.
+        """Stage the ArtworkDB, new thumbnails and compacted .ithmb files into a transaction.
 
-        Thumbnails added since the last save are appended beyond the end of the
-        existing .ithmb files, which the old ArtworkDB never references, so they
-        need no staging. Compaction rewrites files and is staged.
+        Runs after the caller's conflict check, under its write lock. New thumbnails go into
+        slots the ArtworkDB on disk does not reference - free slots of an .ithmb file or
+        beyond its end - written in place and flushed to disk before the commit point: the
+        committed ArtworkDB never points there, so its state stays valid until the new one
+        is committed, and a big .ithmb file is not copied for one cover. A new .ithmb file
+        and compacted files are staged whole. If the transaction aborts, the new
+        thumbnails stay pending (a later save places them again) and data appended beyond
+        the old end of a file is cut off again.
+
+        Raises:
+            ArtworkDBError: the ArtworkDB on disk was replaced since it was loaded and
+                cannot be read (nothing is written over it).
         """
-        if self._root is None:
+        if self.load_error is not None or self._root is None:
             return
-        if getattr(self, "_needs_rebuild", False):
-            if self._should_compact():
-                self._rebuild_ithmb(tx)
-                tx.on_commit(self._after_compaction)
-            else:
-                self._stage_unused_file_deletions(tx, self._by_format())
-                tx.on_commit(self._release_pending_holes)
-        tx.stage_bytes(self._artworkdb_path, write_artworkdb(self._root))
+        disk_slots = self._current_disk_slots()
+        self._place_pending(tx, disk_slots)
+        if self._needs_rebuild:
+            by_file = self._by_file()
+            keys = [] if self._fresh else self._files_to_compact(by_file)
+            if keys:
+                self._rebuild_ithmb(tx, keys, by_file)
+            self._stage_unused_file_deletions(tx, by_file)
+        data = write_artworkdb(self._root)
+        tx.stage_bytes(self._artworkdb_path, data)
+        tx.on_commit(lambda: self._after_commit(data))
 
-    # Compact only when at least this share of the .ithmb data is unused...
+    def _after_commit(self, data: bytes) -> None:
+        self._drop_pending()
+        self._needs_rebuild = False
+        self._fresh = False
+        self._disk_sha = hashlib.sha256(data).hexdigest()
+        self._disk_slots = self._slots(self._root)
+
+    def _current_disk_slots(self) -> Dict[str, Set[Tuple[int, int]]]:
+        """Slots the ArtworkDB on disk references now (re-read only when it changed)."""
+        if self._fresh:
+            return {}  # every .ithmb file is written anew
+        try:
+            with open(self._artworkdb_path, "rb") as f:
+                data: Optional[bytes] = f.read()
+        except FileNotFoundError:
+            data = None
+        sha = hashlib.sha256(data).hexdigest() if data is not None else None
+        if sha == self._disk_sha:
+            return self._disk_slots
+        if data is None:
+            return {}
+        try:
+            return self._slots(parse_artworkdb(data))
+        except Exception as e:  # noqa: BLE001 - replaced by something unreadable
+            raise ArtworkDBError(
+                f"{self._artworkdb_path} was replaced since it was loaded and cannot be read "
+                f"({e}); nothing was written"
+            ) from e
+
+    # Like libgpod, a format's thumbnails go to F<format>_1.ithmb until it reaches this size,
+    # then to F<format>_2.ithmb and so on.
+    ITHMB_MAX_SIZE = 256 * 1000 * 1000
+
+    def _place_pending(self, tx: Transaction, disk_slots: Dict[str, Set[Tuple[int, int]]]) -> None:
+        """Give every pending thumbnail its .ithmb slot and write it (see stage()).
+
+        Free slots of any existing file of the format come first, then the end of the
+        first file below ITHMB_MAX_SIZE (a new file when all are full), like libgpod.
+        """
+        if not self._pending:
+            return
+        os.makedirs(self._artwork_dir, exist_ok=True)
+        pending_ids = {id(mhni) for mhni, _, _ in self._pending}
+        used = self._slots(self._root, skip=pending_ids)
+        for name, slots in disk_slots.items():
+            used.setdefault(name, set()).update(slots)
+        by_format: Dict[int, List[Tuple[Record, int, int]]] = {}
+        for item in self._pending:
+            by_format.setdefault(item[0].fields.get("format_id", 0), []).append(item)
+        for fmt_id, items in by_format.items():
+            files: Dict[int, _IthmbFile] = {}
+
+            def file(n: int) -> _IthmbFile:
+                if n not in files:
+                    name = f"F{fmt_id}_{n}.ithmb"
+                    path = self._ithmb_path(name)
+                    exists = not self._fresh and os.path.isfile(path)
+                    files[n] = _IthmbFile(name, path, os.path.getsize(path) if exists else None)
+                return files[n]
+
+            existing = [] if self._fresh else self._file_indices(fmt_id)
+            for mhni, pos, size in items:
+                target: Optional[_IthmbFile] = None
+                for n in existing:
+                    f = file(n)
+                    if f.holes is None:
+                        f.block = size
+                        f.holes = self._free_slots(
+                            used.get(f.name.lower(), set()), f.old_size or 0, size
+                        )
+                    if f.holes and f.block == size:
+                        target, offset = f, f.holes.pop(0)
+                        break
+                if target is None:
+                    n = 1
+                    while file(n).end >= self.ITHMB_MAX_SIZE:
+                        n += 1
+                    target, offset = file(n), file(n).end
+                    target.end += size
+                target.writes.append((offset, mhni, pos, size))
+            for f in files.values():
+                self._write_placed(tx, f)
+
+    def _write_placed(self, tx: Transaction, f: _IthmbFile) -> None:
+        if not f.writes:
+            return
+        f.writes.sort(key=lambda w: w[0])
+        for offset, mhni, _, _ in f.writes:
+            self._set_slot(mhni, f.name, offset)
+        if f.old_size is None:  # a new file (or one written anew): staged whole
+            tx.stage_bytes(f.path, b"".join(self._spool_read(p, s) for _, _, p, s in f.writes))
+            return
+        tx.on_abort(functools.partial(self._truncate, f.path, f.old_size))
+        with open(f.path, "r+b") as fh:
+            for offset, _, pos, size in f.writes:
+                fh.seek(offset)
+                fh.write(self._spool_read(pos, size))
+            fh.flush()
+            os.fsync(fh.fileno())
+
+    def _file_indices(self, fmt_id: int) -> List[int]:
+        """Indices n of the existing F<fmt_id>_<n>.ithmb files, ascending."""
+        out = []
+        prefix = f"f{fmt_id}_"
+        if os.path.isdir(self._artwork_dir):
+            for name in os.listdir(self._artwork_dir):
+                low = name.lower()
+                if low.startswith(prefix) and low.endswith(".ithmb"):
+                    index = low[len(prefix) : -len(".ithmb")]
+                    if index.isdigit() and os.path.isfile(os.path.join(self._artwork_dir, name)):
+                        out.append(int(index))
+        return sorted(out)
+
+    @staticmethod
+    def _free_slots(used: Set[Tuple[int, int]], end: int, block: int) -> List[int]:
+        """Unreferenced ``block``-sized slots below ``end`` (fixed-size, aligned files only)."""
+        if any(size != block or offset % block for offset, size in used):
+            return []  # mixed sizes or unaligned: no reuse in this file
+        taken = {offset for offset, _ in used}
+        return [o for o in range(0, end - block + 1, block) if o not in taken]
+
+    @staticmethod
+    def _truncate(path: str, size: int) -> None:
+        try:
+            if os.path.getsize(path) > size:
+                os.truncate(path, size)
+        except OSError:
+            logger.debug("could not cut %s back to %d bytes", path, size, exc_info=True)
+
+    def _ithmb_path(self, name: str) -> str:
+        """Path of the .ithmb file ``name`` (an existing one matched case-insensitively,
+        like FAT and HFS+ do)."""
+        path = os.path.join(self._artwork_dir, name)
+        if not os.path.exists(path) and os.path.isdir(self._artwork_dir):
+            want = name.lower()
+            for n in os.listdir(self._artwork_dir):
+                if n.lower() == want:
+                    return os.path.join(self._artwork_dir, n)
+        return path
+
+    def _set_slot(self, mhni: Record, name: str, offset: int) -> None:
+        header = bytearray(mhni.raw_header)
+        put32lint(header, 0x14, offset)
+        mhni.raw_header = bytes(header)
+        mhni.fields["ithumb_offset"] = offset
+        if self._mhni_file(mhni).lower() != name.lower():
+            mhni.children = [c for c in mhni.children if c.fields.get("mhod_type") != 3]
+            mhni.children.insert(0, self._create_filename_mhod(f":{name}"))
+
+    @staticmethod
+    def _mhni_file(mhni: Record) -> str:
+        """The .ithmb file name of a thumbnail, from its MHOD type 3 (":F1060_2.ithmb")."""
+        for child in mhni.children:
+            if child.fields.get("mhod_type") == 3 and child.fields.get("string"):
+                return child.fields["string"].lstrip(":").split(":")[-1]
+        return f"F{mhni.fields.get('format_id')}_1.ithmb"
+
+    @staticmethod
+    def _images(root: Optional[Record]) -> List[Record]:
+        """The MHII records of an ArtworkDB root."""
+        for mhsd in root.children if root is not None else ():
+            if mhsd.fields.get("mhsd_type") == 1 and mhsd.children:
+                return list(mhsd.children[0].children)
+        return []
+
+    @classmethod
+    def _slots(
+        cls, root: Optional[Record], skip: Optional[Set[int]] = None
+    ) -> Dict[str, Set[Tuple[int, int]]]:
+        """(offset, size) of every thumbnail of ``root`` by lower-case .ithmb file name;
+        MHNIs whose id() is in ``skip`` are left out."""
+        out: Dict[str, Set[Tuple[int, int]]] = {}
+        for mhii in cls._images(root):
+            for mhni in cls._mhnis(mhii):
+                size = mhni.fields.get("image_size", 0)
+                if size <= 0 or (skip and id(mhni) in skip):
+                    continue
+                name = cls._mhni_file(mhni).lower()
+                out.setdefault(name, set()).add((mhni.fields.get("ithumb_offset", 0), size))
+        return out
+
+    # Compact a file only when at least this share of it is unused...
     COMPACT_WASTE_RATIO = 0.5
     # ...and the disk has room for a copy of the used part plus this margin.
     COMPACT_SPACE_MARGIN = 1024 * 1024
@@ -357,34 +600,25 @@ class ArtworkManager:
     def _free_space(self) -> int:
         return shutil.disk_usage(self._artwork_dir).free
 
-    def _should_compact(self) -> bool:
-        total = live = 0
-        for fmt_id, entries in self._by_format().items():
-            path = os.path.join(self._artwork_dir, f"F{fmt_id}_1.ithmb")
-            if os.path.isfile(path):
-                total += os.path.getsize(path)
-                live += sum(size for _, _, size in entries)
-        if total == 0 or total - live < self.COMPACT_WASTE_RATIO * total:
-            return False
-        if self._free_space() < live + self.COMPACT_SPACE_MARGIN:
+    def _files_to_compact(self, by_file: Dict[str, List[Tuple[Record, int, int]]]) -> List[str]:
+        """The .ithmb files (lower-case names) worth compacting; the others stay untouched."""
+        out: List[str] = []
+        live_total = 0
+        for key, entries in by_file.items():
+            path = self._ithmb_path(self._mhni_file(entries[0][0]))
+            if not os.path.isfile(path):
+                continue
+            total = os.path.getsize(path)
+            live = sum(size for _, size in {(o, s) for _, o, s in entries})
+            waste = total - live
+            if waste <= 0 or waste < self.COMPACT_WASTE_RATIO * total:
+                continue
+            out.append(key)
+            live_total += live
+        if out and self._free_space() < live_total + self.COMPACT_SPACE_MARGIN:
             logger.info("Not compacting .ithmb files: not enough free space for the copy")
-            return False
-        return True
-
-    def _after_compaction(self) -> None:
-        self._needs_rebuild = False
-        self._pending_holes.clear()
-        self._holes = self._compute_holes()
-
-    def _release_pending_holes(self) -> None:
-        self._needs_rebuild = False
-        for fmt_id, offsets in self._pending_holes.items():
-            if fmt_id in self._hole_block:
-                self._holes.setdefault(fmt_id, []).extend(offsets)
-                self._holes[fmt_id].sort()
-        self._pending_holes.clear()
-        if not self._hole_block:
-            self._holes = self._compute_holes()
+            return []
+        return out
 
     @staticmethod
     def _mhnis(mhii: Record) -> List[Record]:
@@ -397,99 +631,69 @@ class ArtworkManager:
                 out += [c for c in child.children if c.magic == MHNI_MAGIC]
         return out
 
-    def _by_format(self) -> Dict[int, list]:
-        """(mhni, offset, size) of every referenced thumbnail, by format id."""
-        by_format: Dict[int, list] = {}
-        if self._root is None:
-            return by_format
-        for mhii in self._get_or_create_mhli().children:
+    def _by_file(self) -> Dict[str, List[Tuple[Record, int, int]]]:
+        """(mhni, offset, size) of every referenced thumbnail, by lower-case .ithmb file name
+        (a format's thumbnails may be spread over F<format>_1.ithmb, _2 ...)."""
+        by_file: Dict[str, List[Tuple[Record, int, int]]] = {}
+        for mhii in self._images(self._root):
             for mhni in self._mhnis(mhii):
-                fmt_id = mhni.fields.get("format_id")
-                offset = mhni.fields.get("ithumb_offset", 0)
                 size = mhni.fields.get("image_size", 0)
-                if fmt_id is not None and size > 0:
-                    by_format.setdefault(fmt_id, []).append((mhni, offset, size))
-        return by_format
+                if size > 0:
+                    offset = mhni.fields.get("ithumb_offset", 0)
+                    key = self._mhni_file(mhni).lower()
+                    by_file.setdefault(key, []).append((mhni, offset, size))
+        return by_file
 
-    def _compute_holes(self) -> Dict[int, List[int]]:
-        """Unreferenced slots of each .ithmb file (fixed-size, aligned thumbnails only)."""
-        holes: Dict[int, List[int]] = {}
-        self._hole_block = {}
-        for fmt_id, entries in self._by_format().items():
-            path = os.path.join(self._artwork_dir, f"F{fmt_id}_1.ithmb")
-            if not os.path.isfile(path):
-                continue
-            block = entries[0][2]
-            if any(size != block or offset % block for _, offset, size in entries):
-                continue  # mixed sizes or unaligned: no reuse for this format
-            used = {offset for _, offset, _ in entries}
-            end = os.path.getsize(path)
-            self._hole_block[fmt_id] = block
-            holes[fmt_id] = [o for o in range(0, end - block + 1, block) if o not in used]
-        return holes
-
-    def _stage_unused_file_deletions(self, tx: Transaction, by_format: Dict[int, list]) -> None:
-        """Remove .ithmb files that have no remaining entries."""
+    def _stage_unused_file_deletions(self, tx: Transaction, by_file: Dict[str, list]) -> None:
+        """Remove the .ithmb files no thumbnail references any more (when the save commits)."""
         if not os.path.isdir(self._artwork_dir):
             return
         for fname in os.listdir(self._artwork_dir):
-            if fname.startswith("F") and fname.endswith(".ithmb"):
-                parts = fname[1:].replace(".ithmb", "").split("_")
-                if len(parts) == 2:
-                    try:
-                        if int(parts[0]) not in by_format:
-                            tx.delete_on_commit(os.path.join(self._artwork_dir, fname))
-                    except ValueError:
-                        pass
+            low = fname.lower()
+            if low.startswith("f") and low.endswith(".ithmb") and low not in by_file:
+                tx.delete_on_commit(os.path.join(self._artwork_dir, fname))
 
-    def _rebuild_ithmb(self, tx: Transaction) -> None:
-        """Rewrite .ithmb files keeping only data referenced by remaining MHII records.
+    def _rebuild_ithmb(
+        self, tx: Transaction, keys: List[str], by_file: Dict[str, List[Tuple[Record, int, int]]]
+    ) -> None:
+        """Rewrite the .ithmb files ``keys`` keeping only the referenced thumbnails.
 
-        Updates MHNI offset fields so the ArtworkDB stays consistent; the new
-        files are staged in ``tx`` and the offsets are restored if it aborts.
+        Each file keeps its name; the MHNI offsets are updated so the ArtworkDB stays
+        consistent. The new files are staged in ``tx`` and the offsets are restored if it
+        aborts. Thumbnails sharing one slot keep sharing it.
         """
-        by_format = self._by_format()
-
-        new_offsets: Dict[int, int] = {}
         old_state = [
             (mhni, mhni.raw_header, mhni.fields.get("ithumb_offset", 0))
-            for es in by_format.values()
-            for mhni, _, _ in es
+            for key in keys
+            for mhni, _, _ in by_file[key]
         ]
-        old_offsets = dict(self._ithmb_offsets)
 
         def restore() -> None:
             for mhni, raw, off in old_state:
                 mhni.raw_header = raw
                 mhni.fields["ithumb_offset"] = off
-            self._ithmb_offsets = old_offsets
 
         tx.on_abort(restore)
-        for fmt_id, entries in by_format.items():
-            ithmb_path = os.path.join(self._artwork_dir, f"F{fmt_id}_1.ithmb")
-            if not os.path.isfile(ithmb_path):
-                continue
-
+        for key in keys:
+            entries = sorted(by_file[key], key=lambda e: e[1])
+            path = self._ithmb_path(self._mhni_file(entries[0][0]))
+            moved: Dict[Tuple[int, int], int] = {}
             chunks = []
-            with open(ithmb_path, "rb") as f:
-                for mhni, old_offset, size in entries:
-                    f.seek(old_offset)
-                    chunks.append((mhni, f.read(size)))
-
             new_offset = 0
-            for mhni, data in chunks:
-                header = bytearray(mhni.raw_header)
-                put32lint(header, 0x14, new_offset)
-                mhni.raw_header = bytes(header)
-                mhni.fields["ithumb_offset"] = new_offset
-                new_offset += len(data)
-            tx.stage_bytes(ithmb_path, b"".join(data for _, data in chunks))
-            new_offsets[fmt_id] = new_offset
-
-        self._stage_unused_file_deletions(tx, by_format)
-
-        self._ithmb_offsets = new_offsets
-        logger.debug("Rebuilt .ithmb files, %d formats retained", len(new_offsets))
+            with open(path, "rb") as f:
+                for mhni, old_offset, size in entries:
+                    if (old_offset, size) not in moved:
+                        f.seek(old_offset)
+                        chunk = f.read(size)
+                        chunks.append(chunk + b"\x00" * (size - len(chunk)))
+                        moved[(old_offset, size)] = new_offset
+                        new_offset += size
+                    header = bytearray(mhni.raw_header)
+                    put32lint(header, 0x14, moved[(old_offset, size)])
+                    mhni.raw_header = bytes(header)
+                    mhni.fields["ithumb_offset"] = moved[(old_offset, size)]
+            tx.stage_bytes(path, b"".join(chunks))
+        logger.debug("Compacted %d .ithmb files", len(keys))
 
     # Keep private alias for backwards compatibility within this class
     _save = save
@@ -701,6 +905,7 @@ class ArtworkManager:
         rec.raw_header = bytes(header)
         rec.raw_bytes = bytes(header) + bytes(body)
         rec.fields["mhod_type"] = 3
+        rec.fields["string"] = filename
         return rec
 
     def _create_mhif(self, format_id: int, img_size: int) -> Record:

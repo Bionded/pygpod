@@ -6,6 +6,7 @@ Preserves unknown fields and padding for round-trip integrity.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import struct
 from typing import Any, Dict, List, Optional
@@ -31,6 +32,26 @@ from .constants import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The damage list of a partial parse (parse_itunesdb(data, damage=[])), else None: strict
+_DAMAGE: "contextvars.ContextVar[Optional[List[str]]]" = contextvars.ContextVar(
+    "pygpod_parse_damage", default=None
+)
+
+
+def _damaged(what: str, pos: int, end: int, found: int, declared: Optional[int] = None) -> None:
+    """A list ended before its end: raise ParseError, or note it in a partial parse.
+
+    Saving what was read would silently drop everything after the damaged record (also
+    intact records behind it), so a normal parse refuses.
+    """
+    counts = f"{found} of {declared} records read" if declared is not None else f"{found} read"
+    msg = f"damaged {what} at offset {pos}: {counts}, {max(0, end - pos)} bytes not parsed"
+    damage = _DAMAGE.get()
+    if damage is None:
+        raise ParseError(msg)
+    logger.warning("iTunesDB: %s", msg)
+    damage.append(msg)
 
 
 class Record:
@@ -106,22 +127,31 @@ def _advance(data: bytes, pos: int, child: "Record", end: int) -> int:
 
 def _parse_mhod_children(data: bytes, rec: Record, pos: int, end: int, count: int) -> int:
     """Parse MHOD children into rec, returning new position."""
+    found = 0
     for _ in range(count):
         if pos + 12 > end or pos + 12 > len(data):
             break
         if data[pos : pos + 4] != MHOD_MAGIC:
+            # a count larger than the MHODs present is harmless when the record ends here
+            # (its other children may follow); unknown bytes inside it are not
+            if rec.magic != MHYP_MAGIC:
+                _damaged(f"{rec.magic.decode('latin-1')} data object list", pos, end, found, count)
             break
         mhod = _parse_mhod(data, pos)
         rec.children.append(mhod)
         pos = _advance(data, pos, mhod, end)
+        found += 1
     return pos
 
 
-def parse_itunesdb(data: bytes) -> Record:
+def parse_itunesdb(data: bytes, damage: Optional[List[str]] = None) -> Record:
     """Parse an iTunesDB binary blob into a tree of Record objects.
 
     Args:
         data: Raw bytes of the iTunesDB file.
+        damage: None (default): a list that ends early at a damaged record (wrong magic,
+            not enough records for its count) raises ParseError. A list: parse what is
+            readable and append a description of every damaged place to it.
 
     Returns:
         Root MHBD Record with all children parsed.
@@ -141,10 +171,13 @@ def parse_itunesdb(data: bytes) -> Record:
         raise ParseError(f"Invalid mhbd header: header_len={header_len}, total_len={total_len}")
     if total_len > len(data):
         raise ParseError(f"Truncated iTunesDB: header says {total_len} bytes, file has {len(data)}")
+    token = _DAMAGE.set(damage)
     try:
         return _parse_mhbd(data, 0)
     except (struct.error, IndexError) as e:
         raise ParseError(f"Malformed iTunesDB: {e}") from e
+    finally:
+        _DAMAGE.reset(token)
 
 
 def _parse_mhbd(data: bytes, offset: int) -> Record:
@@ -197,6 +230,7 @@ def _parse_mhbd(data: bytes, offset: int) -> Record:
             break
         child_magic = data[pos : pos + 4]
         if child_magic != MHSD_MAGIC:
+            _damaged("section list", pos, end, len(rec.children), rec.fields["num_children"])
             break
         child = _parse_mhsd(data, pos)
         rec.children.append(child)
@@ -259,8 +293,9 @@ def _parse_mhlt(data: bytes, offset: int, end: int) -> Record:
     rec.fields["num_tracks"] = num_tracks
 
     pos = offset + header_len
-    for _ in range(num_tracks):
+    for i in range(num_tracks):
         if pos + 4 > len(data) or data[pos : pos + 4] != MHIT_MAGIC:
+            _damaged("track list", pos, end, i, num_tracks)
             break
         track = _parse_mhit(data, pos)
         rec.children.append(track)
@@ -506,8 +541,9 @@ def _parse_mhlp(data: bytes, offset: int, end: int) -> Record:
     rec.fields["num_playlists"] = num_playlists
 
     pos = offset + header_len
-    for _ in range(num_playlists):
+    for i in range(num_playlists):
         if pos + 4 > len(data) or data[pos : pos + 4] != MHYP_MAGIC:
+            _damaged("playlist list", pos, end, i, num_playlists)
             break
         playlist = _parse_mhyp(data, pos)
         rec.children.append(playlist)
@@ -551,10 +587,11 @@ def _parse_mhyp(data: bytes, offset: int) -> Record:
     pos = _parse_mhod_children(data, rec, offset + header_len, end, f["num_mhods"])
 
     # Parse MHIPs
-    for _ in range(f["num_mhips"]):
+    for i in range(f["num_mhips"]):
         if pos + 12 > end or pos + 12 > len(data):
             break
         if data[pos : pos + 4] != MHIP_MAGIC:
+            _damaged("playlist", pos, end, i, f["num_mhips"])
             break
         mhip = _parse_mhip(data, pos)
         rec.children.append(mhip)
@@ -617,6 +654,7 @@ def _parse_mhla(data: bytes, offset: int, end: int) -> Record:
                     rec.children.append(child)
                     pos = _advance(data, pos, child, end)
                 else:
+                    _damaged("album list", pos, end, len(rec.children), num_albums)
                     break
             else:
                 break
@@ -674,6 +712,7 @@ def _parse_mhli(data: bytes, offset: int, end: int) -> Record:
                     rec.children.append(child)
                     pos = _advance(data, pos, child, end)
                 else:
+                    _damaged("artist list", pos, end, len(rec.children), num_artists)
                     break
             else:
                 break

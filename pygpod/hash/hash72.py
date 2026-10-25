@@ -208,10 +208,15 @@ def read_hash_info(path: str, firewire_guid: Optional[str] = None) -> Optional[T
     return data[38:54], data[26:38]
 
 
+def hash_info_bytes(firewire_guid: str, iv: bytes, random_bytes: bytes) -> bytes:
+    """The content of a libgpod-compatible HashInfo file."""
+    return HASH_INFO_HEADER + _uuid_bytes(firewire_guid) + random_bytes[:12] + iv[:16]
+
+
 def write_hash_info(path: str, firewire_guid: str, iv: bytes, random_bytes: bytes) -> None:
     """Write a libgpod-compatible HashInfo file."""
     with open(path, "wb") as f:
-        f.write(HASH_INFO_HEADER + _uuid_bytes(firewire_guid) + random_bytes[:12] + iv[:16])
+        f.write(hash_info_bytes(firewire_guid, iv, random_bytes))
 
 
 def _get_aes_backend():

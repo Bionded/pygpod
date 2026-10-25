@@ -12,7 +12,7 @@ import math
 import os
 import re
 import struct
-from typing import Any, Dict, NamedTuple, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -544,9 +544,10 @@ _STILL_IMAGE_TYPES = {b"jpeg", b"png ", b"mjpa", b"mjpb", b"gif ", b"tiff", b"bm
 
 
 def mp4_has_video(filepath: str) -> bool:
-    """True if the MP4/M4V/MOV file has a real video track: an enabled 'vide' track whose
-    samples are not still images (chapter pictures of enhanced podcasts and audiobooks
-    are jpeg/png tracks and do not count)."""
+    """True if the MP4/M4V/MOV file has a real video track: an enabled 'vide' track that is
+    not the chapter-picture track of another track ('chap' track reference, as in enhanced
+    podcasts and audiobooks) and, if its samples are still images (JPEG, PNG, ...), has
+    more than one of them (a Motion-JPEG video is video, a single picture is not)."""
     try:
         with open(filepath, "rb") as f:
             f.seek(0, os.SEEK_END)
@@ -554,8 +555,14 @@ def mp4_has_video(filepath: str) -> bool:
             for kind, start, end in _mp4_atoms(f, 0, size):
                 if kind != b"moov":
                     continue
-                for tkind, tstart, tend in _mp4_atoms(f, start, end):
-                    if tkind == b"trak" and _is_video_trak(f, tstart, tend):
+                traks = [(s, e) for k, s, e in _mp4_atoms(f, start, end) if k == b"trak"]
+                chapters = set()
+                for tstart, tend in traks:
+                    chapters.update(_chapter_track_ids(f, tstart, tend))
+                for tstart, tend in traks:
+                    if _track_id(f, tstart, tend) not in chapters and _is_video_trak(
+                        f, tstart, tend
+                    ):
                         return True
     except OSError:
         logger.debug("Could not read %s", filepath, exc_info=True)
@@ -591,8 +598,43 @@ def _is_video_trak(f: Any, start: int, end: int) -> bool:
     if stsd is not None and stsd[1] - stsd[0] >= 16:
         f.seek(stsd[0] + 12)  # version/flags, entry count, first entry size
         if f.read(4) in _STILL_IMAGE_TYPES:
-            return False
+            return _sample_count(f, stbl) > 1  # one picture is no video, Motion-JPEG is
     return True
+
+
+def _track_id(f: Any, start: int, end: int) -> Optional[int]:
+    """Track ID from the 'tkhd' atom of a 'trak' (None if missing or short)."""
+    tkhd = _child_atom(f, start, end, b"tkhd")
+    if tkhd is None:
+        return None
+    f.seek(tkhd[0])
+    version = f.read(1)
+    offset = 20 if version == b"\x01" else 12  # after version/flags and two 8/4-byte dates
+    if tkhd[1] - tkhd[0] < offset + 4:
+        return None
+    f.seek(tkhd[0] + offset)
+    return struct.unpack(">I", f.read(4))[0]
+
+
+def _chapter_track_ids(f: Any, start: int, end: int) -> List[int]:
+    """IDs of the tracks a 'trak' names as its chapter track ('tref'/'chap')."""
+    tref = _child_atom(f, start, end, b"tref")
+    chap = _child_atom(f, *tref, b"chap") if tref else None
+    if chap is None:
+        return []
+    f.seek(chap[0])
+    data = f.read(chap[1] - chap[0])
+    return [struct.unpack(">I", data[i : i + 4])[0] for i in range(0, len(data) - 3, 4)]
+
+
+def _sample_count(f: Any, stbl) -> int:
+    """Number of samples in an 'stbl' (its 'stsz'/'stz2' atom; 0 if unknown)."""
+    for kind in (b"stsz", b"stz2"):
+        atom = _child_atom(f, *stbl, kind)
+        if atom is not None and atom[1] - atom[0] >= 12:
+            f.seek(atom[0] + 8)  # version/flags, sample size (stz2: reserved, field size)
+            return struct.unpack(">I", f.read(4))[0]
+    return 0
 
 
 def extract_artwork(filepath: str) -> Optional[bytes]:

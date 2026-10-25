@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import numbers
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from ..db.constants import (
@@ -49,6 +50,36 @@ if TYPE_CHECKING:
     from .chapterdata import ChapterData
 
 logger = logging.getLogger(__name__)
+
+
+# Numeric MHIT fields as add_track() keyword arguments: width in bits (unsigned)
+NUMERIC_FIELD_BITS = {
+    "track_number": 32,
+    "total_tracks": 32,
+    "year": 32,
+    "cd_number": 32,
+    "total_cds": 32,
+    "play_count": 32,
+    "skip_count": 32,
+    "bookmark_time": 32,
+    "season_number": 32,
+    "episode_number": 32,
+    "media_type": 32,
+    "bpm": 16,
+    "explicit_flag": 16,
+}
+
+
+def checked_int(key: str, value: Any, bits: int, signed: bool = False) -> int:
+    """``value`` as an int that fits the field (ValueError otherwise): the database stores
+    fixed-width integers, and a value that does not fit would silently wrap around."""
+    if not isinstance(value, numbers.Integral):
+        raise ValueError(f"{key} must be an integer, not {value!r}")
+    value = int(value)
+    lo, hi = (-(1 << (bits - 1)), (1 << (bits - 1)) - 1) if signed else (0, (1 << bits) - 1)
+    if not lo <= value <= hi:
+        raise ValueError(f"{key} must be between {lo} and {hi}: {value}")
+    return value
 
 
 class Track:
@@ -140,12 +171,16 @@ class Track:
             self._record.raw_header = bytes(header)
             self._touch()
 
-    def _set_field_and_header_u32(self, key: str, offset: int, value: int) -> None:
+    def _set_field_and_header_u32(
+        self, key: str, offset: int, value: int, signed: bool = False
+    ) -> None:
+        value = checked_int(key, value, 32, signed)
         if self._record:
             self._record.fields[key] = value
         self._set_header_u32(offset, value)
 
     def _set_field_and_header_u8(self, key: str, offset: int, value: int) -> None:
+        value = checked_int(key, value, 8)
         if self._record:
             self._record.fields[key] = value
         self._set_header_u8(offset, value)
@@ -423,6 +458,7 @@ class Track:
 
     @rating.setter
     def rating(self, value: int) -> None:
+        value = checked_int("rating", value, 32, signed=True)
         self._set_field_and_header_u8("rating", 0x1F, max(0, min(100, value)))
 
     @property
@@ -432,7 +468,7 @@ class Track:
 
     @rating_stars.setter
     def rating_stars(self, value: int) -> None:
-        self.rating = max(0, min(5, value)) * 20
+        self.rating = max(0, min(5, checked_int("rating_stars", value, 32, signed=True))) * 20
 
     @property
     def bpm(self) -> int:
@@ -443,6 +479,7 @@ class Track:
         self._set_field_and_header_u16("bpm", 0x7A, value)
 
     def _set_field_and_header_u16(self, key: str, offset: int, value: int) -> None:
+        value = checked_int(key, value, 16)
         if self._record:
             self._record.fields[key] = value
         self._set_header_u16(offset, value)
@@ -534,7 +571,8 @@ class Track:
 
     @volume.setter
     def volume(self, value: int) -> None:
-        self._set_field_and_header_u32("volume", 0x40, max(-255, min(255, value)))
+        value = checked_int("volume", value, 32, signed=True)
+        self._set_field_and_header_u32("volume", 0x40, max(-255, min(255, value)), signed=True)
 
     @property
     def start_time(self) -> int:
@@ -698,7 +736,8 @@ class Track:
 
     @property
     def has_artwork(self) -> bool:
-        return bool(self._get_field("has_artwork", 0))
+        """True if the track has cover art (MHIT 0xA4 is 1; libgpod and iTunes write 2 for none)."""
+        return self._get_field("has_artwork", 0) == 1
 
     @property
     def mhii_link(self) -> int:

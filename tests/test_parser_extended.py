@@ -348,10 +348,15 @@ class TestParseMhodChildren:
         mhsd_data = _make_mhsd(1, mhlt_data)
         db = _make_mhbd([mhsd_data])
 
-        root = parse_itunesdb(db)
+        # unknown bytes inside the track would be dropped by the next save: refused
+        with pytest.raises(ParseError, match="damaged"):
+            parse_itunesdb(db)
+        damage = []
+        root = parse_itunesdb(db, damage=damage)
         track = root.children[0].children[0].children[0]
         # Only 1 MHOD parsed; second slot had wrong magic and broke
         assert len(track.children) == 1
+        assert len(damage) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +378,11 @@ class TestParseMhbdChildren:
         buf = bytearray(db) + garbage
         # Update MHBD total_len
         struct.pack_into("<I", buf, 8, len(buf))
-        root = parse_itunesdb(bytes(buf))
+        with pytest.raises(ParseError, match="damaged"):  # strict by default
+            parse_itunesdb(bytes(buf))
+        damage = []
+        root = parse_itunesdb(bytes(buf), damage=damage)
+        assert len(damage) == 1
         # Should only parse 1 MHSD child, stopping at garbage
         assert len(root.children) == 1
 
@@ -595,7 +604,11 @@ class TestParseMhlaUnknownChildren:
         mhsd = _make_mhsd(4, mhla)
         db = _make_mhbd([mhsd])
 
-        root = parse_itunesdb(db)
+        with pytest.raises(ParseError, match="damaged"):  # strict by default
+            parse_itunesdb(db)
+        damage = []
+        root = parse_itunesdb(db, damage=damage)
+        assert len(damage) == 1
         mhla_rec = root.children[0].children[0]
         assert len(mhla_rec.children) == 0  # Broke out of loop
 
@@ -652,7 +665,11 @@ class TestParseMhlt:
         mhsd = _make_mhsd(1, mhlt_data)
         db = _make_mhbd([mhsd])
 
-        root = parse_itunesdb(db)
+        with pytest.raises(ParseError, match="damaged"):  # strict by default
+            parse_itunesdb(db)
+        damage = []
+        root = parse_itunesdb(db, damage=damage)
+        assert len(damage) == 1
         mhlt_rec = root.children[0].children[0]
         assert len(mhlt_rec.children) == 1  # Only parsed first track
 
@@ -686,7 +703,11 @@ class TestParseMhlp:
         mhsd = _make_mhsd(2, mhlp_data)
         db = _make_mhbd([mhsd])
 
-        root = parse_itunesdb(db)
+        with pytest.raises(ParseError, match="damaged"):  # strict by default
+            parse_itunesdb(db)
+        damage = []
+        root = parse_itunesdb(db, damage=damage)
+        assert len(damage) == 1
         mhlp_rec = root.children[0].children[0]
         assert len(mhlp_rec.children) == 1  # Only parsed first playlist
 
@@ -722,7 +743,11 @@ class TestParseMhyp:
         mhsd = _make_mhsd(2, mhlp)
         db = _make_mhbd([mhsd])
 
-        root = parse_itunesdb(db)
+        with pytest.raises(ParseError, match="damaged"):  # strict by default
+            parse_itunesdb(db)
+        damage = []
+        root = parse_itunesdb(db, damage=damage)
+        assert len(damage) == 1
         mhyp_rec = root.children[0].children[0].children[0]
         # Should have 1 MHOD + 1 MHIP = 2 children; garbage MHIP was skipped
         mhip_children = [c for c in mhyp_rec.children if c.magic == b"mhip"]

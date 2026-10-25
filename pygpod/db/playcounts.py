@@ -413,8 +413,13 @@ def apply_play_counts(tracks: list, entries: List[PlayCountEntry]) -> int:
     Returns:
         Number of tracks updated.
     """
+    return apply_matched_play_counts(match_play_counts(tracks, entries))
+
+
+def apply_matched_play_counts(pairs: list) -> int:
+    """Apply (track, entry) pairs from match_play_counts(); returns the number of tracks updated."""
     updated = 0
-    for track, entry in match_play_counts(tracks, entries):
+    for track, entry in pairs:
         if not track.record:
             continue
 

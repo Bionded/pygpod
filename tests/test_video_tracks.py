@@ -263,3 +263,63 @@ def test_disabled_video_track_does_not_count(tmp_path):
     off = tmp_path / "off.m4v"
     off.write_bytes(bytes(data))
     assert not mp4_has_video(str(off))
+
+
+def _add_chapter_reference(src, dest, chapter_track_id=2):
+    """Copy an MP4 whose moov follows mdat, with a 'tref'/'chap' atom in its first track
+    pointing at `chapter_track_id` (how enhanced podcasts and audiobooks link their chapter
+    pictures). Atoms after mdat move, so no chunk offset changes."""
+    import struct as st
+
+    data = bytearray(open(src, "rb").read())
+
+    def atoms(start, end):
+        pos = start
+        while pos + 8 <= end:
+            size = st.unpack(">I", data[pos : pos + 4])[0]
+            yield bytes(data[pos + 4 : pos + 8]), pos, size
+            pos += size
+
+    kinds = [k for k, _, _ in atoms(0, len(data))]
+    assert kinds.index(b"mdat") < kinds.index(b"moov")
+    moov, moov_size = next((p, s) for k, p, s in atoms(0, len(data)) if k == b"moov")
+    trak, trak_size = next((p, s) for k, p, s in atoms(moov + 8, moov + moov_size) if k == b"trak")
+    tref = st.pack(">I4sI4sI", 20, b"tref", 12, b"chap", chapter_track_id)
+    data[trak + 8 : trak + 8] = tref
+    st.pack_into(">I", data, trak, trak_size + len(tref))
+    st.pack_into(">I", data, moov, moov_size + len(tref))
+    with open(dest, "wb") as f:
+        f.write(data)
+    return dest
+
+
+def _mjpeg_with_audio(path, rate, fmt):
+    _ffmpeg(
+        "-f", "lavfi", "-i", "sine=duration=1", "-f", "lavfi",
+        "-i", f"color=c=red:s=64x48:d=1:r={rate}", "-map", "0", "-map", "1",
+        "-c:a", "aac", "-c:v", "mjpeg", "-pix_fmt", "yuvj420p", "-f", fmt, str(path),
+    )  # fmt: skip
+    return str(path)
+
+
+@needs_ffmpeg
+def test_motion_jpeg_mov_is_video(tmp_path):
+    # QuickTime stores Motion-JPEG with the same 'jpeg' sample entry as a chapter picture
+    mov = _mjpeg_with_audio(tmp_path / "camera.mov", 5, "mov")
+    assert b"jpeg" in open(mov, "rb").read()
+    assert mp4_has_video(mov)
+    assert read_tags(mov)["media_type"] == MEDIATYPE_VIDEO
+    still = _mjpeg_with_audio(tmp_path / "still.mov", 1, "mov")  # one frame: a picture
+    assert not mp4_has_video(still)
+    assert "media_type" not in read_tags(still)
+
+
+@needs_ffmpeg
+def test_chapter_picture_track_is_not_video(tmp_path):
+    plain = _mjpeg_with_audio(tmp_path / "plain.mp4", 3, "mp4")
+    assert mp4_has_video(plain)  # three enabled MJPEG frames without a reference: video
+    pod = _add_chapter_reference(plain, str(tmp_path / "episode.mp4"))
+    assert not mp4_has_video(pod)
+    assert "media_type" not in read_tags(pod)
+    mov = _mjpeg_with_audio(tmp_path / "plain.mov", 3, "mov")
+    assert not mp4_has_video(_add_chapter_reference(mov, str(tmp_path / "chapters.mov")))

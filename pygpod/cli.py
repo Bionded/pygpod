@@ -911,7 +911,8 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     from .model.database import Database
 
     mp = _get_mountpoint(args)
-    db = Database(mp, apply_play_counts=False, recover=False)  # writes nothing
+    # writes nothing; a damaged database is reported instead of refused
+    db = Database(mp, apply_play_counts=False, recover=False, partial=True)
     report = db.check()
     if args.no_verbose:
         print(report.summary())
@@ -928,11 +929,11 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     print()
     actions = db.repair(report, delete_orphans=args.delete_orphans)
     if "interrupted_commit" in report.kinds():  # completed: repair the database as it is now
-        db = Database(mp, apply_play_counts=False)
+        db = Database(mp, apply_play_counts=False, partial=True)
         actions += db.repair(delete_orphans=args.delete_orphans)
     for a in actions:
         print(f"{'done' if a.done else 'skipped':7} {a.kind:24} {a.subject}: {a.action}")
-    after = Database(mp, apply_play_counts=False).check()
+    after = Database(mp, apply_play_counts=False, partial=True).check()
     print(f"After repair: {after.summary()}")
     return 1 if after else 0
 

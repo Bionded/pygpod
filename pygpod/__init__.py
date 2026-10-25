@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,7 @@ from .device.device import Device
 from .device.mountpoint import init_ipod, validate_mountpoint
 from .doctor import CheckReport, Issue, RepairAction
 from .exceptions import (
+    ArtworkDBError,
     ArtworkError,
     ConflictError,
     DatabaseError,
@@ -335,6 +336,7 @@ __all__ = [
     "TrackError",
     "PlaylistError",
     "ArtworkError",
+    "ArtworkDBError",
     "DependencyError",
     "UnsupportedFormatError",
     "__version__",

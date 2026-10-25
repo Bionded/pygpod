@@ -47,6 +47,15 @@ class ArtworkError(PyGpodError):
     """Error related to artwork operations."""
 
 
+class ArtworkDBError(ArtworkError):
+    """The ArtworkDB on the iPod exists but cannot be read (corrupt or an I/O error).
+
+    Cover art cannot be added or changed until ``Database.reset_artwork()`` replaces it
+    with an empty one; saving tracks without artwork changes still works and leaves the
+    file as it is.
+    """
+
+
 class DependencyError(PyGpodError):
     """A required optional dependency is not installed."""
 

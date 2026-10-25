@@ -803,3 +803,15 @@ def test_sort_index_order_matches_libgpod_for_ascii(tool, tmp_path):
             _pygpod_build(mp, mp3, rows)
         mhods[who] = _sort_records(open(f"{mp}/iPod_Control/iTunes/iTunesDB", "rb").read())[0]
     assert mhods["pygpod"] == mhods["libgpod"]
+
+
+def test_playlist_order_after_remove_and_add_read_by_libgpod(tool, ipod):
+    mp, mp3 = ipod
+    with Database(mp) as db:
+        a, b, c = (db.add_track(mp3, title=t) for t in ("Аркан", "Бандура", "Вербова"))
+        pl = db.create_playlist("Танці")
+        db.add_track_to_playlist(pl, a)
+        db.add_track_to_playlist(pl, b)
+        db.remove_track_from_playlist(pl, a)
+        db.add_track_to_playlist(pl, c)
+    assert _dump(tool, mp)[1]["Танці"]["members"] == ["Бандура", "Вербова"]

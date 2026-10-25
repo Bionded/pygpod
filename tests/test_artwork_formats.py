@@ -140,6 +140,30 @@ class TestArtworkManager:
         # Falls back to classic formats
         assert len(mgr.formats) > 0
 
+    def test_cover_decoded_once_for_all_formats(self, writable_ipod, monkeypatch):
+        import io
+
+        Image = pytest.importorskip("PIL.Image")
+
+        from pygpod.device.models import IpodGeneration
+        from pygpod.model import artwork_manager
+        from pygpod.model.artwork_manager import ArtworkManager
+
+        calls = []
+        real = artwork_manager._open_rgb
+
+        def counting(image):
+            calls.append(image)
+            return real(image)
+
+        monkeypatch.setattr(artwork_manager, "_open_rgb", counting)
+        buf = io.BytesIO()
+        Image.new("RGB", (600, 600), (200, 30, 90)).save(buf, "JPEG")
+        mgr = ArtworkManager(writable_ipod, generation=IpodGeneration.CLASSIC_1)
+        assert len(mgr.formats) > 1
+        assert mgr.add_artwork_data(0x1234, buf.getvalue()) is not None
+        assert len(calls) == 1
+
     def test_reset(self, writable_ipod):
         import os
 
@@ -243,6 +267,7 @@ class TestArtworkManager:
         id1 = mgr.add_artwork_data(dbid=1, art_data=art_data, save=False)
         id2 = mgr.add_artwork_data(dbid=2, art_data=art_data, save=False)
         assert id1 is not None and id2 is not None
+        mgr.save()  # thumbnails are written to the .ithmb files with the save
 
         art_dir = os.path.join(writable_ipod, "iPod_Control", "Artwork")
         # Record sizes with both entries present
@@ -251,6 +276,7 @@ class TestArtworkManager:
             for f in os.listdir(art_dir)
             if f.endswith(".ithmb")
         }
+        assert sizes_two
 
         mgr.remove_artwork(id1)
         mgr.save()

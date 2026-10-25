@@ -10,6 +10,7 @@ handle:
 - `HashError`: the database cannot be signed (missing FirewireGuid or HashInfo, unsupported
   scheme); nothing was written;
 - `ConflictError`: another program saved the database meanwhile; reopen, or `save(force=True)`;
+- `ArtworkDBError`: the ArtworkDB is damaged; covers cannot change until `reset_artwork()`;
 - `BackupError`: an archive is damaged or does not fit this iPod.
 
 ```python
@@ -113,6 +114,18 @@ Base: `PyGpodError`
 
 ```text
 Error related to artwork operations.
+```
+
+### `pygpod.ArtworkDBError`
+
+Base: `ArtworkError`
+
+```text
+The ArtworkDB on the iPod exists but cannot be read (corrupt or an I/O error).
+
+Cover art cannot be added or changed until ``Database.reset_artwork()`` replaces it
+with an empty one; saving tracks without artwork changes still works and leaves the
+file as it is.
 ```
 
 ### `pygpod.DependencyError`

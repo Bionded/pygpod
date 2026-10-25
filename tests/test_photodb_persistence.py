@@ -578,3 +578,199 @@ def test_complete_master_album_resave_is_byte_identical(writable_ipod, tmp_path)
     assert loaded._not_in_master == 0
     loaded.save()
     assert _db_bytes(mp) == before
+
+
+# ---- failed saves: the database on the iPod and its thumbnails stay intact ----
+
+
+def _photo_files(mp):
+    """Every file below Photos/ (relative path -> bytes)."""
+    root = os.path.join(mp, "Photos")
+    out = {}
+    for d, _, names in os.walk(root):
+        for name in names:
+            path = os.path.join(d, name)
+            with open(path, "rb") as fh:
+                out[os.path.relpath(path, root)] = fh.read()
+    return out
+
+
+def _refs(db):
+    return [
+        (p.photo_id, t.format_id, t.ithmb_file, t.image_offset, t.image_size)
+        for p in db.photos
+        for t in p.thumbnails
+    ]
+
+
+def _fail_database_write(monkeypatch):
+    """Make writing the Photo Database file fail (e.g. the iPod is full or unplugged)."""
+    from pygpod.db.transaction import Transaction
+
+    real = Transaction.stage_bytes
+
+    def stage_bytes(self, target, data):
+        if os.path.basename(target) == "Photo Database":
+            raise OSError(28, "No space left on device")
+        return real(self, target, data)
+
+    monkeypatch.setattr(Transaction, "stage_bytes", stage_bytes)
+
+
+def test_failed_database_writes_keep_old_thumbnails_and_retry_is_safe(
+    writable_ipod, tmp_path, monkeypatch
+):
+    mp = writable_ipod
+    db = PhotoDB(mp, generation=CLASSIC)
+    a = db.add_photo(_image(tmp_path / "червоне.png", (255, 0, 0)))
+    db.save()
+    on_disk = _photo_files(mp)
+    first = _content(PhotoDB(mp), mp)
+
+    db = PhotoDB(mp, generation=CLASSIC)
+    b = db.add_photo(_image(tmp_path / "синє.png", (0, 0, 255)))
+    new_pixels = {t.format_id: t._pixel_data for t in b.thumbnails}
+    refs = _refs(db)
+    with monkeypatch.context() as m:
+        _fail_database_write(m)
+        for _ in range(2):  # the second attempt must not reuse the first one's addresses
+            with pytest.raises(OSError):
+                db.save()
+            assert _photo_files(mp) == on_disk  # byte-identical, no staging files left
+            assert _refs(db) == refs
+            assert {t.format_id: t._pixel_data for t in b.thumbnails} == new_pixels
+            assert _content(PhotoDB(mp), mp) == first
+
+    db.save()
+    content = _content(PhotoDB(mp), mp)
+    assert {k: v for k, v in content.items() if k[0] == a.photo_id} == first
+    assert {f: v for (pid, f), v in content.items() if pid == b.photo_id} == new_pixels
+    names = sorted(os.listdir(_thumbs_dir(mp)))
+    assert len(names) == 3 and all(n.endswith(".ithmb") for n in names)  # old files removed
+
+
+def test_failed_commit_keeps_old_thumbnails(writable_ipod, tmp_path, monkeypatch):
+    from pygpod.db.transaction import Transaction
+
+    mp = writable_ipod
+    db = PhotoDB(mp, generation=CLASSIC)
+    db.add_photo(_image(tmp_path / "a.png", (10, 200, 10)))
+    db.save()
+    on_disk = _photo_files(mp)
+
+    db = PhotoDB(mp, generation=CLASSIC)
+    db.remove_photo(db.photos[0])
+    db.add_photo(_image(tmp_path / "b.png", (200, 10, 200)))
+    refs = _refs(db)
+
+    def commit(self):
+        raise OSError(5, "Input/output error")
+
+    with monkeypatch.context() as m:
+        m.setattr(Transaction, "commit", commit)
+        with pytest.raises(OSError):
+            db.save()
+    assert _photo_files(mp) == on_disk
+    assert _refs(db) == refs
+    db.save()
+    [p] = PhotoDB(mp).photos
+    assert all(d for d in _content(PhotoDB(mp), mp).values())
+    assert len(os.listdir(_thumbs_dir(mp))) == len(p.thumbnails)
+
+
+def test_save_refuses_while_an_interrupted_commit_is_pending(writable_ipod, tmp_path):
+    from pygpod.db.transaction import JOURNAL_NAME
+
+    mp = writable_ipod
+    db = PhotoDB(mp, generation=CLASSIC)
+    db.add_photo(_image(tmp_path / "a.png", (1, 2, 3)))
+    journal = os.path.join(mp, "iPod_Control", "iTunes", JOURNAL_NAME)
+    with open(journal, "w") as fh:
+        fh.write('{"replace": [], "delete": []}')
+    with pytest.raises(ArtworkError, match="interrupted save"):
+        db.save()  # writing its own journal would lose the pending one
+    assert not os.path.exists(os.path.join(mp, "Photos", "Photo Database"))
+
+
+@pytest.mark.parametrize("photos, thumbs", [("Photos", "Thumbs"), ("PHOTOS", "THUMBS")])
+def test_recover_removes_staged_photo_files(writable_ipod, photos, thumbs):
+    from pygpod.db import transaction
+
+    mp = writable_ipod
+    thumbs_dir = os.path.join(mp, photos, thumbs)
+    os.makedirs(thumbs_dir)
+    staged = [
+        os.path.join(mp, photos, "Photo Database" + transaction.STAGING_SUFFIX),
+        os.path.join(thumbs_dir, "F1024_2.ithmb" + transaction.STAGING_SUFFIX),
+    ]
+    for path in staged:
+        with open(path, "wb") as fh:
+            fh.write(b"x")
+    assert sorted(transaction.leftover_files(mp)) == sorted(staged)
+    assert transaction.recover(mp) == "rolled-back"
+    assert not any(os.path.exists(p) for p in staged)
+
+
+@pytest.mark.libgpod
+def test_libgpod_reads_the_database_saved_after_a_failed_save(
+    tool, writable_ipod, tmp_path, monkeypatch
+):
+    import subprocess
+
+    mp = writable_ipod
+    db = PhotoDB(mp, generation=CLASSIC)
+    a = db.add_photo(_image(tmp_path / "a.png", (255, 0, 0)))
+    db.save()
+    db = PhotoDB(mp, generation=CLASSIC)
+    b = db.add_photo(_image(tmp_path / "b.png", (0, 255, 0)))
+    with monkeypatch.context() as m:
+        _fail_database_write(m)
+        with pytest.raises(OSError):
+            db.save()
+    db.save()
+    out = subprocess.run([tool, "dump-photos", mp], capture_output=True, text=True, check=True)
+    assert sorted(ln for ln in out.stdout.splitlines() if ln.startswith("I")) == sorted(
+        [f"I\t{a.photo_id}\t1", f"I\t{b.photo_id}\t1"]
+    )
+
+
+def test_crash_after_the_commit_point_rolls_forward(writable_ipod, tmp_path, monkeypatch):
+    from pygpod.db import transaction
+
+    mp = writable_ipod
+    db = PhotoDB(mp, generation=CLASSIC)
+    a = db.add_photo(_image(tmp_path / "a.png", (255, 0, 0)))
+    db.save()
+    first = _content(PhotoDB(mp), mp)
+    db = PhotoDB(mp, generation=CLASSIC)
+    b = db.add_photo(_image(tmp_path / "b.png", (0, 0, 255)))
+    new_pixels = {t.format_id: t._pixel_data for t in b.thumbnails}
+
+    def crash(mountpoint):
+        raise OSError(5, "Input/output error")
+
+    with monkeypatch.context() as m:
+        m.setattr(transaction, "_apply_journal", crash)
+        with pytest.raises(OSError):
+            db.save()
+    assert transaction.recover(mp) == "rolled-forward"
+    assert _refs(PhotoDB(mp)) == _refs(db)  # the journal took effect: the new addresses hold
+    content = _content(PhotoDB(mp), mp)
+    assert {k: v for k, v in content.items() if k[0] == a.photo_id} == first
+    assert {f: v for (pid, f), v in content.items() if pid == b.photo_id} == new_pixels
+
+
+def test_save_waits_for_no_other_writer(writable_ipod, tmp_path):
+    from pygpod.db import writelock
+    from pygpod.exceptions import ConflictError
+
+    mp = writable_ipod
+    db = PhotoDB(mp, generation=CLASSIC)
+    db.add_photo(_image(tmp_path / "зелене.png", (0, 255, 0)))
+    before = _photo_files(mp)
+    with writelock.writer_lock(os.path.join(mp, "iPod_Control", "iTunes")):
+        with pytest.raises(ConflictError):  # e.g. a Database.save() of another process
+            db.save()
+    assert _photo_files(mp) == before
+    db.save()
+    assert len(PhotoDB(mp).photos) == 1

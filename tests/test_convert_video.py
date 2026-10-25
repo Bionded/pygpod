@@ -265,3 +265,118 @@ def test_probe_video_without_output_returns_none(tmp_path, monkeypatch):
     done = subprocess.CompletedProcess([], 0, stdout=None, stderr=None)
     monkeypatch.setattr(convert.subprocess, "run", lambda cmd, **kwargs: done)
     assert convert.probe_video(src) is None
+
+
+def _mjpeg_avi(path, audio=True):
+    """1 s 64x48 Motion-JPEG AVI (5 frames), with PCM audio: a video, not cover art."""
+    args = ["-f", "lavfi", "-i", "testsrc=size=64x48:rate=5"]
+    if audio:
+        args += ["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100", "-c:a", "pcm_s16le"]
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", *args, "-t", "1", "-c:v", "mjpeg",
+         "-pix_fmt", "yuvj420p", str(path)],
+        check=True,
+        timeout=60,
+    )  # fmt: skip
+    return str(path)
+
+
+def test_motion_jpeg_avi_becomes_a_video_track(tmp_path):
+    src = _mjpeg_avi(tmp_path / "camera.avi")
+    probe = convert.probe_video(src)
+    assert probe["video"]["codec_name"] == "mjpeg"
+    assert probe["video"]["disposition"]["attached_pic"] == 0
+    mp = _ipod(tmp_path, "B029")
+    track = Database(mp).add_track(src, convert=True)
+    out = _copied(mp)
+    assert out.endswith(".m4v")
+    v, a = _streams(out)
+    assert v["codec_name"] == "h264" and "Baseline" in v["profile"]
+    assert (v["width"], v["height"]) == (64, 48)
+    assert a["codec_name"] == "aac"
+    assert track.media_type == MEDIATYPE_VIDEO and track.movie_flag
+
+
+def test_motion_jpeg_video_on_an_ipod_without_video_keeps_its_audio_with_a_warning(
+    tmp_path, caplog
+):
+    # like any other non-MP4 video there: the soundtrack is converted, but not silently
+    src = _mjpeg_avi(tmp_path / "camera.avi")
+    mp = _ipod(tmp_path, "8737")
+    with caplog.at_level("WARNING", logger="pygpod.convert"):
+        track = Database(mp).add_track(src, convert=True)
+    assert "does not play video" in caplog.text
+    assert _copied(mp).endswith(".m4a") and not track.movie_flag
+    silent = _mjpeg_avi(tmp_path / "silent.avi", audio=False)
+    with pytest.raises(UnsupportedFormatError, match="conversion failed"):
+        convert.convert_for_ipod(silent, IpodGeneration.NANO_2)
+
+
+def _streams_all(path):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_streams", "-of", "json", path],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    return json.loads(out)["streams"]
+
+
+def _with_cover(dest, audio_args, extra=()):
+    from .conftest import _make_minimal_png
+
+    png = os.path.join(os.path.dirname(dest), "cover.png")
+    _make_minimal_png(png, 64, 64)
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+         "-i", png, "-map", "0:a", "-map", "1:v", *audio_args, "-c:v", "mjpeg",
+         "-disposition:v", "attached_pic", *extra, dest],
+        check=True,
+        timeout=60,
+    )  # fmt: skip
+    return dest
+
+
+def test_mp3_and_m4a_with_a_jpeg_cover_still_convert_as_audio(tmp_path):
+    mp3 = _with_cover(str(tmp_path / "song.mp3"), ["-c:a", "libmp3lame"], ["-id3v2_version", "3"])
+    m4a = _with_cover(str(tmp_path / "song.m4a"), ["-c:a", "aac"])
+    for src in (mp3, m4a):
+        cover = [s for s in _streams_all(src) if s["codec_type"] == "video"]
+        assert [s["codec_name"] for s in cover] == ["mjpeg"], src
+        probe = convert.probe_video(src)
+        assert probe["video"] is None and probe["audio"] is not None, src
+        out = convert.convert_for_ipod(src, IpodGeneration.CLASSIC_1)
+        try:
+            assert out.endswith(".m4a")
+            assert [s["codec_type"] for s in _streams_all(out)] == ["audio"]
+        finally:
+            os.unlink(out)
+    mp = _ipod(tmp_path, "B029")
+    track = Database(mp).add_track(mp3, convert=True)
+    assert _copied(mp).endswith(".mp3") and not track.movie_flag
+
+
+def test_chapter_pictures_of_an_audiobook_are_not_video(tmp_path):
+    from .test_video_tracks import _add_chapter_reference, _mjpeg_with_audio
+
+    plain = _mjpeg_with_audio(tmp_path / "plain.m4b", 3, "mp4")
+    book = _add_chapter_reference(plain, str(tmp_path / "book.m4b"))
+    probe = convert.probe_video(book)
+    assert probe["video"] is None and probe["audio"]["codec_name"] == "aac"
+    single = _mjpeg_with_audio(tmp_path / "single.m4b", 1, "mp4")  # one picture, no reference
+    assert convert.probe_video(single)["video"] is None
+    out = convert.convert_for_ipod(book, IpodGeneration.CLASSIC_1)
+    try:
+        assert out.endswith(".m4a")
+    finally:
+        os.unlink(out)
+
+
+def test_which_video_streams_are_pictures():
+    assert convert._is_picture({"codec_name": "h264", "disposition": {"attached_pic": 1}})
+    assert convert._is_picture({"codec_name": "mjpeg", "disposition": {"timed_thumbnails": 1}})
+    assert convert._is_picture({"codec_name": "png", "nb_frames": "1"})
+    assert convert._is_picture({"codec_name": "mjpeg", "nb_frames": "0"})
+    assert not convert._is_picture({"codec_name": "mjpeg", "nb_frames": "25"})
+    assert not convert._is_picture({"codec_name": "mjpeg"})  # frame count unknown: video
+    assert not convert._is_picture({"codec_name": "h264", "nb_frames": "1"})

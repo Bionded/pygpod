@@ -932,6 +932,25 @@ def test_fitted_thumbnail_from_bytes(tmp_path):
     assert (b.width, b.height, b.horizontal_padding) == (51, 64, 12)
 
 
+def test_fitted_thumbnail_from_decoded_image(tmp_path):
+    """A decoded Pillow image gives the same bytes as its file and is left unchanged."""
+    from PIL import Image
+
+    from pygpod.model.artwork import render_fitted_thumbnail
+
+    path = _save_test_image(_make_test_image(300, 500), str(tmp_path))
+    img = Image.open(path).convert("RGB")
+    before = img.tobytes()
+    for crop in (False, True):
+        a = render_fitted_thumbnail(path, 64, 64, PixelFormat.RGB565_LE, crop=crop)
+        b = render_fitted_thumbnail(img, 64, 64, PixelFormat.RGB565_LE, crop=crop)
+        assert a.data == b.data
+    assert img.tobytes() == before
+    rgba = Image.open(path).convert("RGBA")
+    c = render_fitted_thumbnail(rgba, 64, 64, PixelFormat.RGB565_LE)
+    assert c.data == render_fitted_thumbnail(path, 64, 64, PixelFormat.RGB565_LE).data
+
+
 # ============================================================================
 # YCbCr values: limited-range BT.601 as libgpod writes them
 # ============================================================================

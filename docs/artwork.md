@@ -6,7 +6,11 @@ Cover art lives in the ArtworkDB (`iPod_Control/Artwork`) and `.ithmb` files, on
 format the iPod shows (list, Now Playing, Cover Flow ...). Pillow (the `artwork` extra) converts
 the images. A track's cover comes from the file's embedded picture, `cover_art=` (path or bytes)
 on `add_track()`, or `set_artwork(track, bytes)`; `set_artwork(track, None)` removes it. Models
-without cover art (1G-4G, mini, shuffles) get none.
+without cover art (1G-4G, mini, shuffles) get none. The thumbnails are rendered right away but
+written with the next `save()`, after its conflict check: until then no file on the iPod changes.
+Like libgpod, a format's thumbnails fill `F<format>_1.ithmb` up to 256 MB, then `_2` and so on;
+removed covers leave free slots that new ones reuse, and a file is compacted (keeping its name)
+only when most of it is unused.
 
 The formats are the ones the iPod's SysInfoExtended lists under `AlbumArt` (size, pixel format,
 crop or letterbox, background colour, row alignment), like libgpod; the built-in per-model table
@@ -23,6 +27,19 @@ t = db.add_track(song, title="З обкладинкою", cover_art=cover)
 assert t.has_artwork
 db.set_artwork(t, None)   # remove; set_artwork(t, jpeg_or_png_bytes) replaces
 db.save()
+```
+
+An ArtworkDB that exists but cannot be read (damaged) is never replaced silently: adding or
+changing a cover raises `ArtworkDBError`, `check()` reports `artwork_db_unreadable`, and saving
+changes that do not touch covers leaves the file as it is. `reset_artwork()` starts an empty
+ArtworkDB with the next save and clears every track's cover reference; covers can be set again
+afterwards.
+
+```python
+db = pygpod.Database(mountpoint)
+if "artwork_db_unreadable" in db.check().kinds():
+    db.reset_artwork()    # every track loses its cover
+    db.save()
 ```
 
 ## Photos
@@ -182,10 +199,14 @@ Args:
 Save the photo database back to the iPod.
 
 Every thumbnail (new ones and those already on the iPod) is read first, then written to
-fresh ``F<format>_<N>.ithmb`` files under a file index no current thumbnail uses, then the
-database is replaced atomically, then .ithmb files nothing refers to are deleted. Existing
-images are never overwritten in place; removed photos' data is dropped. Nothing is
-written when nothing changed (no new thumbnails, the same database as on disk).
+fresh ``F<format>_<N>.ithmb`` files under a file index that no .ithmb file on the iPod
+has; these, the new database and the deletion of the .ithmb files nothing refers to any
+more are committed together (crash-safe, like ``Database.save()``). Existing images are
+never overwritten in place; removed photos' data is dropped. If the save fails, the
+files on the iPod and the photos' thumbnail references stay as they were, and saving
+again is safe. Nothing is written when nothing changed (no new thumbnails, the same
+database as on disk). The save holds the database writer lock (ConflictError while
+another process saves the iPod's databases), as the commit journal is shared.
 
 A Photo Database written by pygpod re-saves byte-identically. One written by iTunes or
 libgpod is rewritten in pygpod's layout on its first save, even without changes

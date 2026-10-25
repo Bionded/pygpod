@@ -60,6 +60,7 @@
  * dump-artwork output (tab separated):
  *   K <title> <n thumbnail items> <n items libgpod decodes to a pixbuf>
  *   F <title> <format id> <width> <height> <size> <horizontal_padding> <vertical_padding>
+ *   P <title> <width>x<height> <MD5 of the decoded pixels>   (per decoded thumbnail)
  *
  * dump-times output (tab separated, time_t as libgpod converts the iPod's timestamps):
  *   W <title> <time_added> <time_modified> <time_played> <time_released> <time_skipped>
@@ -73,6 +74,7 @@
  * Build: gcc -o libgpod_tool libgpod_tool.c $(pkg-config --cflags --libs libgpod-1.0 glib-2.0)
  */
 #include <gpod/itdb.h>
+#include <gdk-pixbuf/gdk-pixbuf.h>
 #include <glib.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -462,7 +464,6 @@ static int dump_artwork(const char *mp) {
         GList *pixbufs = itdb_thumb_to_pixbufs(itdb->device, t->artwork->thumbnail);
         for (GList *p = pixbufs; p; p = p->next)
             if (p->data) n_decoded++;
-        g_list_free(pixbufs); /* the pixbufs leak: the tool exits right after */
         GList *items = ((Tool_ThumbIpod *)th)->thumbs;
         printf("K\t%s\t%u\t%u\n", s(t->title), g_list_length(items), n_decoded);
         for (GList *i = items; i; i = i->next) {
@@ -471,6 +472,16 @@ static int dump_artwork(const char *mp) {
                    it->format ? it->format->format_id : -1, it->width, it->height, it->size,
                    it->horizontal_padding, it->vertical_padding);
         }
+        for (GList *p = pixbufs; p; p = p->next) {
+            GdkPixbuf *pb = p->data;
+            if (!pb) continue;
+            gchar *md5 = g_compute_checksum_for_data(
+                G_CHECKSUM_MD5, gdk_pixbuf_read_pixels(pb), gdk_pixbuf_get_byte_length(pb));
+            printf("P\t%s\t%dx%d\t%s\n", s(t->title), gdk_pixbuf_get_width(pb),
+                   gdk_pixbuf_get_height(pb), md5);
+            g_free(md5);
+        }
+        g_list_free(pixbufs); /* the pixbufs leak: the tool exits right after */
     }
     itdb_free(itdb);
     return 0;

@@ -99,6 +99,7 @@ def broken(clean):
         f.write(bytes([b[0] ^ 0xFF]))
     with open(os.path.join(itunes, "pygpod.lock"), "w") as f:
         json.dump({"pid": 1, "host": "elsewhere", "time": 0, "token": "x"}, f)
+    os.utime(os.path.join(itunes, "pygpod.lock"), (0, 0))  # untouched for decades: stale
     with open(os.path.join(itunes, "iTunesDB.pygpod-new"), "wb") as f:
         f.write(b"partial")
     return mp
@@ -332,3 +333,89 @@ def test_unidentified_model_with_signed_db_is_reported(clean, tmp_path):
         f.write(bytes(data))
     kinds = [i.kind for i in Database(clean, recover=False).check()]
     assert kinds == ["model_unidentified", "checksum_mismatch"]
+
+
+def _concurrent_add(mp, tmp_path, title="theirs"):
+    """Another writer adds a track and saves; returns its title and media file."""
+    mp3 = str(tmp_path / f"{title}.mp3")
+    _make_minimal_mp3(mp3)
+    other = Database(mp)
+    track = other.add_track(mp3, title=title)
+    other.save()
+    return _path(mp, track)
+
+
+def test_check_reports_a_concurrent_save_instead_of_its_files_as_orphans(clean, tmp_path):
+    db = Database(clean)
+    theirs = _concurrent_add(clean, tmp_path)
+    report = db.check()
+    assert "database_changed" in report.kinds()
+    assert not report.by_kind("database_changed")[0].fixable
+    assert "orphan_file" not in report.kinds()  # their new file is not ours to judge
+    assert os.path.isfile(theirs)
+
+
+@pytest.mark.parametrize("delete_orphans", [False, True])
+def test_repair_refuses_to_overwrite_a_concurrent_save(clean, tmp_path, delete_orphans):
+    from pygpod.exceptions import ConflictError
+
+    db = Database(clean)
+    t = {x.title: x for x in db.tracks}
+    with open(_path(clean, t["short"]), "rb+") as f:  # something to repair (size_mismatch)
+        f.truncate(100)
+    orphan = os.path.join(clean, "iPod_Control", "Music", "F00", "ORPHAN.mp3")
+    with open(orphan, "wb") as f:
+        f.write(b"\xff\xfb" + b"\0" * 200)
+    report = db.check()  # taken before the other writer saved
+    assert {"size_mismatch", "orphan_file"} <= report.kinds()
+    theirs = _concurrent_add(clean, tmp_path)
+    before = _tree(clean)
+    with pytest.raises(ConflictError, match="changed since it was checked"):
+        db.repair(report, delete_orphans=delete_orphans)
+    with pytest.raises(ConflictError):
+        db.repair(delete_orphans=delete_orphans)  # a fresh check sees the change too
+    assert _tree(clean) == before  # nothing deleted, nothing saved
+    assert os.path.isfile(theirs) and os.path.isfile(orphan)
+    assert "theirs" in {x.title for x in Database(clean).tracks}
+
+
+def test_repair_after_reopening_works(clean, tmp_path):
+    db = Database(clean)
+    t = {x.title: x for x in db.tracks}
+    with open(_path(clean, t["short"]), "rb+") as f:
+        f.truncate(100)
+    _concurrent_add(clean, tmp_path)
+    db = Database(clean)
+    actions = db.repair()
+    assert [a.kind for a in actions] == ["size_mismatch"] and actions[0].done
+    reopened = Database(clean)
+    assert "theirs" in {x.title for x in reopened.tracks}
+    assert not reopened.check()
+
+
+def test_doctor_fix_exits_non_zero_when_another_writer_saves_meanwhile(
+    clean, tmp_path, monkeypatch, capsys
+):
+    import pygpod.doctor
+
+    db = Database(clean)
+    t = {x.title: x for x in db.tracks}
+    with open(_path(clean, t["short"]), "rb+") as f:
+        f.truncate(100)
+    orphan = os.path.join(clean, "iPod_Control", "Music", "F00", "ORPHAN.mp3")
+    with open(orphan, "wb") as f:
+        f.write(b"\xff\xfb" + b"\0" * 200)
+    check = pygpod.doctor.check
+    theirs = []
+
+    def check_then_other_writer(d):
+        report = check(d)
+        if not theirs:
+            theirs.append(_concurrent_add(clean, tmp_path))
+        return report
+
+    monkeypatch.setattr(pygpod.doctor, "check", check_then_other_writer)
+    assert main(["-m", clean, "doctor", "--fix", "--delete-orphans"]) == 1
+    assert "changed since it was checked" in capsys.readouterr().err
+    assert os.path.isfile(orphan) and os.path.isfile(theirs[0])
+    assert "theirs" in {x.title for x in Database(clean).tracks}

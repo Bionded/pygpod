@@ -12,7 +12,19 @@ import random
 import shutil
 import stat
 import struct
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Set
+from contextlib import contextmanager
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+)
 
 from ..db.constants import (
     DEFAULT_MHBD_HEADER_LEN,
@@ -79,7 +91,7 @@ from ..db.playcounts import (
     PendingPlayCount,
     PlayCountEntry,
     PlayCountSource,
-    apply_play_counts,
+    apply_matched_play_counts,
     file_sha256,
     read_commit_marker,
     read_otg_files,
@@ -92,12 +104,13 @@ from ..db.playcounts import (
 from ..db.sortindex import SortEntry, build_indexes, mhod52_body, mhod53_body
 from ..db.transaction import Transaction, interrupted_commit
 from ..db.transaction import recover as recover_interrupted_commit
-from ..db.writelock import writer_lock
+from ..db.writelock import try_writer_lock, writer_lock
 from ..db.writer import make_string_mhod, write_itunesdb
 from ..device.device import Device
 from ..device.fileutils import copy_track_to_ipod
 from ..device.mountpoint import _build_empty_itunesdb, find_itunesdb, validate_mountpoint
 from ..exceptions import (
+    ArtworkDBError,
     ArtworkError,
     ConflictError,
     DatabaseError,
@@ -146,9 +159,16 @@ class Database:
     merge_play_counts() and clear_play_counts(). The file is deleted only after
     the next successful save(), so a session that does not save loses nothing.
 
-    Opening completes or discards an interrupted save (``recover=True``, default).
+    Opening completes or discards an interrupted save (``recover=True``, default), under the
+    writer lock: while another process is saving, opening waits up to a few seconds for it and
+    otherwise reads the files without recovering anything (save() completes a leftover save then).
     ``recover=False`` opens read-only-style without touching any file (used by check());
     save() then refuses while the journal of an interrupted save is still there.
+
+    A damaged iTunesDB (a list that ends early at a broken record) raises ParseError: saving
+    what is readable would drop every track or playlist after the damaged one. With
+    ``partial=True`` the readable part is loaded instead and described in ``damage``;
+    save() then refuses unless ``force=True`` (which keeps only the readable part).
     """
 
     def __init__(
@@ -157,6 +177,7 @@ class Database:
         config: Optional[DatabaseConfig] = None,
         apply_play_counts: bool = True,
         recover: bool = True,
+        partial: bool = False,
     ) -> None:
         self._mountpoint = mountpoint
         self._config = config or DatabaseConfig()
@@ -169,7 +190,9 @@ class Database:
         self._modified = False
         self._rng = random.Random(self._config.random_seed)
         self._pc_source: Optional[PlayCountSource] = None
-        self._pc_pending: List[PlayCountEntry] = []
+        # (track, entry) bound when the file was read: the entries are positional, so they
+        # must not shift onto other tracks when tracks are removed before the merge
+        self._pc_pending: List[Tuple[Track, PlayCountEntry]] = []
         self._pc_consume = False
         self._otg_files: List[OTGFile] = []
         self._otg_tracks: List[Track] = []
@@ -177,7 +200,10 @@ class Database:
         self._otg_resolved: Dict[str, List[Track]] = {}
         self._otg_skipped: List[OTGSkippedEntry] = []
         self._ids: Optional[List[Any]] = None
+        self._pending_deletes: List[Tuple[str, str]] = []  # (iPod path, file) to delete on save
         self._recover = recover
+        self._partial = partial
+        self._damage: List[str] = []
         self._tz_shift = self._timezone_shift(mountpoint)
 
         if mountpoint:
@@ -211,7 +237,10 @@ class Database:
         db._otg_resolved = {}
         db._otg_skipped = []
         db._ids = None
+        db._pending_deletes = []
         db._recover = True
+        db._partial = False
+        db._damage = []
         db._tz_shift = db._timezone_shift(None)
 
         with open(path, "rb") as f:
@@ -249,9 +278,26 @@ class Database:
                 f"Not a valid iPod mount point: {mountpoint}\n"
                 f"Expected to find iPod_Control/iTunes/ directory."
             )
-        if self._recover:
-            recover_interrupted_commit(mountpoint)
+        itunes_dir = os.path.join(mountpoint, "iPod_Control", "iTunes")
+        if not self._recover:
+            self._read_from_mountpoint(mountpoint, apply_play_counts, cleanup=False)
+            return
+        # recover and read under the writer lock: never touch the staging files or the journal
+        # of a save in progress, and never read a half-applied commit
+        with try_writer_lock(itunes_dir) as held:
+            if held:
+                recover_interrupted_commit(mountpoint)
+            else:
+                logger.info(
+                    "Another writer is saving (or the iPod is read-only): reading %s without "
+                    "recovering an interrupted save",
+                    mountpoint,
+                )
+            self._read_from_mountpoint(mountpoint, apply_play_counts, cleanup=held)
 
+    def _read_from_mountpoint(
+        self, mountpoint: str, apply_play_counts: bool, cleanup: bool
+    ) -> None:
         self._device = Device.from_mountpoint(mountpoint)
         db_path = find_itunesdb(mountpoint)
         if db_path is None:
@@ -261,11 +307,13 @@ class Database:
             data = f.read()
 
         self._raw_data = data
-        self._root = parse_itunesdb(data)
+        damage: Optional[List[str]] = [] if self._partial else None
+        self._root = parse_itunesdb(data, damage=damage)
+        self._damage = damage or []
         self._build_model()
         logger.info("Loaded %d tracks, %d playlists", len(self._tracks), len(self._playlists))
 
-        self._load_play_counts(mountpoint)
+        self._load_play_counts(mountpoint, cleanup)
         self._load_otg(mountpoint)
         if apply_play_counts:
             self.merge_play_counts()
@@ -276,7 +324,7 @@ class Database:
         assert self._mountpoint is not None
         return os.path.join(self._mountpoint, "iPod_Control", "iTunes")
 
-    def _load_play_counts(self, mountpoint: str) -> None:
+    def _load_play_counts(self, mountpoint: str, cleanup: bool = True) -> None:
         """Read the iPod's play count file without consuming it.
 
         Finishes an interrupted consume first: if the commit marker says the
@@ -302,20 +350,22 @@ class Database:
             ):
                 logger.info("Play counts in %s were already merged; finishing cleanup", source.name)
                 source = None
-                if self._recover and remove_consumed_files(
+                if cleanup and remove_consumed_files(
                     itunes_dir, marker["file"], marker["file_sha256"], marker["others"]
                 ):
                     remove_file(os.path.join(itunes_dir, PLAY_COUNTS_COMMIT_FILE))
-            elif self._recover:
+            elif cleanup:
                 # Either the save never committed (old iTunesDB still in place) or
                 # the play count file was rewritten since: the counts are not applied yet.
-                # (recover=False: an interrupted save may still commit - leave the marker.)
+                # (Not recovering: an interrupted save may still commit - leave the marker.)
                 remove_file(os.path.join(itunes_dir, PLAY_COUNTS_COMMIT_FILE))
 
         if source is None:
             return
         self._pc_source = source
-        self._pc_pending = list(source.entries)
+        from ..db.playcounts import match_play_counts
+
+        self._pc_pending = match_play_counts(self._tracks, list(source.entries))
 
     # ---- On-The-Go playlists ----
 
@@ -474,12 +524,11 @@ class Database:
         """Play count updates read from the iPod that are not merged yet.
 
         Matched to tracks by position (the iPod writes one entry per track in
-        database order); entries without any change are skipped.
+        database order) when the database was opened; entries of tracks removed since and
+        entries without any change are skipped.
         """
-        from ..db.playcounts import match_play_counts
-
         result: List[PendingPlayCount] = []
-        for track, e in match_play_counts(self._tracks, self._pc_pending):
+        for track, e in self._live_play_counts():
             if (
                 e.play_count > 0
                 or e.time_played > 0
@@ -501,12 +550,15 @@ class Database:
         """
         if self._pc_source is None or not self._pc_pending:
             return 0
-        updated = apply_play_counts(self._tracks, self._pc_pending)
+        updated = apply_matched_play_counts(self._live_play_counts())
         self._pc_pending = []
         self._pc_consume = True
         self._modified = True
         logger.info("Merged play counts from %s: %d tracks updated", self._pc_source.name, updated)
         return updated
+
+    def _live_play_counts(self) -> List[Tuple[Track, PlayCountEntry]]:
+        return [(t, e) for t, e in self._pc_pending if self._track_lookup.get(t.track_id) is t]
 
     def clear_play_counts(self) -> None:
         """Drop pending play counts without merging them.
@@ -709,6 +761,7 @@ class Database:
 
         if not self._mountpoint:
             raise TrackError("Cannot add tracks without a mount point")
+        self._check_numeric_kwargs(kwargs)
 
         soundcheck_mode = kwargs.get("soundcheck")
         if isinstance(soundcheck_mode, str):
@@ -798,6 +851,7 @@ class Database:
             if key not in post and key in tags:
                 post[key] = tags[key]
 
+        self._require_cover_writable(filepath, tags.get("cover_art"))
         num_dirs = self._device.music_dirs if self._device else 50
         cfg = self._config
         if copy:
@@ -819,24 +873,27 @@ class Database:
                 raise TrackError(f"copy=False needs a file inside {music}: {filepath}")
             ipod_path = os_path_to_ipod(real, os.path.realpath(self._mountpoint))
 
-        # Generate track ID and DBID
-        track_id = self._next_track_id()
-        dbid = self._next_dbid()
+        # Build and validate the whole track before it joins the database: a bad value
+        # (e.g. rating='x') leaves neither a hidden MHIT nor the copied file behind
+        try:
+            track_id = self._next_track_id()
+            dbid = self._next_dbid()
+            mhit = self._create_mhit(track_id, dbid, tags, ipod_path, source)
+            track = Track.from_record(mhit)
+            track._tz_shift = self._tz_shift
+            if chapters:
+                track.chapters = chapters
+            for key, value in post.items():
+                setattr(track, key, value)
+        except BaseException:
+            if copy:
+                from ..utils.encoding import ipod_path_to_os
 
-        # Create MHIT record
-        mhit = self._create_mhit(track_id, dbid, tags, ipod_path, source)
+                remove_file(ipod_path_to_os(ipod_path, self._mountpoint))
+            raise
 
         # Add to track list MHSD
-        mhlt = self._get_or_create_mhlt()
-        mhlt.children.append(mhit)
-
-        # Create Track model object
-        track = Track.from_record(mhit)
-        track._tz_shift = self._tz_shift
-        if chapters:
-            track.chapters = chapters
-        for key, value in post.items():
-            setattr(track, key, value)
+        self._get_or_create_mhlt().children.append(mhit)
         track._on_change = self._mark_modified
         self._tracks.append(track)
         self._track_lookup[track_id] = track
@@ -860,6 +917,20 @@ class Database:
         self._modified = True
         logger.info("Track added: %s", track)
         return track
+
+    @staticmethod
+    def _check_numeric_kwargs(kwargs: Dict[str, Any]) -> None:
+        """ValueError for a numeric add_track() value that is no integer or does not fit its
+        field (it would wrap around on save), before anything is copied."""
+        from .track import NUMERIC_FIELD_BITS, checked_int
+
+        for key, bits in NUMERIC_FIELD_BITS.items():
+            if kwargs.get(key) is not None:
+                checked_int(key, kwargs[key], bits)
+        if kwargs.get("rating") is not None:
+            checked_int("rating", kwargs["rating"], 32, signed=True)
+        if kwargs.get("soundcheck") is not None and not isinstance(kwargs["soundcheck"], str):
+            checked_int("soundcheck", kwargs["soundcheck"], 32)
 
     @staticmethod
     def _measure_soundcheck(mode: str, source: str, tags: Dict[str, Any]) -> None:
@@ -899,16 +970,31 @@ class Database:
                 generation=generation,
                 formats=list(reversed(formats)) if formats else None,
             )
+            if self._artwork_manager.created_new:
+                self._clear_artwork_links()
         return self._artwork_manager
+
+    def _clear_artwork_links(self) -> None:
+        """Clear the artwork references of every track (their images are not in the
+        ArtworkDB, which is missing or replaced by an empty one)."""
+        for t in self._tracks:
+            rec = t.record
+            if rec is None:
+                continue
+            f = rec.fields
+            if f.get("mhii_link") or f.get("artwork_count") or f.get("has_artwork") == 1:
+                self._set_artwork_fields(rec, 0, 0, 0)
+                t._touch()
+                self._modified = True
 
     def _add_artwork_for_track(
         self, mhit: Record, dbid: int, filepath: str, cover_art: str = None
     ) -> None:
-        """Extract artwork from audio file and process immediately.
+        """Extract artwork from audio file and render its thumbnails now.
 
-        Creates thumbnails and writes .ithmb data right away during track
-        addition, so save() doesn't have to do all the heavy lifting.
-        ArtworkDB is written once at save time.
+        The thumbnails are rendered right away (save() does not have to do all the
+        heavy lifting); they are written to the .ithmb files, with the ArtworkDB,
+        by the next save(), after its conflict check.
 
         Args:
             mhit: The MHIT record for the track.
@@ -934,8 +1020,41 @@ class Database:
                 return
             self._attach_artwork(mhit, dbid, art_data)
             logger.info("Artwork processed for track dbid=%d (%d bytes)", dbid, len(art_data))
+        except ArtworkDBError:
+            raise
         except Exception:
             logger.debug("Failed to process artwork", exc_info=True)
+
+    def _require_cover_writable(self, filepath: str, cover_art: Any) -> None:
+        """ArtworkDBError before a track with a cover is added while the ArtworkDB on the
+        iPod cannot be read (writing a new one would drop every cover it holds)."""
+        if not self._mountpoint or not self._shows_cover_art():
+            return
+        mgr = getattr(self, "_artwork_manager", None)
+        if mgr is not None and mgr.load_error is None:
+            return  # the usual case: no second look at the file's cover
+        if isinstance(cover_art, (bytes, bytearray)):
+            has_cover = bool(cover_art)
+        else:
+            has_cover = bool(cover_art and os.path.isfile(cover_art)) or bool(
+                extract_artwork(filepath)
+            )
+        if has_cover:
+            self._get_artwork_manager().require_readable()
+
+    def reset_artwork(self) -> None:
+        """Start an empty ArtworkDB with the next save(): every track loses its cover.
+
+        Meant for an ArtworkDB that cannot be read (check() reports
+        ``artwork_db_unreadable``; adding or changing covers raises ArtworkDBError
+        until then). The tracks' artwork references are cleared, so none points at a
+        missing image; the old .ithmb files are deleted when the save commits.
+        """
+        if not self._mountpoint:
+            raise DatabaseError("No mount point")
+        self._get_artwork_manager().start_empty()
+        self._clear_artwork_links()
+        self._modified = True
 
     @staticmethod
     def _set_artwork_fields(mhit: Record, count: int, size: int, image_id: int) -> None:
@@ -982,18 +1101,31 @@ class Database:
 
         Raises:
             ArtworkError: the image could not be converted (e.g. Pillow missing).
+                Like any error decoding the image, the track keeps its current cover.
+            ArtworkDBError: the ArtworkDB on the iPod cannot be read (see reset_artwork()).
+            ValueError: the track belongs to another database (or was removed).
         """
         if not self._mountpoint or track.record is None:
             raise TrackError("Cannot set artwork without a mount point")
+        self._check_own_tracks([track])
         mgr = self._get_artwork_manager()
-        if track.has_artwork and track.mhii_link:
-            mgr.remove_artwork(track.mhii_link)
-        self._set_artwork_fields(track.record, 0, 0, 0)
+        mgr.require_readable()
+        old_link = track.mhii_link if track.has_artwork else 0
         if image and not self._shows_cover_art():
             logger.info("%s shows no cover art: image ignored", self._device.model)
-        elif image:
-            if not self._attach_artwork(track.record, track.dbid, image):
+            image = None
+        if image:
+            # the new thumbnails first: invalid data raises before the old cover is dropped
+            image_id = mgr.add_artwork_data(track.dbid, image, save=False)
+            if image_id is None:
                 raise ArtworkError("could not create artwork thumbnails (is Pillow installed?)")
+            if old_link:
+                mgr.remove_artwork(old_link)
+            self._set_artwork_fields(track.record, 1, len(image), image_id)
+        else:
+            if old_link:
+                mgr.remove_artwork(old_link)
+            self._set_artwork_fields(track.record, 0, 0, 0)
         self._modified = True
 
     def remove_track(self, track: Track, delete_file: bool = False) -> None:
@@ -1001,11 +1133,13 @@ class Database:
 
         Args:
             track: Track to remove.
-            delete_file: If True, also delete the file from the iPod.
+            delete_file: If True, also delete the file from the iPod - with the next
+                successful save(), and only if no remaining track uses the same file.
 
         Raises:
             UnsafePathError: delete_file is set and the track's path points
                 outside the mount point (nothing is changed).
+            ValueError: the track belongs to another database (or was removed already).
         """
         self.remove_tracks([track], delete_files=delete_file)
 
@@ -1018,16 +1152,23 @@ class Database:
         Raises:
             UnsafePathError: delete_files is set and a track's path points outside the
                 mount point (nothing is changed).
+            ValueError: a track belongs to another database (or was removed already);
+                nothing is changed.
         """
         tracks = list(tracks)
         if not tracks:
             return
+        self._check_own_tracks(tracks)
         # Validate every file path before changing anything (raises UnsafePathError)
-        fpaths: List[str] = []
+        fpaths: List[Tuple[str, str]] = []
         if delete_files and self._mountpoint:
             from ..utils.encoding import ipod_path_to_os
 
-            fpaths = [ipod_path_to_os(t.ipod_path, self._mountpoint) for t in tracks if t.ipod_path]
+            fpaths = [
+                (t.ipod_path, ipod_path_to_os(t.ipod_path, self._mountpoint))
+                for t in tracks
+                if t.ipod_path
+            ]
 
         ids = {t.track_id for t in tracks}
         self._remove_from_all_playlists(ids)
@@ -1046,12 +1187,21 @@ class Database:
                 index[1].discard(t.dbid)
             if self._mountpoint and t.has_artwork and t.mhii_link:
                 self._get_artwork_manager().remove_artwork(t.mhii_link)
-        for fpath in fpaths:
-            try:
-                os.unlink(fpath)
-            except OSError:
-                logger.warning("Failed to delete track file %s", fpath, exc_info=True)
+        # deleted by the next successful save (in its commit), unless a remaining track
+        # still uses the file then
+        self._pending_deletes.extend(fpaths)
         self._modified = True
+
+    def _check_own_tracks(self, tracks: Iterable[Track]) -> None:
+        """ValueError for a Track that is not (or no longer) part of this database: its
+        track id may name another track here."""
+        for t in tracks:
+            if self._track_lookup.get(t.track_id) is not t:
+                raise ValueError(f"{t!r} does not belong to this database")
+
+    def _check_own_playlist(self, playlist: Playlist) -> None:
+        if not any(p is playlist for p in self._playlists):
+            raise ValueError(f"{playlist!r} does not belong to this database")
 
     # ---- Playlist Operations ----
 
@@ -1063,7 +1213,12 @@ class Database:
         return None
 
     def set_playlist(self, name: str, tracks: List[Track]) -> Playlist:
-        """Create the playlist ``name`` or replace its members with ``tracks`` (in order)."""
+        """Create the playlist ``name`` or replace its members with ``tracks`` (in order).
+
+        Raises:
+            ValueError: a track belongs to another database (or was removed).
+        """
+        self._check_own_tracks(tracks)
         pl = self.get_playlist(name)
         if pl is None:
             pl = self.create_playlist(name)
@@ -1105,7 +1260,10 @@ class Database:
         dry_run: bool = False,
     ) -> "List[RepairAction]":
         """Fix the issues of ``report`` (default: check()) and save once; orphan media files
-        are deleted only with ``delete_orphans``. ``dry_run`` returns the actions only."""
+        are deleted only with ``delete_orphans``. ``dry_run`` returns the actions only.
+
+        Raises ConflictError, changing nothing, when another writer holds the lock or saved
+        the database after this object loaded it: reopen it and check again."""
         from ..doctor import repair
 
         return repair(self, report, delete_orphans=delete_orphans, dry_run=dry_run)
@@ -1189,8 +1347,14 @@ class Database:
     def update_smart_playlist(
         self, playlist: Playlist, rules=None, match=None, prefs=None, refresh: bool = True
     ) -> None:
-        """Change rules, match operator and/or preferences of a (smart) playlist."""
+        """Change rules, match operator and/or preferences of a (smart) playlist.
+
+        Raises:
+            ValueError: the playlist does not belong to this database.
+        """
         from .smartplaylist import SPLMatch, SPLPrefs
+
+        self._check_own_playlist(playlist)
 
         current = playlist.smart_rules or (SPLMatch.AND, [])
         self._set_spl_mhods(
@@ -1208,8 +1372,13 @@ class Database:
         Rules are applied when ``checkrules`` is set, unchecked tracks are skipped
         with ``matchcheckedonly``, then the limit (sort + count/size/time) when
         ``checklimits`` is set. Returns the new members.
+
+        Raises:
+            ValueError: the playlist does not belong to this database.
         """
         from .smartplaylist import apply_limit, evaluate_smart_playlist
+
+        self._check_own_playlist(playlist)
 
         spl = playlist.smart_rules
         prefs = playlist.smart_prefs
@@ -1235,18 +1404,76 @@ class Database:
         """Refresh every smart playlist (only live-updating ones by default); returns how many.
 
         save() and save_to_file() call this with live_only=True unless told not to.
+
+        A smart playlist with a rule "Playlist is / is not <other smart playlist>" is refreshed
+        after that playlist, so it sees its new members. Playlists that depend on each other in
+        a cycle are refreshed in list order again until their members no longer change (at
+        most once per playlist in the cycle; a warning is logged if they still change).
         """
-        n = 0
-        for pl in self._playlists:
-            prefs = pl.smart_prefs
-            if (
-                prefs is not None
-                and pl.smart_rules is not None
-                and (prefs.liveupdate or not live_only)
-            ):
+        selected = [
+            pl
+            for pl in self._playlists
+            if pl.smart_prefs is not None
+            and pl.smart_rules is not None
+            and (pl.smart_prefs.liveupdate or not live_only)
+        ]
+        order, cyclic = self._smart_refresh_order(selected)
+        for pl in order:
+            self.refresh_smart_playlist(pl)
+        for _ in range(len(cyclic)):
+            before = [list(pl.track_ids) for pl in cyclic]
+            for pl in cyclic:
                 self.refresh_smart_playlist(pl)
-                n += 1
-        return n
+            if [list(pl.track_ids) for pl in cyclic] == before:
+                break
+        else:
+            if cyclic:
+                logger.warning(
+                    "Smart playlists %s depend on each other and did not settle; their "
+                    "members are those of the last refresh",
+                    ", ".join(repr(pl.name) for pl in cyclic),
+                )
+        return len(selected)
+
+    @staticmethod
+    def _smart_refresh_order(selected: List[Playlist]) -> Tuple[List[Playlist], List[Playlist]]:
+        """Refresh order (dependencies first, else list order) and the playlists that are
+        part of a dependency cycle (in list order)."""
+        from .smartplaylist import SPLFieldType, get_field_type
+
+        by_id = {pl.playlist_id: pl for pl in selected}
+
+        def deps(pl: Playlist) -> List[Playlist]:
+            _, rules = pl.smart_rules  # type: ignore[misc]
+            out = []
+            for rule in rules:
+                if get_field_type(rule.field) == SPLFieldType.PLAYLIST:
+                    dep = by_id.get(rule.fromvalue & 0xFFFFFFFFFFFFFFFF)
+                    if dep is not None and dep is not pl and dep not in out:
+                        out.append(dep)
+            return out
+
+        order: List[Playlist] = []
+        state: Dict[int, int] = {}  # id(playlist) -> 1 visiting, 2 done
+        cyclic_ids: Set[int] = set()
+        stack: List[Playlist] = []
+
+        def visit(pl: Playlist) -> None:
+            state[id(pl)] = 1
+            stack.append(pl)
+            for dep in deps(pl):
+                if state.get(id(dep)) == 1:  # back edge: everything on the stack from dep
+                    cyclic_ids.update(id(p) for p in stack[stack.index(dep) :])
+                elif id(dep) not in state:
+                    visit(dep)
+            stack.pop()
+            state[id(pl)] = 2
+            order.append(pl)
+
+        for pl in selected:
+            if id(pl) not in state:
+                visit(pl)
+        return order, [pl for pl in selected if id(pl) in cyclic_ids]
 
     def create_playlist(self, name: str, podcast: bool = False) -> Playlist:
         """Create a new playlist.
@@ -1259,7 +1486,7 @@ class Database:
             The new Playlist object.
         """
         mhlp = self._get_or_create_mhlp(mhsd_type=2)
-        playlist_id = self._rng.getrandbits(64)
+        playlist_id = self._next_playlist_id()
 
         mhyp = self._create_mhyp(name, playlist_id, is_master=False, podcast=podcast)
         mhlp.children.append(mhyp)
@@ -1276,7 +1503,13 @@ class Database:
         return pl
 
     def delete_playlist(self, playlist: Playlist) -> None:
-        """Delete a playlist."""
+        """Delete a playlist.
+
+        Raises:
+            ValueError: the playlist does not belong to this database (e.g. it was read from
+                another one, or already deleted).
+        """
+        self._check_own_playlist(playlist)
         if playlist.is_master:
             raise DatabaseError("Cannot delete the master playlist")
 
@@ -1337,7 +1570,13 @@ class Database:
         return changed
 
     def add_track_to_playlist(self, playlist: Playlist, track: Track) -> None:
-        """Add a track to a playlist."""
+        """Add a track to a playlist.
+
+        Raises:
+            ValueError: the playlist or the track belongs to another database (or was removed).
+        """
+        self._check_own_playlist(playlist)
+        self._check_own_tracks([track])
         if not playlist.record:
             return
         pos = self._mhip_count(playlist.record)
@@ -1374,7 +1613,13 @@ class Database:
         self.add_track_to_playlist(pl, track)
 
     def remove_track_from_playlist(self, playlist: Playlist, track: Track) -> None:
-        """Remove a track from a playlist."""
+        """Remove a track from a playlist.
+
+        Raises:
+            ValueError: the playlist or the track belongs to another database (or was removed).
+        """
+        self._check_own_playlist(playlist)
+        self._check_own_tracks([track])
         if not playlist.record:
             return
         playlist.record.children = [
@@ -1382,6 +1627,7 @@ class Database:
             for c in playlist.record.children
             if not (c.magic == MHIP_MAGIC and c.fields.get("track_id") == track.track_id)
         ]
+        self._renumber_positions(playlist.record)
         # Mirror removal to MHSD type 3
         self._unmirror_from_type3(playlist.playlist_id, track.track_id)
         self._modified = True
@@ -1982,6 +2228,12 @@ class Database:
 
         return write_itunesdb(self._root)
 
+    @property
+    def damage(self) -> List[str]:
+        """Damaged places of the iTunesDB skipped by ``Database(..., partial=True)`` (empty
+        for an intact database)."""
+        return list(self._damage)
+
     def save(self, refresh_smart_playlists: bool = True, force: bool = False) -> None:
         """Save the database back to the iPod.
 
@@ -1992,7 +2244,8 @@ class Database:
         Concurrency: the save holds ``iPod_Control/iTunes/pygpod.lock`` (see db/writelock.py) and
         raises ConflictError when the iTunesDB on the iPod is no longer the one this object loaded
         or last saved (another writer saved meanwhile) - reopen and redo the changes, or pass
-        ``force=True`` to overwrite.
+        ``force=True`` to overwrite. A database opened with ``partial=True`` that has
+        ``damage`` raises DatabaseError unless ``force=True``.
 
         Crash-safe: checksum inputs are validated before anything is written,
         then iTunesDB, ArtworkDB and compacted .ithmb files are committed
@@ -2000,6 +2253,20 @@ class Database:
         and the exception propagates.
         """
         logger.info("Saving database")
+        if self._damage and not force:
+            raise DatabaseError(
+                "the iTunesDB was damaged and only partly loaded ("
+                + "; ".join(self._damage)
+                + "): saving would drop everything after the damage; restore a backup, or "
+                "save(force=True) to keep only the readable part"
+            )
+        with self._writing(check=not force):
+            self._save_locked(refresh_smart_playlists)
+
+    @contextmanager
+    def _writing(self, check: bool = True) -> Iterator[None]:
+        """Hold the writer lock for a save (and, in repair(), the file deletions before it);
+        with ``check``, ConflictError first when another writer saved since this was loaded."""
         if not self._mountpoint:
             raise DatabaseError("No mount point - use save_to_file() instead")
         if self._device is not None and self._device.sqlite_db:
@@ -2016,9 +2283,33 @@ class Database:
                 "recover=True (the default) before saving"
             )
         with writer_lock(self._itunes_dir()):
-            if not force:
+            if interrupted_commit(self._mountpoint):
+                # a save that crashed after this database was read (or while it was read
+                # without recovering): complete it first; the check below then sees its result
+                recover_interrupted_commit(self._mountpoint)
+            self._finish_own_interrupted_save()
+            if check:
                 self._check_not_modified()
-            self._save_locked(refresh_smart_playlists)
+            yield
+
+    def _finish_own_interrupted_save(self) -> None:
+        """A save of this object that failed after its commit point was completed by
+        recover() (here or by another process): the iTunesDB on disk is this object's own,
+        so finish that save's bookkeeping instead of reporting it as another writer's."""
+        pending, self._interrupted_save = getattr(self, "_interrupted_save", None), None
+        if pending is None:
+            return
+        tx, sha = pending
+        path = (
+            str(self._device.itunesdb_path())
+            if self._device
+            else os.path.join(self._itunes_dir(), "iTunesDB")
+        )
+        if not interrupted_commit(self._mountpoint) and file_sha256(path) == sha:
+            # edits made since are not on disk: only the retry's own commit clears the flag
+            modified = self._modified
+            tx.run_commit_callbacks()
+            self._modified = modified
 
     def _check_not_modified(self) -> None:
         """ConflictError when the iTunesDB on disk differs from the one loaded / last saved."""
@@ -2034,7 +2325,9 @@ class Database:
                     f"{path} was created by another writer since the database was opened"
                 )
             return
-        if on_disk is not None and on_disk != sha256_hex(self._raw_data):
+        if on_disk is None:
+            raise ConflictError(f"{path} was deleted since it was loaded")
+        if on_disk != sha256_hex(self._raw_data):
             raise ConflictError(f"{path} was changed by another writer since it was loaded")
 
     def _save_locked(self, refresh_smart_playlists: bool) -> None:
@@ -2117,19 +2410,41 @@ class Database:
                     tx.delete_on_commit(path)
             for path, new_data, _ in otg_rewrites:
                 tx.stage_bytes(path, new_data)
+            deleted = self._stage_track_file_deletions(tx)
+
+            def saved() -> None:
+                self._raw_data = data
+                self._modified = False
+                self._otg_consume = []
+                self._pending_deletes = [d for d in self._pending_deletes if d not in deleted]
+                if otg_rewrites or self._otg_files:
+                    self._otg_after_save(otg_rewrites)
+                logger.debug("Database saved to %s", db_path)
+                if consume:
+                    self._finish_play_count_cleanup()
+
+            tx.on_commit(saved)
             tx.commit()
         except BaseException:
+            if tx.journal_written:
+                # past the commit point: recover() completes it; the next save() of this
+                # object then recognises the result as its own (no false conflict)
+                self._interrupted_save = (tx, sha256_hex(data))
             tx.abort()
             raise
 
-        self._raw_data = data
-        self._modified = False
-        self._otg_consume = []
-        if otg_rewrites or self._otg_files:
-            self._otg_after_save(otg_rewrites)
-        logger.debug("Database saved to %s", db_path)
-        if consume:
-            self._finish_play_count_cleanup()
+    def _stage_track_file_deletions(self, tx: Transaction) -> List[Tuple[str, str]]:
+        """Files of removed tracks (remove_track(delete_file=True)) that no remaining track
+        uses: deleted in the commit."""
+        if not self._pending_deletes:
+            return []
+        used = {t.ipod_path.lower() for t in self._tracks if t.ipod_path}
+        staged = []
+        for ipod_path, path in self._pending_deletes:
+            if ipod_path.lower() not in used and os.path.lexists(path):
+                tx.delete_on_commit(path)
+            staged.append((ipod_path, path))
+        return staged
 
     @staticmethod
     def _write_db_file(path: str, data: bytes) -> None:
@@ -2157,10 +2472,11 @@ class Database:
             f"{gen.name}: unknown iPod shuffle generation; the iTunesSD format is not known"
         )
 
-    def _hash72_params(self, guid: str) -> tuple:
+    def _hash72_params(self, guid: str, persist: bool = True) -> tuple:
         """The device's hash72 IV and random part: from iPod_Control/Device/HashInfo, else
-        extracted once from the database as read (signed by iTunes/libgpod) and stored in
-        HashInfo, like libgpod does.
+        extracted once from the database as read (signed by iTunes/libgpod) and, with
+        ``persist`` (saving), stored in HashInfo, like libgpod does. Read-only callers
+        (check()) pass ``persist=False``.
 
         Raises:
             HashError: neither is available (a random IV would make the iPod reject the database).
@@ -2179,17 +2495,13 @@ class Database:
                 "the database on it was not signed by iTunes. Sync it with iTunes once "
                 "(or copy a HashInfo file)."
             )
+        if not persist:
+            return params
         try:
             write_hash_info(path, guid, *params)
         except OSError:
             logger.warning("could not write %s", path, exc_info=True)
         return params
-
-    def _save_artwork_db(self) -> None:
-        """Write ArtworkDB to disk once (artwork was already processed per-track)."""
-        if getattr(self, "_artwork_manager", None) is not None:
-            self._artwork_manager.save()
-            logger.info("ArtworkDB saved")
 
     def _try_resolve_guid(self) -> Optional[str]:
         """Try to get FirewireGuid from USB and write SysInfo for future use.
@@ -2219,14 +2531,15 @@ class Database:
         return None
 
     def save_to_file(self, path: str, refresh_smart_playlists: bool = True) -> None:
-        """Save the database to a specific file path (and the ArtworkDB, if loaded).
+        """Write the iTunesDB to ``path`` (an export: nothing on the iPod is changed).
 
-        Refreshes live-updating smart playlists first, like save().
+        Only the iTunesDB is written; the artwork (ArtworkDB, .ithmb files) is not exported
+        and stays as on the iPod until save(). The file is not signed with the iPod's
+        checksum. Refreshes live-updating smart playlists first, like save().
         """
         if refresh_smart_playlists:
             self.refresh_smart_playlists(live_only=True)
         data = self._prepare_for_save()
-        self._save_artwork_db()
         with open(path, "wb") as f:
             f.write(data)
 
@@ -2269,6 +2582,21 @@ class Database:
         while tid in tids:
             tid += 1
         return tid
+
+    def _next_playlist_id(self) -> int:
+        """A 64-bit playlist id no playlist of any list (MHSD 2, 3, ...) has: with a fixed
+        DatabaseConfig.random_seed a reopened database draws the same sequence again."""
+        used = {
+            mhyp.fields.get("playlist_id")
+            for mhsd in self._root.children
+            if mhsd.magic == MHSD_MAGIC and mhsd.children
+            for mhyp in mhsd.children[0].children
+            if mhyp.magic == MHYP_MAGIC
+        }
+        while True:
+            playlist_id = self._rng.getrandbits(64)
+            if playlist_id and playlist_id not in used:
+                return playlist_id
 
     def _next_dbid(self) -> int:
         """Generate a unique 64-bit DBID."""
@@ -2766,6 +3094,7 @@ class Database:
                             for c in mhyp.children
                             if not (c.magic == MHIP_MAGIC and c.fields.get("track_id") == track_id)
                         ]
+                        self._renumber_positions(mhyp)
                         return
 
     def _remove_from_all_playlists(self, track_ids: Set[int]) -> None:
@@ -2775,11 +3104,36 @@ class Database:
             if mhsd_type in (2, 3) and mhsd.children:
                 mhlp = mhsd.children[0]
                 for mhyp in mhlp.children:
-                    mhyp.children = [
+                    kept = [
                         c
                         for c in mhyp.children
                         if not (c.magic == MHIP_MAGIC and c.fields.get("track_id") in track_ids)
                     ]
+                    if len(kept) != len(mhyp.children):
+                        mhyp.children = kept
+                        self._renumber_positions(mhyp)
+
+    @staticmethod
+    def _renumber_positions(mhyp: Record) -> None:
+        """Position MHODs (type 100) of the playlist's items 0..n-1 in order, as libgpod
+        writes them; after a removal the old numbers would leave gaps and, with the next
+        addition, duplicates. Items that already have their number are left as they are."""
+        position = 0
+        for mhip in mhyp.children:
+            if mhip.magic != MHIP_MAGIC:
+                continue
+            for mhod in mhip.children:
+                if mhod.magic != MHOD_MAGIC or mhod.fields.get("mhod_type") != MHOD_ID_PLAYLIST:
+                    continue
+                raw = bytearray(mhod.raw_bytes)
+                at = mhod.header_len
+                if len(raw) >= at + 4 and struct.unpack_from("<I", raw, at)[0] != position:
+                    struct.pack_into("<I", raw, at, position)
+                    mhod.raw_bytes = bytes(raw)
+                    if "raw_body" in mhod.fields:
+                        mhod.fields["raw_body"] = bytes(raw[at:])
+                break
+            position += 1
 
     def _make_basic_header(self, magic: bytes, header_len: int) -> bytes:
         """Create a minimal header for a record type."""

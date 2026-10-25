@@ -45,9 +45,11 @@ MEDIA_DIRS = ("Music", "Photos/Full Resolution")
 PHOTO_MEDIA_DIRS = ("Full Resolution",)
 # never archived: pygpod's own lock / staging / temporary files
 _SKIP_NAMES = {"pygpod.lock", "pygpod.journal"}
-_SKIP_SUFFIXES = (".pygpod-new", ".pygpod-restore", ".tmp")
+_SKIP_SUFFIXES = (".pygpod-new", ".pygpod-restore", ".pygpod-orig", ".tmp")
 _JOURNAL = "iTunes/pygpod.journal"
 _RESTORE_SUFFIX = ".pygpod-restore"
+# a media file the restore replaces is kept under this name until the database is committed
+_ORIGINAL_SUFFIX = ".pygpod-orig"
 _FREE_SPACE_MARGIN = 16 * 1024 * 1024
 _CHUNK = 1024 * 1024
 _BACKUP_ATTEMPTS = 3
@@ -484,6 +486,60 @@ def _target_path(ipod_control: pathlib.Path, rel: str) -> pathlib.Path:
 _ASIDE_SUFFIX = ".pre-restore"
 
 
+def _inside(root: str, path) -> bool:
+    """Does ``path`` (symbolic links resolved) lie below ``root`` (a resolved directory)?"""
+    try:
+        return os.path.commonpath([root, os.path.realpath(str(path))]) == root
+    except ValueError:  # another drive (Windows)
+        return False
+
+
+def _check_inside(root: str, name: str, *paths) -> None:
+    for path in paths:
+        if not _inside(root, path):
+            raise BackupError(
+                f"{name}: its destination {path} lies outside the mount point (a symbolic "
+                "link?); nothing restored"
+            )
+
+
+def _destinations(target: pathlib.Path, name: str) -> Tuple[str, ...]:
+    """The file a member is restored to, the temporary file it is written to first and, for
+    media, where the file it replaces is kept until the commit."""
+    from .db.transaction import STAGING_SUFFIX
+
+    if _is_media_member(name):
+        return str(target), str(target) + _RESTORE_SUFFIX, str(target) + _ORIGINAL_SUFFIX
+    return str(target), str(target) + STAGING_SUFFIX
+
+
+def _same_file(path: pathlib.Path, size: int, sha1: str) -> bool:
+    """Does ``path`` already hold the archived content (size, then SHA-1)?"""
+    try:
+        if not path.is_file() or path.stat().st_size != size:
+            return False
+        digest = hashlib.sha1()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(_CHUNK), b""):
+                digest.update(chunk)
+    except OSError:
+        return False
+    return digest.hexdigest() == sha1
+
+
+def _asides(itunes: pathlib.Path, archived) -> List[pathlib.Path]:
+    """Position-indexed files in iTunes the archive does not replace (moved aside)."""
+    if not itunes.is_dir():
+        return []
+    return [
+        itunes / name
+        for name in sorted(os.listdir(str(itunes)))
+        if (itunes / name).is_file()
+        and _position_indexed(name)
+        and f"itunes/{name.lower()}" not in archived
+    ]
+
+
 def _position_indexed(name: str) -> bool:
     """Play count / OTG files: their entries are positions in the iTunesDB track list."""
     low = name.lower()
@@ -508,8 +564,71 @@ def _copy_member(src, path: str, expected_sha1: str, archive_path: str, name: st
         raise BackupError(f"{archive_path}: {name} is corrupted")
 
 
-def _restore_files(archive_path, ipod_control, wanted, tx, total, progress) -> None:
-    """Media files: written and renamed one by one. Database files: staged in ``tx``."""
+class _Signer(NamedTuple):
+    """How a restored iTunesDB is signed for another iPod (restore with force)."""
+
+    sign: Callable[[bytes], bytes]
+    hash_info: Optional[bytes]  # HashInfo to create (hash72 parameters not cached yet)
+
+
+def _signer_for(mountpoint: str, ipod_control: pathlib.Path) -> _Signer:
+    """The target's signature for a database restored from another iPod, worked out before
+    anything is written: its hash72 parameters come from its HashInfo or its current
+    iTunes/libgpod-signed iTunesDB, which the restore replaces (they would be lost).
+
+    Raises:
+        BackupError: the target needs a signature that cannot be computed here.
+    """
+    from .device.device import Device
+    from .hash.checksum import detect_checksum_type, update_checksums
+    from .hash.hash72 import extract_hash72_params, hash_info_bytes, read_hash_info
+
+    dev = Device.from_mountpoint(mountpoint)
+    current = _target_path(ipod_control, "iTunes/iTunesDB")
+    data = current.read_bytes() if current.is_file() else b""
+    if dev.requires_hash:
+        hash_type: Optional[str] = dev.checksum_type.name
+    elif dev.checksum_known:
+        hash_type = None  # unsigned model: the re-save after the commit clears the signature
+    else:  # model not identified: signed like its current database, as Database.save() does
+        hash_type = detect_checksum_type(data)
+    if not hash_type:
+        return _Signer(lambda db: db, None)
+    guid = dev.firewire_guid
+    if hash_type not in ("HASH58", "HASH72") or not guid:
+        raise BackupError(
+            f"this iPod needs a {hash_type} signature that cannot be computed here"
+            + ("" if guid else " (no FirewireGuid in its SysInfo)")
+            + ": nothing restored"
+        )
+    params, hash_info = None, None
+    if hash_type == "HASH72":
+        path = str(dev.device_dir / "HashInfo")
+        params = read_hash_info(path, guid)
+        if params is None:
+            params = extract_hash72_params(data)
+            if params is None:
+                raise BackupError(
+                    "this iPod needs hash72, but it has no Device/HashInfo and its database "
+                    "was not signed by iTunes: its signing parameters cannot be recovered and "
+                    "the restored database would not be accepted; nothing restored"
+                )
+            hash_info = hash_info_bytes(guid, *params)
+
+    def sign(db: bytes) -> bytes:
+        return update_checksums(db, guid, hash_type, hash72_params=params)
+
+    return _Signer(sign, hash_info)
+
+
+def _restore_files(
+    archive_path, root, wanted, tx, total, progress, sign=None, identical=(), replaced=None
+) -> None:
+    """Media files: written and renamed into place one by one, the file each replaces kept
+    aside (``replaced`` collects (target, aside or None) for the rollback); those in
+    ``identical`` (already as archived) are left alone. Database files: staged in ``tx``, the
+    iTunesDB passed through ``sign`` (another iPod's database). Every destination is checked
+    to lie below ``root`` (the resolved mount point) again right before it is written."""
     done = [0]
 
     def step(n: int, name: str) -> None:
@@ -523,24 +642,56 @@ def _restore_files(archive_path, ipod_control, wanted, tx, total, progress) -> N
                 continue
             f, base, rel = wanted[member.name]
             target = _target_path(base, rel)
+            _check_inside(root, member.name, target.parent, *_destinations(target, member.name))
             target.parent.mkdir(parents=True, exist_ok=True)
+            _check_inside(root, member.name, target.parent, *_destinations(target, member.name))
+            if member.name in identical:
+                step(f.size, member.name)
+                continue
             src = tar.extractfile(member)
             if _is_media_member(member.name):
-                tmp = str(target) + _RESTORE_SUFFIX
+                _, tmp, original = _destinations(target, member.name)
                 try:
                     _copy_member(src, tmp, f.sha1, archive_path, member.name, step)
+                    aside = None
+                    if os.path.lexists(original):
+                        # left by an interrupted restore: it is the file the database on the
+                        # iPod still refers to; keep it until this restore commits
+                        aside = original
+                    elif target.exists():
+                        os.replace(str(target), original)
+                        aside = original
+                    if replaced is not None:
+                        replaced.append((str(target), aside))
                     os.replace(tmp, str(target))
                 except BaseException:
                     if os.path.exists(tmp):
                         os.unlink(tmp)
                     raise
             else:
-                tx.stage_with(
-                    str(target),
-                    lambda path, src=src, f=f, name=member.name: _copy_member(
-                        src, path, f.sha1, archive_path, name, step
-                    ),
-                )
+                resign = sign if member.name.lower() == f"{ROOT}/iTunes/iTunesDB".lower() else None
+
+                def write(path, src=src, f=f, name=member.name, resign=resign) -> None:
+                    _copy_member(src, path, f.sha1, archive_path, name, step)
+                    if resign is not None:
+                        with open(path, "rb") as fh:
+                            data = resign(fh.read())
+                        with open(path, "wb") as fh:
+                            fh.write(data)
+
+                tx.stage_with(str(target), write)
+
+
+def _roll_back_media(replaced: List[Tuple[str, Optional[str]]]) -> None:
+    """Undo the media replacements of a restore that did not commit (newest first)."""
+    for target, aside in reversed(replaced):
+        try:
+            if aside is not None:
+                os.replace(aside, target)
+            else:
+                os.unlink(target)
+        except OSError:
+            logger.warning("Could not restore %s", target, exc_info=True)
 
 
 def restore(
@@ -556,16 +707,26 @@ def restore(
     The whole archive is verified first (manifest, sizes, SHA-1); a corrupted archive raises
     before anything is written. The target is the same iPod or a freshly initialised one
     (``init_ipod``); an iPod with another FirewireGuid is refused unless ``force=True``, which
-    keeps the target's ``Device`` files and re-signs the database for it. Files not in the
+    keeps the target's ``Device`` files and re-signs the database for it (a hash72 iPod's
+    signing parameters come from its HashInfo or its current iTunes-signed database, which is
+    replaced: HashInfo is created with the database; without either the restore is refused
+    before anything is written). Files not in the
     archive are left alone, except play count and On-The-Go files (their entries are track
     positions of the database being replaced): those are moved to ``<name>.pre-restore``.
     The writer lock is held while files are replaced; the database files are committed
-    together through the same journal as Database.save(). A target with an interrupted
-    save is refused. ``include_media=False`` restores the database and artwork only.
+    together through the same journal as Database.save(). Media files already as archived
+    (same size and SHA-1) are not rewritten; every media file the restore replaces is kept
+    as ``<name>.pygpod-orig`` until the database is committed, so a restore that fails puts
+    the old files back (the iPod stays as before). If the restore is interrupted (power
+    loss), run it again: it completes and removes the kept files. A target with an
+    interrupted save is refused. ``include_media=False`` restores the database and artwork only.
     ``dry_run=True`` verifies and plans but writes nothing.
 
     Raises:
-        BackupError: corrupted/unsupported archive, other iPod without force, not enough space.
+        BackupError: corrupted/unsupported archive, other iPod without force, not enough space,
+            a target whose database signature cannot be computed (force), a destination
+            outside the mount point (a symbolic link in place of a folder or
+            file of the target; checked for every file before anything is written).
     """
     from .db.transaction import interrupted_commit
     from .device.mountpoint import _find_ipod_control
@@ -603,58 +764,95 @@ def restore(
         plan.append((_write_order(f.path), f, ipod_control if root == ROOT else photos, rel))
     plan.sort(key=lambda x: x[0])
 
-    # media files go into place one by one (one temporary copy at a time); database files are
-    # staged together and renamed at the end
-    needed = largest = 0
+    # every destination below the mount point, before anything is written: a symbolic link in
+    # place of a folder (possible on a directory target, not on the iPod's FAT) must not lead
+    # the restore outside it
+    real_mp = os.path.realpath(mountpoint)
     for _, f, base, rel in plan:
-        if _is_media_member(f.path):
-            target = _target_path(base, rel)
-            existing = target.stat().st_size if target.is_file() else 0
-            needed += max(0, f.size - existing)
-            largest = max(largest, f.size)
+        _check_inside(real_mp, f.path, *_destinations(_target_path(base, rel), f.path))
+    archived = {
+        rel.lower() for r, rel in map(_member_root, (f.path for f in info.files)) if r == ROOT
+    }
+    itunes = _target_path(ipod_control, "iTunes")
+    _check_inside(real_mp, f"{ROOT}/iTunes", itunes)
+    for path in _asides(itunes, archived):
+        aside = pathlib.Path(str(path) + _ASIDE_SUFFIX)
+        _check_inside(real_mp, f"{ROOT}/iTunes/{path.name}", path, *_destinations(aside, ""))
+
+    # media files go into place one by one, each replaced file kept aside until the database
+    # is committed (a failed restore puts them back); files already as archived are left
+    # alone; database files are staged together and renamed at the end
+    needed = 0
+    identical = set()
+    for _, f, base, rel in plan:
+        if _is_media_member(f.path) and _same_file(_target_path(base, rel), f.size, f.sha1):
+            identical.add(f.path)
         else:
             needed += f.size
-    needed += largest
     free = shutil.disk_usage(mountpoint).free
     if needed + _FREE_SPACE_MARGIN > free:
         raise BackupError(f"not enough free space: need {needed} bytes, {free} free")
 
+    signer = _signer_for(mountpoint, ipod_control) if other_ipod else None
     written = [f.path for _, f, _, _ in plan]
     if dry_run:
         return RestoreResult(info, written, skipped, 0, False, True)
 
     wanted = {f.path: (f, base, rel) for _, f, base, rel in plan}
     total = sum(f.size for f, _, _ in wanted.values())
-    archived = {
-        rel.lower() for root, rel in map(_member_root, (f.path for f in info.files)) if root == ROOT
-    }
-    itunes = _target_path(ipod_control, "iTunes")
     itunes.mkdir(parents=True, exist_ok=True)
 
     from .db.transaction import Transaction
     from .db.writelock import writer_lock
 
+    replaced: List[Tuple[str, Optional[str]]] = []
     with writer_lock(str(itunes)):  # no save may run while the files are replaced
         tx = Transaction(mountpoint)
         try:
-            _restore_files(archive_path, ipod_control, wanted, tx, total, progress)
+            _restore_files(
+                archive_path,
+                real_mp,
+                wanted,
+                tx,
+                total,
+                progress,
+                signer and signer.sign,
+                identical,
+                replaced,
+            )
+            if signer and signer.hash_info:  # committed with the database signed by it
+                device = _target_path(ipod_control, "Device")
+                device.mkdir(parents=True, exist_ok=True)
+                hash_info = _target_path(device, "HashInfo")
+                _check_inside(real_mp, f"{ROOT}/Device/HashInfo", hash_info)
+                tx.stage_bytes(str(hash_info), signer.hash_info)
             # files indexed by track position that the archive does not replace would point
             # at the wrong tracks of the restored database: moved aside, not deleted
-            for name in sorted(os.listdir(str(itunes))):
-                path = itunes / name
-                if (
-                    path.is_file()
-                    and _position_indexed(name)
-                    and f"itunes/{name.lower()}" not in archived
-                ):
-                    data = path.read_bytes()
-                    tx.stage_bytes(str(path) + _ASIDE_SUFFIX, data)
-                    tx.delete_on_commit(str(path))
-                    skipped.append(f"{ROOT}/iTunes/{name} (moved to {name}{_ASIDE_SUFFIX})")
+            for path in _asides(itunes, archived):
+                name = path.name
+                aside = pathlib.Path(str(path) + _ASIDE_SUFFIX)
+                _check_inside(real_mp, f"{ROOT}/iTunes/{name}", path, *_destinations(aside, ""))
+                tx.stage_bytes(str(aside), path.read_bytes())
+                tx.delete_on_commit(str(path))
+                skipped.append(f"{ROOT}/iTunes/{name} (moved to {name}{_ASIDE_SUFFIX})")
             tx.commit()  # database files all or none (journal), like Database.save()
         except BaseException:
             tx.abort()
+            if not interrupted_commit(mountpoint):  # not committed: the old media back
+                _roll_back_media(replaced)
             raise
+        # committed: the replaced files (also those an interrupted restore kept) go
+        asides = [aside for _, aside in replaced if aside is not None]
+        for name in identical:
+            _, base, rel = wanted[name]
+            asides.append(str(_target_path(base, rel)) + _ORIGINAL_SUFFIX)
+        for aside in asides:
+            try:
+                os.unlink(aside)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.warning("Could not remove %s", aside, exc_info=True)
 
     resigned = False
     if other_ipod:

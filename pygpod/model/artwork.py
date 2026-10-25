@@ -286,16 +286,19 @@ def fit_size(src_width: int, src_height: int, width: int, height: int) -> Tuple[
     return min(width, math.ceil(src_width * (height / src_height))), height
 
 
-def _open_rgb(image: Union[str, bytes]) -> Any:
+def _open_rgb(image: Union[str, bytes, Any]) -> Any:
+    """Decode ``image`` (path, encoded bytes or a Pillow image) to an RGB Pillow image."""
     from PIL import Image  # type: ignore
 
+    if isinstance(image, Image.Image):
+        return image if image.mode == "RGB" else image.convert("RGB")
     if isinstance(image, (bytes, bytearray)):
         return Image.open(io.BytesIO(bytes(image))).convert("RGB")
     return Image.open(image).convert("RGB")
 
 
 def render_fitted_thumbnail(
-    image: Union[str, bytes],
+    image: Union[str, bytes, Any],
     w: int,
     h: int,
     pixel_fmt: PixelFormat,
@@ -304,13 +307,14 @@ def render_fitted_thumbnail(
     back_color: Tuple[int, int, int] = (0, 0, 0),
     row_width: int = 0,
 ) -> Optional[FittedThumbnail]:
-    """Scale an image (path or encoded bytes) to fit ``w`` x ``h`` like libgpod does for photos.
+    """Scale an image (path, encoded bytes or a Pillow image) to fit ``w`` x ``h`` like libgpod.
 
     The image keeps its aspect ratio (:func:`fit_size`) and is centred on a ``w`` x ``h`` slot
     of ``back_color``, which is encoded as ``pixel_fmt``. With ``crop`` it is scaled to fill
     the whole slot and the overhang cut off (centred; no padding). ``row_width`` (> ``w``)
     stores each row that many pixels wide, the extra pixels in ``back_color`` (libgpod's
-    RowBytesAlignment). None without Pillow.
+    RowBytesAlignment). None without Pillow. Rendering several formats from one source is
+    faster with the image decoded once (``_open_rgb``) and passed in; it is not modified.
     """
     try:
         from PIL import Image  # type: ignore
@@ -512,34 +516,56 @@ def _unpack_i420(data: bytes, w: int, h: int) -> bytes:
 # ============================================================================
 # Pixel format packing (RGB → iPod format)
 # ============================================================================
-def _pack_rgb565(img: Any, big_endian: bool = False) -> bytes:
-    """Pack PIL Image to RGB565."""
-    w, h = img.size
-    pixels = img.tobytes()
-    fmt = ">" if big_endian else "<"
-    result = bytearray(w * h * 2)
-    for i in range(w * h):
-        r = pixels[i * 3]
-        g = pixels[i * 3 + 1]
-        b = pixels[i * 3 + 2]
-        pixel = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
-        struct.pack_into(f"{fmt}H", result, i * 2, pixel)
+def _table(fn: Any) -> bytes:
+    """A ``bytes.translate`` table mapping every byte value ``v`` to ``fn(v) & 0xFF``."""
+    return bytes(fn(v) & 0xFF for v in range(256))
+
+
+def _or_bytes(a: bytes, b: bytes) -> bytes:
+    """Bytewise OR of two equally long byte strings (one big-integer OR, done in C)."""
+    n = len(a)
+    return (int.from_bytes(a, "big") | int.from_bytes(b, "big")).to_bytes(n, "big")
+
+
+def _interleave16(hi: bytes, lo: bytes, big_endian: bool) -> bytes:
+    """Interleave the high and low bytes of 16-bit pixels in the requested byte order."""
+    result = bytearray(len(hi) * 2)
+    result[0::2], result[1::2] = (hi, lo) if big_endian else (lo, hi)
     return bytes(result)
+
+
+# Byte tables for the 16-bit packers: each channel's share of the pixel's high and low byte.
+# The bits of the two shares never overlap, so OR-ing them builds the byte.
+_RGB565_R_HI = _table(lambda v: v & 0xF8)
+_RGB565_G_HI = _table(lambda v: v >> 5)
+_RGB565_G_LO = _table(lambda v: (v << 3) & 0xE0)
+_RGB565_B_LO = _table(lambda v: v >> 3)
+_RGB555_R_HI = _table(lambda v: (v >> 1) & 0x7C)
+_RGB555_G_HI = _table(lambda v: v >> 6)
+_RGB555_G_LO = _table(lambda v: (v << 2) & 0xE0)
+_RGB555_B_LO = _RGB565_B_LO
+
+
+def _pack_rgb565(img: Any, big_endian: bool = False) -> bytes:
+    """Pack PIL Image to RGB565.
+
+    Each pixel is ``(r >> 3) << 11 | (g >> 2) << 5 | b >> 3``; the channels are split and
+    combined with byte-string operations instead of a per-pixel loop.
+    """
+    pixels = img.tobytes()
+    r, g, b = pixels[0::3], pixels[1::3], pixels[2::3]
+    hi = _or_bytes(r.translate(_RGB565_R_HI), g.translate(_RGB565_G_HI))
+    lo = _or_bytes(g.translate(_RGB565_G_LO), b.translate(_RGB565_B_LO))
+    return _interleave16(hi, lo, big_endian)
 
 
 def _pack_rgb555(img: Any, big_endian: bool = False) -> bytes:
-    """Pack PIL Image to RGB555."""
-    w, h = img.size
+    """Pack PIL Image to RGB555 (``(r >> 3) << 10 | (g >> 3) << 5 | b >> 3``, top bit 0)."""
     pixels = img.tobytes()
-    fmt = ">" if big_endian else "<"
-    result = bytearray(w * h * 2)
-    for i in range(w * h):
-        r = pixels[i * 3]
-        g = pixels[i * 3 + 1]
-        b = pixels[i * 3 + 2]
-        pixel = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)
-        struct.pack_into(f"{fmt}H", result, i * 2, pixel)
-    return bytes(result)
+    r, g, b = pixels[0::3], pixels[1::3], pixels[2::3]
+    hi = _or_bytes(r.translate(_RGB555_R_HI), g.translate(_RGB555_G_HI))
+    lo = _or_bytes(g.translate(_RGB555_G_LO), b.translate(_RGB555_B_LO))
+    return _interleave16(hi, lo, big_endian)
 
 
 def _pack_rgb888(img: Any, bgr: bool = False) -> bytes:
@@ -547,12 +573,9 @@ def _pack_rgb888(img: Any, bgr: bool = False) -> bytes:
     pixels = img.tobytes()
     if not bgr:
         return pixels
-    w, h = img.size
-    result = bytearray(w * h * 3)
-    for i in range(w * h):
-        result[i * 3] = pixels[i * 3 + 2]
-        result[i * 3 + 1] = pixels[i * 3 + 1]
-        result[i * 3 + 2] = pixels[i * 3]
+    result = bytearray(len(pixels))
+    result[0::3], result[2::3] = pixels[2::3], pixels[0::3]
+    result[1::3] = pixels[1::3]
     return bytes(result)
 
 

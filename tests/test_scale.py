@@ -53,9 +53,9 @@ def test_remove_tracks_from_playlists_and_files(writable_ipod):
         db.add_track_to_playlist(pl, t)
     db.remove_tracks(copies[:2], delete_files=True)
     assert [t.title for t in pl.tracks] == ["C2", "C3"]
+    db.save()  # the files go with the save
     assert not os.path.exists(os.path.join(writable_ipod, "iPod_Control", "Music", "F01", "c0.mp3"))
     assert os.path.exists(os.path.join(writable_ipod, "iPod_Control", "Music", "F01", "c2.mp3"))
-    db.save()
     assert [t.title for t in Database(writable_ipod).get_playlist("Mix").tracks] == ["C2", "C3"]
     db.remove_tracks([])  # no-op
 
