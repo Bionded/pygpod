@@ -67,12 +67,14 @@ pip install "pygpod[all]"
 | `tags` | [mutagen](https://mutagen.readthedocs.io/) | reading tags, cover art, chapters and gapless data from files |
 | `artwork` | [Pillow](https://pillow.readthedocs.io/) | cover art and photos |
 | `usb` | [pyusb](https://pyusb.github.io/pyusb/) | finding iPods on USB (`discover`, model/GUID when SysInfo lacks them) |
-| `all` | all of the above | |
+| `all` | all of the above, plus [tzdata](https://pypi.org/project/tzdata/) on Windows | |
 
 Without the extras pygpod still reads and writes databases; you pass the metadata yourself and
 artwork is not available (pygpod warns on import about what is missing). `ffmpeg` and `ffprobe`
 are needed only for conversion (`convert=True`), Sound Check analysis and the gapless estimate.
-Python 3.8 or newer; Linux, macOS and Windows.
+Python 3.8 or newer; Linux, macOS and Windows. Windows has no time zone database of its own:
+without `tzdata` (in `all`, or `pip install tzdata`; Python 3.9+) a city time zone set on a Classic
+or nano 3G/4G cannot be resolved and pygpod uses the computer's UTC offset for the iPod's timestamps.
 
 ## Quick start
 

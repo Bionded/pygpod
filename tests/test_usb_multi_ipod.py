@@ -10,6 +10,7 @@ real USB access.
 import json
 import os
 import plistlib
+import sys
 from unittest import mock
 
 import pytest
@@ -139,6 +140,12 @@ def _fake_sysfs(root):
     return root
 
 
+# sysfs names such as 1-1:1.0 and 0:0:0:0 cannot be created on Windows
+linux_sysfs = pytest.mark.skipif(
+    sys.platform == "win32", reason="the fake Linux sysfs tree needs ':' in file names"
+)
+
+
 @pytest.fixture
 def fake_linux(tmp_path, monkeypatch):
     monkeypatch.setattr(usb_mod, "_SYSFS_ROOT", str(_fake_sysfs(tmp_path / "sys")))
@@ -149,6 +156,8 @@ def fake_linux(tmp_path, monkeypatch):
     return monkeypatch
 
 
+@linux_sysfs
+@linux_sysfs
 @pytest.mark.parametrize(
     "devnum, guid, pid, capacity",
     [((8, 2), GUID, 0x1261, 80.0), ((8, 18), "000A2700BBBBBBBB", 0x1205, 4.0)],
@@ -160,6 +169,7 @@ def test_linux_mountpoint_maps_to_its_own_ipod(fake_linux, devnum, guid, pid, ca
     assert (dev.firewire_guid, dev.product_id, dev.capacity_gb) == (guid, pid, capacity)
 
 
+@linux_sysfs
 def test_linux_scsi_serial_read_from_the_mapped_disk(fake_linux):
     seen = []
     fake_linux.setattr(usb_mod, "_read_scsi_serial", lambda dev: seen.append(dev) or "8K74729BY5N")
@@ -168,17 +178,20 @@ def test_linux_scsi_serial_read_from_the_mapped_disk(fake_linux):
     assert seen == ["/dev/sdy"] and dev.serial == "8K74729BY5N"
 
 
+@linux_sysfs
 def test_linux_non_usb_mountpoint_two_ipods_no_guess(fake_linux):
     fake_linux.setattr(usb_mod, "_block_devnum", lambda mp: (259, 2))
     assert detect_ipod_usb_for_mountpoint("/home/me/ipod-copy") is None
 
 
+@linux_sysfs
 def test_linux_unknown_devnum_one_ipod_uses_it(fake_linux):
     fake_linux.setattr(usb_mod, "_block_devnum", lambda mp: (7, 0))
     fake_linux.setattr(usb_mod, "detect_ipod_usb", lambda: [_usb(GUID, "THISSERIAL")])
     assert detect_ipod_usb_for_mountpoint("/mnt/x").firewire_guid == GUID
 
 
+@linux_sysfs
 def test_device_from_mapped_mountpoint_gets_its_own_guid(fake_linux, tmp_path):
     """Device.from_mountpoint on a mapped mountpoint takes this iPod's GUID, not the first."""
     from pygpod.device.device import Device
@@ -328,6 +341,7 @@ def test_windows_unmapped_drive_two_ipods_no_guess(monkeypatch, drive):
     assert detect_ipod_usb_for_mountpoint(drive) is None
 
 
+@linux_sysfs
 def test_linux_bus_scan_gives_each_ipod_its_own_capacity(fake_linux):
     """Without pyusb, the sysfs scan pairs every iPod with its own disk (capacity)."""
     fake_linux.setattr(usb_mod, "_detect_pyusb", lambda: None)
@@ -356,3 +370,16 @@ def test_windows_bus_scan_gives_each_ipod_its_own_serial(monkeypatch):
     monkeypatch.setattr(usb_mod, "_run_powershell", run_powershell)
     found = {d.firewire_guid: d.serial for d in usb_mod._detect_windows_wmi()}
     assert found == {GUID: "8K74729BY5N", "000A2700BBBBBBBB": "9C7311XYZ"}
+
+
+def test_powershell_output_decoded_as_utf8(monkeypatch):
+    seen = {}
+
+    def check_output(cmd, **kwargs):
+        seen["cmd"] = cmd
+        raw = "USB\\VID_05AC&PID_1261\\Ґанок\r\n".encode("utf-8")
+        return raw.decode(kwargs.get("encoding") or "cp1252", kwargs.get("errors") or "strict")
+
+    monkeypatch.setattr(usb_mod.subprocess, "check_output", check_output)
+    assert usb_mod._run_powershell("Get-PnpDevice") == ["USB\\VID_05AC&PID_1261\\Ґанок"]
+    assert seen["cmd"][-1].startswith("[Console]::OutputEncoding = [Text.Encoding]::UTF8; ")

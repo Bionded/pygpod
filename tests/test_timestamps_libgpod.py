@@ -16,7 +16,7 @@ from pygpod.device.mountpoint import init_ipod
 from pygpod.model.config import DatabaseConfig
 from pygpod.model.database import Database
 
-from .conftest import _make_minimal_mp3
+from .conftest import _make_minimal_mp3, require_tz_database
 
 GUID = "000A2700213749FF"
 SYSINFO = f"ModelNumStr: xB029\nFirewireGuid: 0x{GUID}\n".encode()  # Classic: hash58
@@ -130,6 +130,7 @@ def test_times_written_by_libgpod_read_by_pygpod(tool, tmp_path, host_tz, zone):
 @pytest.mark.libgpod
 @pytest.mark.parametrize("city,shift", [(0xC2, 9 * 3600), (0x4F, None)])  # Tokyo, London
 def test_the_ipods_timezone_wins_over_the_host(tool, tmp_path, host_tz, city, shift):
+    require_tz_database()
     host_tz("America/New_York")
     mp = _ipod(tmp_path)
     _set_prefs_city(mp, city)

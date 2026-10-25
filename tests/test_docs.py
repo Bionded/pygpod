@@ -29,7 +29,6 @@ def test_every_public_name_is_documented():
     assert not missing, missing
 
 
-@pytest.mark.skipif(sys.version_info < (3, 13), reason="generated with Python 3.13 formatting")
 def test_reference_sections_are_up_to_date():
     proc = subprocess.run(
         [sys.executable, os.path.join(DOCS, "gen_reference.py"), "--check"],

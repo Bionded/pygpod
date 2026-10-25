@@ -227,3 +227,41 @@ def test_flac_with_cover_picture_stays_audio(tmp_path):
     mp = _ipod(tmp_path, "B029")
     track = Database(mp).add_track(src, convert=True)
     assert _copied(mp).endswith(".m4a") and not track.movie_flag
+
+
+def _cp1252_locale(monkeypatch):
+    """subprocess text mode decodes with cp1252, the locale default of a Western Windows."""
+    real_run = subprocess.run
+
+    def run(cmd, **kwargs):
+        if kwargs.get("text") or kwargs.get("universal_newlines"):
+            kwargs.setdefault("encoding", "cp1252")
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(convert.subprocess, "run", run)
+
+
+def test_probe_video_decodes_utf8_output_whatever_the_locale(tmp_path, monkeypatch):
+    # 'Ґ' is D2 90 in UTF-8; 0x90 has no cp1252 character, so a locale decode fails
+    src = str(tmp_path / "Ґанок.mp4")
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25",
+            "-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-metadata", "title=Ґанок", src,
+        ],
+        check=True,
+        timeout=120,
+    )  # fmt: skip
+    _cp1252_locale(monkeypatch)
+    probe = convert.probe_video(src)
+    assert probe["video"]["codec_name"] == "h264"
+    mp = _ipod(tmp_path, "B029")
+    track = Database(mp).add_track(src, convert=True)
+    assert track.title == "Ґанок" and track.movie_flag
+
+
+def test_probe_video_without_output_returns_none(tmp_path, monkeypatch):
+    src = _make(tmp_path / "clip.mp4")
+    done = subprocess.CompletedProcess([], 0, stdout=None, stderr=None)
+    monkeypatch.setattr(convert.subprocess, "run", lambda cmd, **kwargs: done)
+    assert convert.probe_video(src) is None

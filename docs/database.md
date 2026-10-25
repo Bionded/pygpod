@@ -68,7 +68,9 @@ files with `delete_file(s)=True`). Playlists: `create_playlist()`, `set_playlist
 Track times (added, modified, played, skipped, released), playlist and photo dates are stored on
 the iPod as its local wall time, as iTunes and libgpod do. pygpod converts them with the timezone
 set on the iPod (`iPod_Control/Device/Preferences`), else with the computer's current UTC offset
-(`db.timezone_shift`, seconds east of UTC). The `datetime` values pygpod returns are aware (UTC).
+(`db.timezone_shift`, seconds east of UTC). The Classic and nano 3G/4G store a city; its offset
+comes from the IANA time zone database (`zoneinfo`; on Windows install `tzdata`, part of the
+`all` extra). The `datetime` values pygpod returns are aware (UTC).
 Dates outside the iPod's range (1904-01-01 to 2040-02-06) are clamped to its ends with a warning.
 `DatabaseConfig(timestamps="utc")` reads and writes them as UTC instead (pygpod 0.1.0's
 behaviour).

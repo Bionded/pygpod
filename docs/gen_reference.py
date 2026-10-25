@@ -2,8 +2,9 @@
 
 Each page keeps its hand-written text; the part between ``<!-- reference:start -->`` and
 ``<!-- reference:end -->`` is generated here (signatures, docstrings, property tables, enum
-members, CLI help). Output depends on the Python version (argparse/inspect formatting):
-generate with Python 3.13. Run from the repository root:
+members, CLI help). Every documented module uses ``from __future__ import annotations``, so
+signatures look the same on every Python version. Only argparse formats ``--help`` differently
+before Python 3.13: there ``--check`` skips cli.md. Run from the repository root:
 
     python docs/gen_reference.py           # rewrite the pages
     python docs/gen_reference.py --check   # exit 1 if a page is out of date (tests use it)
@@ -152,7 +153,9 @@ def _function(obj, level: str = "###") -> str:
 def _class(cls) -> str:
     out = f"### `{_qualname(cls)}`\n\n"
     if issubclass(cls, enum.Enum):
-        out += _code(_doc(cls)) if cls.__doc__ != enum.Enum.__doc__ else ""
+        # Python < 3.11 gives enums without a docstring "An enumeration."
+        default = cls.__doc__ in (enum.Enum.__doc__, "An enumeration.")
+        out += _code(_doc(cls)) if not default else ""
         out += "| member | value |\n|---|---|\n"
         out += "".join(f"| `{m.name}` | `{m.value!r}` |\n" for m in cls)
         return out + "\n"
@@ -251,7 +254,10 @@ def update(path: str, check: bool) -> bool:
 def main(argv) -> int:
     check = "--check" in argv
     docs = os.path.join(ROOT, "docs")
-    stale = [p for p in [*PAGES, "cli.md"] if not update(os.path.join(docs, p), check)]
+    pages = [*PAGES, "cli.md"]
+    if check and sys.version_info < (3, 13):
+        pages.remove("cli.md")  # argparse --help formatting changed in 3.10 and 3.13
+    stale = [p for p in pages if not update(os.path.join(docs, p), check)]
     if stale and check:
         print("out of date (run python docs/gen_reference.py):", ", ".join(stale))
         return 1

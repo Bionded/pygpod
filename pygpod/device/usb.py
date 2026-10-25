@@ -413,7 +413,10 @@ def _detect_macos_ioreg() -> List[USBDeviceInfo]:
     results = []
     try:
         output = subprocess.check_output(
-            ["system_profiler", "SPUSBDataType", "-detailLevel", "mini"], text=True, timeout=10
+            ["system_profiler", "SPUSBDataType", "-detailLevel", "mini"],
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
         )
         # Basic parsing of system_profiler output
         # This is a simplified parser
@@ -554,8 +557,15 @@ def _run_powershell(command: str) -> List[str]:
     """Run a PowerShell command and return output lines."""
     try:
         output = subprocess.check_output(
-            ["powershell", "-NoProfile", "-Command", command],
-            text=True,
+            # UTF-8 output instead of the console code page
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "[Console]::OutputEncoding = [Text.Encoding]::UTF8; " + command,
+            ],
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             stderr=subprocess.DEVNULL,
         )
@@ -776,21 +786,17 @@ def _read_serial_macos() -> Optional[str]:
     """Read iPod serial on macOS via diskutil or system_profiler."""
     # Try diskutil first - it reads the SCSI serial for USB mass storage
     try:
-        output = subprocess.check_output(
-            ["diskutil", "list", "-plist", "external"], text=True, timeout=10
-        )
+        output = subprocess.check_output(["diskutil", "list", "-plist", "external"], timeout=10)
         import plistlib
 
-        plist = plistlib.loads(output.encode())
+        plist = plistlib.loads(output)
         for disk_name in plist.get("AllDisksAndPartitions", []):
             dev = disk_name.get("DeviceIdentifier", "")
             if not dev:
                 continue
             try:
-                info_out = subprocess.check_output(
-                    ["diskutil", "info", "-plist", dev], text=True, timeout=10
-                )
-                info = plistlib.loads(info_out.encode())
+                info_out = subprocess.check_output(["diskutil", "info", "-plist", dev], timeout=10)
+                info = plistlib.loads(info_out)
                 vendor = info.get("MediaName", "") or info.get("IORegistryEntryName", "")
                 if "iPod" in vendor or "Apple" in vendor:
                     # Get serial from IOKit - try system_profiler
@@ -810,7 +816,10 @@ def _macos_ioreg_serial() -> Optional[str]:
     """Read iPod serial from macOS ioreg (IOKit registry)."""
     try:
         output = subprocess.check_output(
-            ["ioreg", "-r", "-c", "IOUSBHostDevice", "-l"], text=True, timeout=10
+            ["ioreg", "-r", "-c", "IOUSBHostDevice", "-l"],
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
         )
         in_apple = False
         for line in output.splitlines():
@@ -864,6 +873,7 @@ def _read_serial_windows() -> Optional[str]:
                 "/value",
             ],
             text=True,
+            errors="replace",  # console code page
             timeout=10,
             stderr=subprocess.DEVNULL,
         )

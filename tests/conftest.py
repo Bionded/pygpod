@@ -27,6 +27,14 @@ def pytest_sessionfinish(session, exitstatus):
         shutil.rmtree(test_files, ignore_errors=True)
 
 
+def require_tz_database():
+    """Skip the calling test without an IANA time zone database (Windows without tzdata)."""
+    from pygpod.utils.timezone import _get_tz_offset
+
+    if _get_tz_offset("Asia/Tokyo") is None:
+        pytest.skip("no IANA time zone database (install tzdata)")
+
+
 # Root of the project
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 

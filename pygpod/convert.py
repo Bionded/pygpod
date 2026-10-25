@@ -10,6 +10,8 @@ Classic). Needs the ``ffmpeg`` program (and ``ffprobe`` to check video); nothing
 unless asked for.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -26,6 +28,9 @@ logger = logging.getLogger(__name__)
 LOSSLESS_CODECS = {"flac", "ape", "wavpack", "tta", "optimfrog", "alac", "wav", "aiff"}
 DEFAULT_AAC_BITRATE = "256k"
 TIMEOUT_S = 600
+# ffmpeg and ffprobe write UTF-8 (tags, paths) whatever the locale; decoding with the locale
+# default (e.g. cp1252 on Windows) fails on the first non-ASCII byte
+_UTF8 = {"encoding": "utf-8", "errors": "replace"}
 
 
 def find_ffmpeg() -> str:
@@ -89,9 +94,9 @@ def probe_video(filepath: str) -> Optional[Dict[str, Any]]:
         return None
     cmd = [ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", filepath]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        data = json.loads(proc.stdout) if proc.returncode == 0 else None
-    except (OSError, subprocess.TimeoutExpired, ValueError):
+        proc = subprocess.run(cmd, capture_output=True, **_UTF8, timeout=60)
+        data = json.loads(proc.stdout) if proc.returncode == 0 and proc.stdout else None
+    except (OSError, subprocess.TimeoutExpired, ValueError, TypeError):
         logger.debug("ffprobe failed on %s", filepath, exc_info=True)
         return None
     if not isinstance(data, dict):
@@ -217,7 +222,7 @@ def convert_video_for_ipod(
     cmd += ["-movflags", "+faststart", "-f", "ipod", dest]
     timeout = max(TIMEOUT_S, 2 * _num(probe.get("duration")))
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, capture_output=True, **_UTF8, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as e:
         os.unlink(dest)
         raise UnsupportedFormatError(f"{filepath}: video conversion failed: {e}") from e
@@ -292,7 +297,7 @@ def convert_for_ipod(
         cmd += ["-ac", "2"]
     cmd += ["-f", "ipod", dest]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT_S)
+        proc = subprocess.run(cmd, capture_output=True, **_UTF8, timeout=TIMEOUT_S)
     except (OSError, subprocess.TimeoutExpired) as e:
         os.unlink(dest)
         raise UnsupportedFormatError(f"{filepath}: conversion failed: {e}") from e

@@ -8,6 +8,7 @@ from unittest import mock
 
 import pytest
 
+from pygpod.utils import timezone as timezone_mod
 from pygpod.utils.timezone import (
     _CITY_TIMEZONES,
     _get_tz_offset,
@@ -22,6 +23,8 @@ from pygpod.utils.timezone import (
     read_timezone_from_device,
     read_timezone_from_prefs,
 )
+
+from .conftest import require_tz_database
 
 # ---------------------------------------------------------------------------
 # get_local_tz_offset
@@ -94,6 +97,8 @@ class TestReadTimezoneFromPrefs:
         ],
     )
     def test_formats(self, tmp_path, size, offset, value, expected):
+        if offset == 0xB70:  # a city
+            require_tz_database()
         assert read_timezone_from_prefs(_write(tmp_path, _prefs(size, offset, value))) == expected
 
     @pytest.mark.parametrize("size", [1000, 2956, 2893])
@@ -156,6 +161,7 @@ class TestParseTz6g:
 
     def test_legacy_zone_names_resolve(self):
         # libgpod's table names e.g. "PST8PDT", which newer tz databases may not ship
+        require_tz_database()
         assert _get_tz_offset("PST8PDT") in (-8 * 3600, -7 * 3600)
 
 
@@ -504,5 +510,12 @@ class TestCityTimezones:
         assert len(_CITY_TIMEZONES) == 204
 
     def test_every_zone_resolves(self):
+        require_tz_database()
         for idx, name in _CITY_TIMEZONES.items():
             assert _get_tz_offset(name) is not None, f"city 0x{idx:02x}: {name}"
+
+
+def test_tz_tests_skip_without_a_tz_database(monkeypatch):
+    monkeypatch.setattr(timezone_mod, "_zone_offset", lambda name: None)
+    with pytest.raises(pytest.skip.Exception, match="tzdata"):
+        require_tz_database()
