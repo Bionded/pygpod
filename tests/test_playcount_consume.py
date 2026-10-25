@@ -5,6 +5,7 @@ import os
 import pytest
 
 from pygpod.db.playcounts import PLAY_COUNTS_COMMIT_FILE
+from pygpod.model.config import DatabaseConfig
 from pygpod.model.database import Database
 
 from .test_playcount_merge import _write_play_counts_file
@@ -192,7 +193,7 @@ def test_unrelated_files_untouched(ipod):
         with open(path, "wb") as f:
             f.write(data)
         others[path] = data
-    Database(mp).save()
+    Database(mp, config=DatabaseConfig(otg_on_save="keep")).save()  # 'import' consumes OTG
     assert not os.path.isfile(os.path.join(itunes, "Play Counts"))
     for path, data in others.items():
         with open(path, "rb") as f:
@@ -214,7 +215,7 @@ def _write_plist(itunes):
 
 
 def test_all_play_count_files_deleted_after_save(ipod):
-    """Like libgpod: every variant goes after a save, not only the one that was read (task 96)."""
+    """Like libgpod: every variant goes after a save, not only the one that was read."""
     mp, base = ipod
     itunes = _itunes(mp)
     pc = _write_play_counts_file(itunes, [{"play_count": 1}] * len(base))

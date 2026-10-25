@@ -27,6 +27,7 @@ from .constants import (
     MHSD_MAGIC,
     MHYP_MAGIC,
     STRING_MHOD_TYPES,
+    URL_MHOD_TYPES,
 )
 
 logger = logging.getLogger(__name__)
@@ -393,7 +394,11 @@ def _parse_mhod(data: bytes, offset: int) -> Record:
 
     body_offset = offset + header_len
 
-    if mhod_type in STRING_MHOD_TYPES:
+    if mhod_type in URL_MHOD_TYPES and not _has_string_header(
+        data, body_offset, offset + total_len
+    ):
+        _parse_url_mhod(data, body_offset, offset + total_len, rec)
+    elif mhod_type in STRING_MHOD_TYPES:
         _parse_string_mhod(data, body_offset, rec)
     elif mhod_type == 50:  # SPLPREF
         _parse_splpref_mhod(data, body_offset, rec)
@@ -406,6 +411,23 @@ def _parse_mhod(data: bytes, offset: int) -> Record:
         rec.fields["raw_body"] = bytes(data[body_offset : offset + total_len])
 
     return rec
+
+
+def _has_string_header(data: bytes, body_offset: int, end: int) -> bool:
+    """True if an MHOD body starts with a string sub-header (encoding, length, ...) whose
+    length matches the body: the form pygpod <= 0.1.0 used for podcast URLs."""
+    if end - body_offset < 16:
+        return False
+    encoding = get32lint(data, body_offset)
+    return encoding in (0, 1, 2) and get32lint(data, body_offset + 4) == end - body_offset - 16
+
+
+def _parse_url_mhod(data: bytes, body_offset: int, end: int, rec: Record) -> None:
+    """Parse a podcast URL MHOD (15/16): UTF-8 bytes right after the header."""
+    raw = bytes(data[body_offset:end])
+    rec.fields["url_format"] = True
+    rec.fields["string"] = raw.decode("utf-8", errors="replace")
+    rec.fields["string_raw"] = raw
 
 
 def _parse_string_mhod(data: bytes, body_offset: int, rec: Record) -> None:

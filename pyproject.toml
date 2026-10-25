@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pygpod"
-version = "0.1.0"
+version = "0.2.0"
 description = "Pure Python library for iPod database management - a spiritual successor to libgpod"
 readme = "README.md"
 license = { text = "LGPL-2.1-or-later" }
@@ -38,7 +38,7 @@ Issues = "https://github.com/Bionded/pygpod/issues"
 tags = ["mutagen"]
 artwork = ["Pillow"]
 usb = ["pyusb", "libusb; sys_platform == 'win32'"]
-all = ["mutagen", "Pillow", "pyusb", "libusb; sys_platform == 'win32'"]
+all = ["mutagen", "Pillow", "pyusb", "libusb; sys_platform == 'win32'", "tzdata; sys_platform == 'win32'"]
 
 [project.scripts]
 pygpod = "pygpod.cli:main"

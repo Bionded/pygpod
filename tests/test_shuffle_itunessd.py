@@ -1,4 +1,4 @@
-"""iPod shuffle 1G/2G: save() writes the iTunesSD exactly like libgpod; 3G/4G are refused."""
+"""iPod shuffle 1G/2G: save() writes the iTunesSD exactly like libgpod (3G/4G: test_itunessd_v2)."""
 
 import os
 import subprocess
@@ -7,7 +7,6 @@ import pytest
 
 from pygpod.db.itunessd import ITunesSD
 from pygpod.device.mountpoint import init_ipod
-from pygpod.exceptions import DeviceError
 from pygpod.model.database import Database
 
 from .conftest import _make_minimal_mp3
@@ -45,14 +44,12 @@ def test_save_writes_itunessd_for_shuffle_2g(tmp_path):
     assert [t.filename for t in ITunesSD.parse(_sd(mp)).tracks] == [b.ipod_path.replace(":", "/")]
 
 
-def test_shuffle_3g_refused_before_writing(tmp_path):
-    mp, mp3 = _shuffle(tmp_path, "xC306")  # shuffle 3G
-    before = os.listdir(os.path.join(mp, "iPod_Control", "iTunes"))
+def test_shuffle_3g_gets_the_version_2_format(tmp_path):
+    mp, mp3 = _shuffle(tmp_path, "xC306")  # shuffle 3G (older pygpod refused it)
     db = Database(mp)
     db.add_track(mp3, title="x")
-    with pytest.raises(DeviceError, match="shuffle 3G/4G"):
-        db.save()
-    assert os.listdir(os.path.join(mp, "iPod_Control", "iTunes")) == before
+    db.save()
+    assert _sd(mp)[:4] == b"bdhs"
 
 
 def test_no_itunessd_for_other_ipods(tmp_path):

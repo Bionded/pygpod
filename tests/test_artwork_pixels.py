@@ -187,13 +187,13 @@ class TestCreateThumbnailI420:
         path = _save_test_image(img, str(tmp_path))
         result = create_thumbnail(path, I420_FORMAT_ID)
         assert result is not None
-        # format 1067 is 720x480, I420 = 1.5 bytes/pixel
+        # format 1067 is 720x480, I420 planes (1.5 bytes/pixel) padded to 2 like libgpod
         w, h = 720, 480
-        expected = w * h * 3 // 2
+        expected = w * h * 2
         assert len(result) == expected
 
     def test_plane_structure(self, tmp_path):
-        """I420 has Y plane, then U plane, then V plane."""
+        """I420 has Y plane, then U plane, then V plane, then zeros up to w*h*2 (libgpod)."""
         w, h = 720, 480
         img = _make_test_image(w, h, color=(255, 255, 255))
         path = _save_test_image(img, str(tmp_path))
@@ -201,13 +201,14 @@ class TestCreateThumbnailI420:
         assert result is not None
         y_size = w * h
         uv_size = (w // 2) * (h // 2)
-        assert len(result) == y_size + 2 * uv_size
+        assert len(result) == w * h * 2
+        assert not any(result[y_size + 2 * uv_size :])
         # Y plane: all high for white
         y_plane = result[:y_size]
         assert all(p > 200 for p in y_plane[:100])
         # U and V planes: near 128 for white
         u_plane = result[y_size : y_size + uv_size]
-        v_plane = result[y_size + uv_size :]
+        v_plane = result[y_size + uv_size : y_size + 2 * uv_size]
         assert all(100 < p < 160 for p in u_plane[:100])
         assert all(100 < p < 160 for p in v_plane[:100])
 
@@ -335,7 +336,8 @@ PACK_UNPACK_PARAMS = [
 
 PACK_UNPACK_YUV_PARAMS = [
     pytest.param(PixelFormat.UYVY, _pack_uyvy, _unpack_uyvy, 2.0, id="UYVY"),
-    pytest.param(PixelFormat.I420, _pack_i420, _unpack_i420, 1.5, id="I420"),
+    # I420 planes are 1.5 bytes per pixel; libgpod stores them zero-padded to 2
+    pytest.param(PixelFormat.I420, _pack_i420, _unpack_i420, 2.0, id="I420"),
 ]
 
 
@@ -541,7 +543,7 @@ FORMAT_ID_PARAMS = [
     # UYVY
     pytest.param(1019, 720, 480, 2.0, id="1019_uyvy_720x480"),
     # I420
-    pytest.param(1067, 720, 480, 1.5, id="1067_i420_720x480"),
+    pytest.param(1067, 720, 480, 2.0, id="1067_i420_720x480"),
 ]
 
 
@@ -805,7 +807,8 @@ class TestI420EdgeCases:
         packed = _pack_i420(img)
         y_size = w * h
         uv_size = (w // 2) * (h // 2)
-        assert len(packed) == y_size + 2 * uv_size
+        assert len(packed) == w * h * 2  # planes, then zeros (libgpod's layout)
+        assert not any(packed[y_size + 2 * uv_size :])
         unpacked = _unpack_i420(packed, w, h)
         assert len(unpacked) == w * h * 3
 
@@ -825,9 +828,9 @@ class TestUYVYEdgeCases:
         assert len(packed) == 2 * 1 * 2  # 4 bytes: U Y0 V Y1
 
     def test_odd_width_raises(self):
-        """UYVY with odd width hits a buffer overrun -- iPod formats always use even widths."""
+        """UYVY stores pixel pairs; iPod formats always use even widths."""
         img = _make_test_image(3, 2)
-        with pytest.raises(IndexError):
+        with pytest.raises(ValueError, match="even width"):
             _pack_uyvy(img)
 
 
@@ -863,3 +866,144 @@ class TestArtworkProperties:
     def test_pixel_format_unknown(self):
         artwork = Artwork(format_id=99999)
         assert artwork.pixel_format is None
+
+
+# ============================================================================
+# Letterboxed (fitted) photo thumbnails, libgpod's geometry
+# ============================================================================
+# (source size, slot size) -> (scaled size, horizontal padding, vertical padding), as libgpod
+# 0.8.3 writes them (itdb_photodb_add_photo, itdb_track_set_thumbnails)
+LIBGPOD_FIT = [
+    ((1600, 1200), (720, 480), (640, 480), 40, 0),
+    ((1600, 1200), (64, 64), (64, 48), 0, 8),
+    ((1600, 1200), (130, 88), (118, 88), 6, 0),
+    ((300, 500), (64, 64), (39, 64), 12, 0),
+    ((1200, 1800), (64, 64), (43, 64), 10, 0),
+    ((721, 480), (720, 480), (720, 480), 0, 0),
+    ((719, 481), (720, 480), (718, 480), 1, 0),
+    ((33, 17), (320, 240), (320, 165), 0, 37),
+    ((2000, 1), (50, 41), (50, 1), 0, 20),
+    ((1, 1), (50, 41), (41, 41), 4, 0),
+    # cover art (itdb_track_set_thumbnails): the rounded-up side is computed in floating point
+    ((400, 300), (56, 56), (56, 43), 0, 6),
+    ((300, 400), (56, 56), (43, 56), 6, 0),
+    ((400, 300), (128, 128), (128, 96), 0, 16),
+    ((549, 97), (56, 56), (56, 10), 0, 23),
+    ((51, 51), (56, 56), (56, 56), 0, 0),  # never past the slot
+    ((11, 11), (100, 100), (100, 100), 0, 0),
+]
+
+
+@pytest.mark.parametrize("src, slot, scaled, hpad, vpad", LIBGPOD_FIT)
+def test_fit_size_matches_libgpod(src, slot, scaled, hpad, vpad):
+    from pygpod.model.artwork import fit_size
+
+    assert fit_size(*src, *slot) == scaled
+    assert (slot[0] - scaled[0]) // 2 == hpad
+    assert (slot[1] - scaled[1]) // 2 == vpad
+
+
+def test_fitted_thumbnail_is_centred_on_black(tmp_path):
+    from pygpod.model.artwork import render_fitted_thumbnail
+
+    path = _save_test_image(_make_test_image(1600, 1200), str(tmp_path))  # red, 4:3
+    fitted = render_fitted_thumbnail(path, 64, 64, PixelFormat.RGB565_LE)
+    assert (fitted.scaled_width, fitted.scaled_height) == (64, 48)
+    assert (fitted.horizontal_padding, fitted.vertical_padding) == (0, 8)
+    assert (fitted.width, fitted.height) == (64, 56)  # libgpod's stored size includes padding
+    assert len(fitted.data) == 64 * 64 * 2  # the whole slot
+    rows = [fitted.data[y * 128 : (y + 1) * 128] for y in range(64)]
+    red = struct.pack("<H", 0xF800) * 64
+    black = bytes(128)
+    assert rows[:8] == [black] * 8
+    assert rows[8:56] == [red] * 48
+    assert rows[56:] == [black] * 8
+
+
+def test_fitted_thumbnail_from_bytes(tmp_path):
+    from pygpod.model.artwork import render_fitted_thumbnail
+
+    path = _save_test_image(_make_test_image(300, 500), str(tmp_path))
+    with open(path, "rb") as fh:
+        data = fh.read()
+    a = render_fitted_thumbnail(path, 64, 64, PixelFormat.RGB565_LE)
+    b = render_fitted_thumbnail(data, 64, 64, PixelFormat.RGB565_LE)
+    assert a.data == b.data
+    assert (b.width, b.height, b.horizontal_padding) == (51, 64, 12)
+
+
+# ============================================================================
+# YCbCr values: limited-range BT.601 as libgpod writes them
+# ============================================================================
+
+# (Y, U, V) libgpod wrote for solid 720x480 images in a Classic's 1067 thumbnail
+LIBGPOD_YUV = [
+    ((0, 0, 0), (16, 128, 128)),
+    ((255, 255, 255), (235, 128, 128)),
+    ((255, 0, 0), (82, 90, 240)),
+    ((0, 255, 0), (144, 54, 34)),
+    ((0, 0, 255), (41, 240, 110)),
+    ((128, 128, 128), (126, 128, 128)),
+]
+
+
+class TestLimitedRangeYUV:
+    @pytest.mark.parametrize("rgb,yuv", LIBGPOD_YUV)
+    def test_i420_solid_colours_match_libgpod(self, rgb, yuv):
+        w, h = 8, 6
+        packed = _pack_i420(_make_test_image(w, h, color=rgb))
+        y_size, uv_size = w * h, (w // 2) * (h // 2)
+        assert set(packed[:y_size]) == {yuv[0]}
+        assert set(packed[y_size : y_size + uv_size]) == {yuv[1]}
+        assert set(packed[y_size + uv_size : y_size + 2 * uv_size]) == {yuv[2]}
+
+    @pytest.mark.parametrize("rgb,yuv", LIBGPOD_YUV)
+    def test_i420_unpack_inverts_the_solid_colours(self, rgb, yuv):
+        w, h = 4, 4
+        unpacked = _unpack_i420(_pack_i420(_make_test_image(w, h, color=rgb)), w, h)
+        for i in range(w * h):
+            assert all(abs(a - b) <= 3 for a, b in zip(unpacked[i * 3 : i * 3 + 3], rgb))
+
+    def test_i420_chroma_from_the_bottom_right_pixel_of_each_block(self):
+        img = _make_test_image(4, 2, color=(255, 0, 0))
+        img.putpixel((1, 1), (0, 0, 255))  # bottom-right of the first 2x2 block
+        packed = _pack_i420(img)
+        assert packed[8:10] == bytes((240, 90))  # U: blue block, red block
+        assert packed[10:12] == bytes((110, 240))  # V
+
+    def test_i420_roundtrip_of_a_gradient(self):
+        w, h = 16, 16
+        img = Image.new("RGB", (w, h))
+        img.putdata([(x * 16, y * 16, 128) for y in range(h) for x in range(w)])
+        unpacked = _unpack_i420(_pack_i420(img), w, h)
+        src = img.tobytes()
+        # chroma is shared by 2x2 blocks, so allow for the neighbour's colour
+        assert max(abs(a - b) for a, b in zip(unpacked, src)) <= 24
+
+    @pytest.mark.parametrize("rgb,yuv", LIBGPOD_YUV)
+    def test_uyvy_solid_colours_match_libgpod(self, rgb, yuv):
+        packed = _pack_uyvy(_make_test_image(4, 2, color=rgb))
+        y, u, v = yuv
+        assert packed == bytes((u, y, v, y)) * 4
+
+    def test_uyvy_rows_in_field_order_chroma_from_the_left_pixel(self):
+        img = _make_test_image(2, 3, color=(0, 0, 0))
+        img.putpixel((0, 1), (255, 0, 0))  # row 1 is stored last (odd field)
+        img.putpixel((1, 2), (255, 255, 255))  # right pixel: only its Y is stored
+        packed = _pack_uyvy(img)
+        assert packed == bytes(
+            (128, 16, 128, 16) + (128, 16, 128, 235) + (90, 82, 240, 16)
+        )  # rows 0, 2, 1
+        rgb = _unpack_uyvy(packed, 2, 3)
+        # (0, 1) and (1, 2) back in place, within the rounding of the 8-bit conversion
+        assert all(abs(a - b) <= 2 for a, b in zip(rgb[6:9], (255, 0, 0)))
+        assert all(abs(a - b) <= 2 for a, b in zip(rgb[15:18], (255, 255, 255)))
+
+    def test_uyvy_roundtrip_of_a_gradient(self):
+        w, h = 16, 16
+        img = Image.new("RGB", (w, h))
+        img.putdata([(x * 16, y * 16, 128) for y in range(h) for x in range(w)])
+        unpacked = _unpack_uyvy(_pack_uyvy(img), w, h)
+        src = img.tobytes()
+        # chroma is shared by pixel pairs, so allow for the neighbour's colour
+        assert max(abs(a - b) for a, b in zip(unpacked, src)) <= 24

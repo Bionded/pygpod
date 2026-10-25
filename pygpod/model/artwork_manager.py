@@ -45,17 +45,18 @@ from ..db.transaction import Transaction
 from ..device.artwork_formats import (
     ArtworkFormatInfo,
     ThumbFormat,
+    aligned_width,
     get_cover_art_formats,
     image_data_size,
 )
 from ..device.models import IpodGeneration
-from ..model.artwork import PixelFormat, create_thumbnail
+from ..model.artwork import PixelFormat, render_fitted_thumbnail
 from ..tags import extract_artwork
 from ..utils.compat import put8int, put16lint, put32lint, put64lint
 
 logger = logging.getLogger(__name__)
 
-# Map ThumbFormat to PixelFormat for create_thumbnail
+# Map ThumbFormat to PixelFormat for render_fitted_thumbnail
 _THUMB_TO_PIXEL: Dict[ThumbFormat, PixelFormat] = {
     ThumbFormat.RGB565_LE: PixelFormat.RGB565_LE,
     ThumbFormat.RGB565_BE: PixelFormat.RGB565_BE,
@@ -71,14 +72,16 @@ _THUMB_TO_PIXEL: Dict[ThumbFormat, PixelFormat] = {
 class ArtworkManager:
     """Manages artwork on an iPod mountpoint.
 
-    Uses per-generation format tables from libgpod to create thumbnails
-    in all formats the iPod expects.
+    Creates thumbnails in all formats the iPod expects: ``formats`` (in write order, e.g. the
+    device's SysInfoExtended AlbumArt list) when given, else the generation's table from
+    libgpod.
     """
 
     def __init__(
         self,
         mountpoint: str,
         generation: IpodGeneration = IpodGeneration.UNKNOWN,
+        formats: Optional[List[ArtworkFormatInfo]] = None,
     ) -> None:
         self._mountpoint = mountpoint
         self._generation = generation
@@ -87,7 +90,7 @@ class ArtworkManager:
         self._root: Optional[Record] = None
         self._next_image_id = 1
         self._ithmb_offsets: Dict[int, int] = {}  # format_id -> current write offset
-        self._formats: Optional[List[ArtworkFormatInfo]] = None
+        self._formats: Optional[List[ArtworkFormatInfo]] = list(formats) if formats else None
         # Free thumbnail slots per format that the ArtworkDB on disk does not reference
         # (reusable without staging); slots freed in this session join after the commit.
         self._holes: Dict[int, List[int]] = {}
@@ -198,93 +201,98 @@ class ArtworkManager:
         image_id = self._next_image_id
         self._next_image_id += 1
 
-        # Save art_data to temp file for create_thumbnail
-        import tempfile
+        mhni_records = []
 
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-            tmp.write(art_data)
-            tmp_path = tmp.name
-
-        try:
-            mhni_records = []
-
-            for fmt in self.formats:
-                thumb_data = create_thumbnail(tmp_path, fmt.format_id, fmt.width, fmt.height)
-                if thumb_data is None:
-                    continue
-
-                # Pad to block_size
-                block_size = image_data_size(fmt)
-                if len(thumb_data) < block_size:
-                    thumb_data = thumb_data + b"\x00" * (block_size - len(thumb_data))
-
-                # Write to .ithmb file: into a free slot if there is one, else at the end
-                ithmb_path = os.path.join(self._artwork_dir, f"F{fmt.format_id}_1.ithmb")
-                holes = self._holes.get(fmt.format_id)
-                if (
-                    holes
-                    and self._hole_block.get(fmt.format_id) == len(thumb_data)
-                    and os.path.isfile(ithmb_path)
-                ):
-                    offset = holes.pop(0)
-                    with open(ithmb_path, "r+b") as f:
-                        f.seek(offset)
-                        f.write(thumb_data)
-                    mhni_records.append(
-                        self._create_mhni(
-                            fmt.format_id, offset, len(thumb_data), fmt.width, fmt.height
-                        )
-                    )
-                    continue
-                offset = self._ithmb_offsets.get(fmt.format_id, 0)
-
-                if os.path.isfile(ithmb_path):
-                    with open(ithmb_path, "r+b") as f:
-                        f.seek(offset)
-                        f.write(thumb_data)
-                else:
-                    with open(ithmb_path, "wb") as f:
-                        if offset > 0:
-                            f.write(b"\x00" * offset)
-                        f.write(thumb_data)
-
-                self._ithmb_offsets[fmt.format_id] = offset + len(thumb_data)
-
-                mhni = self._create_mhni(
-                    fmt.format_id, offset, len(thumb_data), fmt.width, fmt.height
-                )
-                mhni_records.append(mhni)
-
-            if not mhni_records:
-                return None
-
-            # Create MHII record
-            mhii = self._create_mhii(image_id, dbid, mhni_records, source_size=len(art_data))
-
-            # Add to MHLI in MHSD type 1
-            mhli = self._get_or_create_mhli()
-            mhli.children.append(mhii)
-
-            # Update MHLF format entries
-            self._update_mhlf()
-
-            # Update MHFD next_id
-            self._update_mhfd_next_id()
-
-            # Save ArtworkDB (can be deferred for batch operations)
-            if save:
-                self._save()
-
-            logger.info(
-                "Added artwork id=%d for dbid=%d (%d formats)",
-                image_id,
-                dbid,
-                len(mhni_records),
+        for fmt in self.formats:
+            pixel_fmt = _THUMB_TO_PIXEL.get(fmt.pixel_format)
+            if pixel_fmt is None:
+                continue
+            # scaled to fit and centred in the slot like libgpod, or cropped to fill it when
+            # the format says so
+            fitted = render_fitted_thumbnail(
+                art_data,
+                fmt.width,
+                fmt.height,
+                pixel_fmt,
+                crop=fmt.crop,
+                back_color=fmt.back_color,
+                row_width=aligned_width(fmt),
             )
-            return image_id
+            if fitted is None or not fitted.data:
+                continue
+            thumb_data = fitted.data
+            geometry = (
+                fitted.width,
+                fitted.height,
+                fitted.horizontal_padding,
+                fitted.vertical_padding,
+            )
 
-        finally:
-            os.unlink(tmp_path)
+            # Pad to block_size
+            block_size = image_data_size(fmt)
+            if len(thumb_data) < block_size:
+                thumb_data = thumb_data + b"\x00" * (block_size - len(thumb_data))
+
+            # Write to .ithmb file: into a free slot if there is one, else at the end
+            ithmb_path = os.path.join(self._artwork_dir, f"F{fmt.format_id}_1.ithmb")
+            holes = self._holes.get(fmt.format_id)
+            if (
+                holes
+                and self._hole_block.get(fmt.format_id) == len(thumb_data)
+                and os.path.isfile(ithmb_path)
+            ):
+                offset = holes.pop(0)
+                with open(ithmb_path, "r+b") as f:
+                    f.seek(offset)
+                    f.write(thumb_data)
+                mhni_records.append(
+                    self._create_mhni(fmt.format_id, offset, len(thumb_data), *geometry)
+                )
+                continue
+            offset = self._ithmb_offsets.get(fmt.format_id, 0)
+
+            if os.path.isfile(ithmb_path):
+                with open(ithmb_path, "r+b") as f:
+                    f.seek(offset)
+                    f.write(thumb_data)
+            else:
+                with open(ithmb_path, "wb") as f:
+                    if offset > 0:
+                        f.write(b"\x00" * offset)
+                    f.write(thumb_data)
+
+            self._ithmb_offsets[fmt.format_id] = offset + len(thumb_data)
+
+            mhni = self._create_mhni(fmt.format_id, offset, len(thumb_data), *geometry)
+            mhni_records.append(mhni)
+
+        if not mhni_records:
+            return None
+
+        # Create MHII record
+        mhii = self._create_mhii(image_id, dbid, mhni_records, source_size=len(art_data))
+
+        # Add to MHLI in MHSD type 1
+        mhli = self._get_or_create_mhli()
+        mhli.children.append(mhii)
+
+        # Update MHLF format entries
+        self._update_mhlf()
+
+        # Update MHFD next_id
+        self._update_mhfd_next_id()
+
+        # Save ArtworkDB (can be deferred for batch operations)
+        if save:
+            self._save()
+
+        logger.info(
+            "Added artwork id=%d for dbid=%d (%d formats)",
+            image_id,
+            dbid,
+            len(mhni_records),
+        )
+        return image_id
 
     def remove_artwork(self, image_id: int) -> bool:
         """Remove artwork entry by image_id.
@@ -634,8 +642,13 @@ class ArtworkManager:
         size: int,
         width: int,
         height: int,
+        horizontal_padding: int = 0,
+        vertical_padding: int = 0,
     ) -> Record:
-        """Create MHNI with MHOD type=3 filename child."""
+        """Create MHNI with MHOD type=3 filename child.
+
+        ``width`` / ``height`` as libgpod stores them: the scaled image plus the left/top padding.
+        """
         hdr_len = 76
         header = bytearray(hdr_len)
         header[0:4] = MHNI_MAGIC
@@ -645,6 +658,8 @@ class ArtworkManager:
         put32lint(header, 0x10, format_id)
         put32lint(header, 0x14, offset)  # ithumb_offset
         put32lint(header, 0x18, size)  # image_size
+        put16lint(header, 0x1C, vertical_padding)
+        put16lint(header, 0x1E, horizontal_padding)
         put16lint(header, 0x20, height)
         put16lint(header, 0x22, width)
 
@@ -653,6 +668,8 @@ class ArtworkManager:
         rec.fields["format_id"] = format_id
         rec.fields["ithumb_offset"] = offset
         rec.fields["image_size"] = size
+        rec.fields["vertical_padding"] = vertical_padding
+        rec.fields["horizontal_padding"] = horizontal_padding
         rec.fields["image_width"] = width
         rec.fields["image_height"] = height
 
@@ -662,10 +679,11 @@ class ArtworkManager:
         return rec
 
     def _create_filename_mhod(self, filename: str) -> Record:
-        """Create MHOD type=3 with UTF-16LE filename."""
+        """Create MHOD type=3 with UTF-16LE filename, padded to 4 bytes like libgpod."""
         name_bytes = filename.encode("utf-16-le")
         hdr_len = 24
-        body = bytearray(12 + len(name_bytes))
+        pad = (4 - (hdr_len + 12 + len(name_bytes)) % 4) % 4
+        body = bytearray(12 + len(name_bytes) + pad)
         put32lint(body, 0, len(name_bytes))  # string length
         put32lint(body, 4, 2)  # encoding = 2 (UTF-16LE)
         # body[8:12] = 0 (unknown)
@@ -676,7 +694,8 @@ class ArtworkManager:
         header[0:4] = MHOD_MAGIC
         put32lint(header, 4, hdr_len)
         put32lint(header, 8, total_len)
-        put32lint(header, 0x0C, 3)  # mhod_type = 3
+        put16lint(header, 0x0C, 3)  # mhod_type = 3
+        header[0x0F] = pad  # padding_len
 
         rec = Record(MHOD_MAGIC, hdr_len, total_len)
         rec.raw_header = bytes(header)
@@ -730,12 +749,24 @@ class ArtworkManager:
             mhsd.children.append(mhlf)
             self._root.children.append(mhsd)
 
-        existing_formats = {c.fields.get("format_id") for c in mhlf.children}
-        for fmt in self.formats:
-            if fmt.format_id not in existing_formats:
-                img_size = image_data_size(fmt)
-                mhif = self._create_mhif(fmt.format_id, img_size)
-                mhlf.children.append(mhif)
+        # libgpod's mhif image_size: width * height * 2 of the format (without row
+        # alignment), also when older thumbnails of another size are still in the database
+        wanted = [(f.format_id, f.padding or f.width * f.height * 2) for f in self.formats]
+        existing = {c.fields.get("format_id"): c for c in mhlf.children}
+        if any(
+            fid not in existing or existing[fid].fields.get("image_size") != size
+            for fid, size in wanted
+        ):
+            ids = {fid for fid, _ in wanted}
+            children = [
+                existing[fid]
+                if fid in existing and existing[fid].fields.get("image_size") == size
+                else self._create_mhif(fid, size)
+                for fid, size in wanted
+            ]
+            mhlf.children = children + [
+                c for c in mhlf.children if c.fields.get("format_id") not in ids
+            ]
 
         # Update count in header
         header = bytearray(mhlf.raw_header)

@@ -219,3 +219,6 @@ test_data/
 
 # Test fixture music (generated, not committed)
 test_files/music/
+
+# Local venvs
+.venv38/

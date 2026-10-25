@@ -113,6 +113,13 @@ def _owned(path: str, token: str) -> bool:
         return False
 
 
+def writer_active(itunes_dir: str) -> bool:
+    """Does a live writer hold the lock? Reads only (works on a read-only mount)."""
+    path = os.path.join(itunes_dir, LOCK_NAME)
+    data = _read(path)
+    return data is not None and not _stale(path, data)
+
+
 @contextmanager
 def writer_lock(itunes_dir: str) -> Iterator[None]:
     """Hold the database writer lock; ConflictError if another live writer has it."""

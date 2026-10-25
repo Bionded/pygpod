@@ -1,7 +1,7 @@
-"""hash72 implementation for iPod Classic 6G+ and Nano 3G+.
+"""hash72 implementation (iPod nano 5G, and any iPod whose SysInfoExtended says DBVersion 4).
 
 Ported from libgpod's itdb_hash72.c. This hash is required for the iPod
-to accept the iTunesDB as valid.
+to accept the iTunesDB as valid. The Classic and nano 3G/4G use hash58.
 
 The hash72 signature is 46 bytes stored at offset 0x72 in the MHBD header.
 """

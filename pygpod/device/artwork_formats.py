@@ -4,13 +4,14 @@ Each table defines the cover art thumbnail formats that an iPod generation
 supports. Format entries specify format_id, width, height, pixel format,
 and optional padding (block size in the .ithmb file).
 
-These are the FALLBACK tables used when SysInfoExtended is not available.
+These are the FALLBACK tables used when SysInfoExtended is not available; with it, the
+device's own image specifications win (:func:`formats_from_sysinfo_extended`).
 """
 
 from __future__ import annotations
 
 from enum import IntEnum
-from typing import Dict, List, NamedTuple, Optional
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Tuple
 
 from .models import IpodGeneration
 
@@ -36,6 +37,26 @@ class ArtworkFormatInfo(NamedTuple):
     height: int
     pixel_format: ThumbFormat
     padding: int = 0  # block size (0 = use exact image size)
+    # SysInfoExtended image specification extras (libgpod Itdb_ArtworkFormat):
+    crop: bool = False  # fill the whole slot (scale up and cut) instead of letterboxing
+    back_color: Tuple[int, int, int] = (0, 0, 0)  # RGB of the letterbox bars (RGB formats)
+    row_bytes_alignment: int = 0  # each row padded to a multiple of this many bytes
+
+
+def aligned_width(fmt: ArtworkFormatInfo) -> int:
+    """Pixels per stored row: the width rounded up to ``row_bytes_alignment`` (libgpod
+    get_aligned_width; only the 2-byte RGB formats use it)."""
+    if fmt.pixel_format not in (
+        ThumbFormat.RGB565_LE,
+        ThumbFormat.RGB565_BE,
+        ThumbFormat.RGB555_LE,
+        ThumbFormat.RGB555_BE,
+    ):
+        return fmt.width
+    align = fmt.row_bytes_alignment // 2
+    if align and fmt.width % align:
+        return fmt.width + align - fmt.width % align
+    return fmt.width
 
 
 def bytes_per_pixel(fmt: ThumbFormat) -> float:
@@ -57,12 +78,15 @@ def bytes_per_pixel(fmt: ThumbFormat) -> float:
 def image_data_size(fmt: ArtworkFormatInfo) -> int:
     """Get the size in bytes that one image occupies in the .ithmb file.
 
-    If padding is set, the image slot is exactly padding bytes.
-    Otherwise it's width * height * bpp.
+    If padding is set, the image slot is exactly padding bytes. Otherwise it's
+    width * height * bpp, except I420: libgpod stores those padded to 2 bytes per pixel
+    (planes of 1.5 bytes per pixel, then zeros).
     """
     if fmt.padding > 0:
         return fmt.padding
-    return int(fmt.width * fmt.height * bytes_per_pixel(fmt.pixel_format))
+    if fmt.pixel_format in (ThumbFormat.I420_LE, ThumbFormat.I420_BE):
+        return fmt.width * fmt.height * 2
+    return int(aligned_width(fmt) * fmt.height * bytes_per_pixel(fmt.pixel_format))
 
 
 # ============================================================================
@@ -145,12 +169,14 @@ def get_cover_art_formats(generation: IpodGeneration) -> Optional[List[ArtworkFo
 # ============================================================================
 # Per-generation photo thumbnail formats (libgpod itdb_device.c *_photo_info).
 # Only pixel formats pygpod can encode are listed; skipped from libgpod's tables:
-# iPod Photo 1013 (220x176 RGB565_BE_90, rotated) and 1019 (720x480 UYVY_BE TV-out),
-# iPod Video 1019 (UYVY_BE TV-out), Nano 4G/5G 1081 (JPEG, unimplemented in libgpod too).
+# Nano 4G/5G 1081 (JPEG, unimplemented in libgpod too).
 # ============================================================================
 _PHOTO_PHOTOS = [
     ArtworkFormatInfo(1009, 42, 30, ThumbFormat.RGB565_LE),
     ArtworkFormatInfo(1015, 130, 88, ThumbFormat.RGB565_LE),
+    # RGB565_BE_90 in libgpod's table, but libgpod writes it unrotated: plain RGB565_BE
+    ArtworkFormatInfo(1013, 220, 176, ThumbFormat.RGB565_BE),
+    ArtworkFormatInfo(1019, 720, 480, ThumbFormat.UYVY_BE),  # TV out
 ]
 _NANO_PHOTOS = [
     ArtworkFormatInfo(1032, 42, 37, ThumbFormat.RGB565_LE),
@@ -160,6 +186,7 @@ _VIDEO_PHOTOS = [
     ArtworkFormatInfo(1036, 50, 41, ThumbFormat.RGB565_LE),
     ArtworkFormatInfo(1015, 130, 88, ThumbFormat.RGB565_LE),
     ArtworkFormatInfo(1024, 320, 240, ThumbFormat.RGB565_LE),
+    ArtworkFormatInfo(1019, 720, 480, ThumbFormat.UYVY_BE),  # TV out
 ]
 _CLASSIC_PHOTOS = [  # also Nano 3G
     ArtworkFormatInfo(1067, 720, 480, ThumbFormat.I420_LE),
@@ -196,3 +223,77 @@ _GENERATION_PHOTOS: Dict[IpodGeneration, List[ArtworkFormatInfo]] = {
 def get_photo_formats(generation: IpodGeneration) -> Optional[List[ArtworkFormatInfo]]:
     """Photo thumbnail formats for an iPod generation (None: no photo support known)."""
     return _GENERATION_PHOTOS.get(generation)
+
+
+# ============================================================================
+# SysInfoExtended image specifications (libgpod itdb_sysinfo_extended_parser.c)
+# ============================================================================
+# PixelFormat four-character codes (hex) -> pixel format; others are skipped, like libgpod
+_SPEC_PIXEL_FORMATS = {
+    "32767579": ThumbFormat.UYVY_BE,  # '2vuy'
+    "42353635": ThumbFormat.RGB565_BE,  # 'B565'
+    "4C353635": ThumbFormat.RGB565_LE,  # 'L565'
+    "79343230": ThumbFormat.I420_LE,  # 'y420'
+    "4C353535": ThumbFormat.RGB555_LE,  # 'L555' (not with PixelOrder: a format pygpod lacks)
+}
+
+# SysInfoExtended keys of the three format lists
+SPEC_KEY_COVER_ART = "AlbumArt"
+SPEC_KEY_PHOTOS = "ImageSpecifications"
+SPEC_KEY_CHAPTER_IMAGES = "ChapterImageSpecs"
+
+
+def _spec_int(spec: Dict[str, Any], key: str) -> int:
+    value = spec.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _spec_format(spec: Any) -> Optional[ArtworkFormatInfo]:
+    if not isinstance(spec, dict):
+        return None  # the iPhone mixes <string>s into the array
+    pixel = spec.get("PixelFormat")
+    if not isinstance(pixel, str) or pixel.upper() not in _SPEC_PIXEL_FORMATS:
+        return None
+    if pixel.upper() == "4C353535" and "PixelOrder" in spec:
+        return None
+    pixel_format = _SPEC_PIXEL_FORMATS[pixel.upper()]
+    format_id = _spec_int(spec, "FormatId")
+    width, height = _spec_int(spec, "RenderWidth"), _spec_int(spec, "RenderHeight")
+    if format_id <= 0 or width <= 0 or height <= 0:
+        return None
+    back = spec.get("BackColor")
+    try:
+        rgba = int(back, 16) if isinstance(back, str) else 0
+    except ValueError:
+        rgba = 0
+    rgba &= 0xFFFFFFFF
+    alignment = _spec_int(spec, "RowBytesAlignment")
+    if not alignment and spec.get("AlignRowBytes") is True:
+        alignment = 4  # the older key (nano 3G, Classic): 4 bytes
+    return ArtworkFormatInfo(
+        format_id,
+        width,
+        height,
+        pixel_format,
+        crop=spec.get("Crop") is True,
+        back_color=((rgba >> 24) & 0xFF, (rgba >> 16) & 0xFF, (rgba >> 8) & 0xFF),
+        row_bytes_alignment=alignment,
+    )
+
+
+def formats_from_sysinfo_extended(
+    extended: Dict[str, Any], key: str
+) -> Optional[List[ArtworkFormatInfo]]:
+    """The thumbnail formats a SysInfoExtended plist lists under ``key`` (``AlbumArt``,
+    ``ImageSpecifications`` or ``ChapterImageSpecs``), as libgpod reads them.
+
+    Uses FormatId, RenderWidth/RenderHeight, PixelFormat, Crop, BackColor and
+    RowBytesAlignment/AlignRowBytes; entries with an unknown pixel format are skipped. The
+    list is in plist order, like the static tables (libgpod writes the thumbnails of both in
+    reverse order). None if the key is missing or yields no usable format.
+    """
+    specs: Iterable[Any] = extended.get(key) or []
+    if not isinstance(specs, list):
+        return None
+    formats = [f for f in (_spec_format(s) for s in specs) if f is not None]
+    return formats or None

@@ -148,7 +148,7 @@ def test_rules_and_members_match_libgpod(ipod, tool):
 
 
 def test_save_refreshes_live_playlists_by_default(ipod):
-    """Owner decision (syncDirector task 102): save() refreshes live-updating smart playlists."""
+    """Design: save() refreshes live-updating smart playlists."""
     db = Database(ipod)
     okean = SPLRule(field=SPLField.ARTIST, action=SPLAction.IS_STRING, string="Океан Ельзи")
     db.create_smart_playlist("Live", [okean])
@@ -183,7 +183,7 @@ def _limited(db, name, sort, limittype=SPLLimitType.SONGS, value=3, rules=()):
 
 
 def test_playlist_membership_rules(ipod):
-    """Task 56: "playlist is / is not" rules use the members of the playlist with id fromvalue."""
+    """ "playlist is / is not" rules use the members of the playlist with id fromvalue."""
     db = Database(ipod)
     fav = db.create_playlist("Улюблені")
     for t in db.tracks[:2]:

@@ -5,6 +5,8 @@ import pathlib
 import plistlib
 from types import SimpleNamespace
 
+import pytest
+
 from pygpod.device.device import Device
 from pygpod.device.models import (
     ARTWORK_GENERATIONS,
@@ -142,6 +144,46 @@ class TestFromMountpoint:
         assert dev.sysinfo.product_type == "iPod5,1"
         assert dev.sysinfo.family_id == 10001
 
+    @pytest.mark.parametrize(
+        "dbversion,expected",
+        [
+            (0, ChecksumType.NONE),
+            (1, ChecksumType.NONE),
+            (2, ChecksumType.NONE),
+            (3, ChecksumType.HASH58),
+            (4, ChecksumType.HASH72),
+            (5, ChecksumType.HASHAB),
+        ],
+    )
+    def test_sysinfo_extended_dbversion_unknown_model(self, tmp_path, dbversion, expected):
+        """Real iPods and libgpod use the key 'DBVersion'; it decides the scheme."""
+        mp = _make_ipod_fs(
+            tmp_path,
+            model="ZZZZ",
+            extended={"FireWireGUID": "000A270012345678", "DBVersion": dbversion},
+        )
+        dev = Device.from_mountpoint(mp)
+        assert dev.generation == IpodGeneration.UNKNOWN
+        assert dev.checksum_type == expected
+
+    @pytest.mark.parametrize(
+        "model,dbversion,expected",
+        [("B029", 2, ChecksumType.NONE), ("A003", 3, ChecksumType.HASH58)],
+    )
+    def test_sysinfo_extended_dbversion_overrides_model(self, tmp_path, model, dbversion, expected):
+        """Same as libgpod: DBVersion wins over the model-number mapping."""
+        mp = _make_ipod_fs(tmp_path, model=model, extended={"DBVersion": dbversion})
+        assert Device.from_mountpoint(mp).checksum_type == expected
+
+    def test_sysinfo_extended_dbversion_preferred_over_legacy_key(self, tmp_path):
+        mp = _make_ipod_fs(tmp_path, model="ZZZZ", extended={"DBVersion": 4, "DatabaseVersion": 3})
+        assert Device.from_mountpoint(mp).checksum_type == ChecksumType.HASH72
+
+    def test_sysinfo_extended_without_dbversion_uses_model(self, tmp_path):
+        """No DBVersion key: model mapping (libgpod would treat it as 0 = unsigned)."""
+        mp = _make_ipod_fs(tmp_path, model="B029", extended={"SerialNumber": "8K74729BY5N"})
+        assert Device.from_mountpoint(mp).checksum_type == ChecksumType.HASH58
+
 
 # =========================================================================
 # from_usb
@@ -212,6 +254,45 @@ class TestProperties:
     def test_music_dirs_default(self):
         dev = Device(sysinfo=SysInfo(), ipod_info=None)
         assert dev.music_dirs == 50
+
+    def test_music_dirs_unknown_model_counts_dirs_on_disk(self, tmp_path):
+        """The Unknown table entry has musicdirs 0; count F00.. on disk like libgpod."""
+        music = tmp_path / "iPod_Control" / "Music"
+        for i in (0, 1, 2, 5):  # F05 is not consecutive
+            (music / f"F{i:02d}").mkdir(parents=True)
+        info = IpodInfo("Unknown", 0, IpodModel.UNKNOWN, IpodGeneration.UNKNOWN, 0)
+        dev = Device(mountpoint=str(tmp_path), sysinfo=SysInfo(), ipod_info=info)
+        assert dev.music_dirs == 3
+
+    def test_music_dirs_unknown_model_without_dirs(self, tmp_path):
+        info = IpodInfo("Unknown", 0, IpodModel.UNKNOWN, IpodGeneration.UNKNOWN, 0)
+        assert Device(sysinfo=SysInfo(), ipod_info=info).music_dirs == 50
+        dev = Device(mountpoint=str(tmp_path), sysinfo=SysInfo(), ipod_info=info)
+        assert dev.music_dirs == 50
+
+    def test_add_track_copy_on_unknown_model(self, tmp_path):
+        """Add_track(copy=True) on an unknown ModelNumStr no longer raises ValueError."""
+        from pygpod.device.mountpoint import init_ipod
+        from pygpod.model.database import Database
+
+        from .conftest import _make_minimal_mp3
+
+        mp = tmp_path / "ipod"
+        mp.mkdir()
+        init_ipod(
+            str(mp), name="x", sysinfo_files={"SysInfo": b"ModelNumStr: xZZZZ\n"}, music_dirs=7
+        )
+        mp3 = str(tmp_path / "a.mp3")
+        _make_minimal_mp3(mp3)
+        db = Database(str(mp))
+        assert db.device.music_dirs == 7
+        t = db.add_track(mp3, title="Song", copy=True)
+        db.save()
+        parts = t.ipod_path.strip(":").split(":")
+        assert parts[:2] == ["iPod_Control", "Music"] and parts[2] in {
+            f"F{i:02d}" for i in range(7)
+        }
+        assert (mp / os.path.join(*parts)).is_file()
 
     def test_model_name_with_capacity(self):
         dev = self._dev(IpodGeneration.CLASSIC_1, cap=80)
@@ -362,3 +443,52 @@ class TestCoverArtFormats:
         fmts = dev.get_cover_art_formats()
         # First gen doesn't support artwork
         assert fmts is None or len(fmts) == 0
+
+
+class TestSqliteDb:
+    """Device.sqlite_db follows libgpod: the SysInfoExtended 'SQLiteDB' key, else nano 5G+."""
+
+    def _dev(self, tmp_path, model, ext=None):
+        import plistlib
+
+        from pygpod.device.device import Device
+
+        d = tmp_path / "iPod_Control" / "Device"
+        d.mkdir(parents=True)
+        (d / "SysInfo").write_text(f"ModelNumStr: {model}\n")
+        if ext is not None:
+            (d / "SysInfoExtended").write_bytes(plistlib.dumps(ext))
+        return Device.from_mountpoint(str(tmp_path))
+
+    def test_nano5_without_sysinfoextended(self, tmp_path):
+        assert self._dev(tmp_path, "xC027").sqlite_db
+
+    def test_sysinfoextended_key_decides(self, tmp_path):
+        assert not self._dev(tmp_path / "a", "xC027", {"DBVersion": 4}).sqlite_db
+        assert self._dev(tmp_path / "b", "xB029", {"DBVersion": 3, "SQLiteDB": True}).sqlite_db
+        assert not self._dev(tmp_path / "c", "xC027", {"SQLiteDB": False}).sqlite_db
+
+    def test_older_models(self, tmp_path):
+        assert not self._dev(tmp_path / "a", "xB029").sqlite_db
+        assert not self._dev(tmp_path / "b", "xA003").sqlite_db
+
+    def test_save_warns_once(self, tmp_path, caplog, generated_mp3):
+        import logging
+
+        from pygpod import init_ipod
+        from pygpod.model.database import Database
+
+        mp = tmp_path / "ipod"
+        mp.mkdir()
+        sysinfo = b"ModelNumStr: xB029\nFirewireGuid: 0x000A270012345678\n"
+        init_ipod(str(mp), name="iPod", sysinfo_files={"SysInfo": sysinfo})
+        import plistlib
+
+        ext = {"DBVersion": 3, "SQLiteDB": True, "FireWireGUID": "000A270012345678"}
+        (mp / "iPod_Control" / "Device" / "SysInfoExtended").write_bytes(plistlib.dumps(ext))
+        db = Database(str(mp))
+        db.add_track(generated_mp3, title="Обійми")
+        with caplog.at_level(logging.WARNING):
+            db.save()
+            db.save(force=True)
+        assert sum("SQLite" in r.getMessage() for r in caplog.records) == 1

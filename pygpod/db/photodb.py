@@ -3,7 +3,7 @@
 Ported from libgpod's itdb_photoalbum.c. The PhotoDB is stored in
 ``<mountpoint>/Photos/Photo Database`` (thumbnails in ``Photos/Thumbs``; libgpod
 itdb_get_photos_dir) and uses a similar MHXX binary format to the main ArtworkDB.
-pygpod before syncDirector task 53 wrote ``iPod_Control/Photos`` instead: that is
+Older pygpod versions wrote ``iPod_Control/Photos`` instead: that is
 still read when ``Photos`` has no database, and the next save moves it.
 
 Photo IDs start at 0x40, Album IDs at 0x64.
@@ -17,11 +17,17 @@ import os
 import re
 import shutil
 import struct
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
-from ..device.artwork_formats import ArtworkFormatInfo, ThumbFormat, get_photo_formats
+from ..device.artwork_formats import (
+    ArtworkFormatInfo,
+    ThumbFormat,
+    aligned_width,
+    get_photo_formats,
+)
 from ..exceptions import ArtworkError
 from ..utils.compat import put16lint, put32lint, put64lint
+from ..utils.datetime import MAC_EPOCH_OFFSET
 from .artwork_parser import parse_artworkdb
 from .artwork_writer import write_artworkdb
 from .parser import Record
@@ -38,6 +44,13 @@ ALBUM_TYPE_NORMAL = 2
 _ITHMB_NAME = re.compile(r"F(\d+)_(\d+)\.ithmb$")
 
 
+def _file_date(path: str, tz_shift: int = 0) -> int:
+    """A file's modification time as a Mac timestamp in the iPod's local time (``tz_shift``
+    seconds east of UTC); 0 if it does not fit in 32 bits."""
+    mac = int(os.stat(path).st_mtime) + MAC_EPOCH_OFFSET + tz_shift
+    return mac if 0 < mac <= 0xFFFFFFFF else 0
+
+
 class Photo:
     """Represents a photo on the iPod."""
 
@@ -46,6 +59,11 @@ class Photo:
         self.song_id: int = 0  # Links to MHII via song_id field
         self.original_path: str = ""
         self.thumbnails: List[PhotoThumbnail] = []
+        # MHII fields libgpod fills in (dates as raw Mac-epoch timestamps, kept as stored)
+        self.rating: int = 0
+        self.creation_date: int = 0
+        self.digitized_date: int = 0
+        self.artwork_size: int = 0  # size of the source image file
 
     def __repr__(self) -> str:
         return f"<Photo id={self.photo_id} thumbs={len(self.thumbnails)}>"
@@ -56,11 +74,15 @@ class PhotoThumbnail:
 
     def __init__(self) -> None:
         self.format_id: int = 0
+        # as stored in the database (libgpod): the scaled image size plus the left/top padding
         self.width: int = 0
         self.height: int = 0
         self.image_offset: int = 0
         self.image_size: int = 0
         self.ithmb_file: int = 1  # the N of F<format>_<N>.ithmb
+        # blank pixels left of / above the image in the thumbnail slot (letterboxing)
+        self.horizontal_padding: int = 0
+        self.vertical_padding: int = 0
         self._pixel_data: Optional[bytes] = None  # set for thumbnails not written yet
 
     def read_data(self, photos_dir: str) -> Optional[bytes]:
@@ -111,11 +133,21 @@ class PhotoDB:
     Provides CRUD operations for photos and photo albums.
     """
 
-    def __init__(self, mountpoint: Optional[str] = None, generation=None) -> None:
+    def __init__(
+        self, mountpoint: Optional[str] = None, generation=None, timestamps: str = "local"
+    ) -> None:
         """``generation`` (IpodGeneration) picks the photo formats; default: detected from the
-        mount point."""
+        mount point. ``timestamps``: the zone of new photos' dates, as
+        ``DatabaseConfig.timestamps`` ('local': the iPod's timezone like libgpod, 'utc')."""
+        if timestamps not in ("local", "utc"):
+            raise ValueError(f"timestamps must be 'local' or 'utc': {timestamps!r}")
+        self._timestamps = timestamps
+        self._tz_shift_value: Optional[int] = None
         self._mountpoint = mountpoint
         self._generation = generation
+        self._formats: Optional[List[ArtworkFormatInfo]] = None
+        self._mhif_order: List[int] = []  # format ids of the loaded database's file list
+        self._mhif_sizes: Dict[int, int] = {}  # format id -> MHIF image_size as loaded
         self._read_dir: Optional[str] = None  # where existing thumbnails are read from
         self._photos: List[Photo] = []
         self._albums: List[PhotoAlbum] = []
@@ -123,9 +155,22 @@ class PhotoDB:
         self._next_album_id = ALBUM_ID_START
         self._root = None
         self._raw_data: Optional[bytes] = None
+        self._merged_masters = 0  # extra master albums merged on load
+        self._dropped_members = 0  # album members without a photo dropped on load
+        self._master_missing = False  # the loaded database had no master album
+        self._not_in_master = 0  # loaded photos missing from the master album, added on load
 
         if mountpoint:
             self._load(mountpoint)
+
+    def _tz_shift(self) -> int:
+        if self._timestamps == "utc":
+            return 0
+        if self._tz_shift_value is None:
+            from ..utils.timezone import device_timezone_shift
+
+            self._tz_shift_value = device_timezone_shift(self._mountpoint)
+        return self._tz_shift_value
 
     def _load(self, mountpoint: str) -> None:
         """Load photo database from iPod."""
@@ -162,6 +207,10 @@ class PhotoDB:
                     photo = Photo()
                     photo.photo_id = mhii.fields.get("image_id", 0)
                     photo.song_id = mhii.fields.get("song_id", 0)
+                    photo.rating = mhii.fields.get("rating", 0)
+                    photo.creation_date = mhii.fields.get("creation_date", 0)
+                    photo.digitized_date = mhii.fields.get("digitized_date", 0)
+                    photo.artwork_size = mhii.fields.get("artwork_size", 0)
 
                     for child in mhii.children:
                         # MHNI can be direct child or wrapped in MHOD type=2
@@ -179,6 +228,8 @@ class PhotoDB:
                             thumb.height = mhni.fields.get("image_height", 0)
                             thumb.image_offset = mhni.fields.get("ithumb_offset", 0)
                             thumb.image_size = mhni.fields.get("image_size", 0)
+                            thumb.vertical_padding = mhni.fields.get("vertical_padding", 0)
+                            thumb.horizontal_padding = mhni.fields.get("horizontal_padding", 0)
                             for mhod in mhni.children:
                                 name = mhod.fields.get("string", "")
                                 m = _ITHMB_NAME.search(name) if mhod.magic == b"mhod" else None
@@ -189,6 +240,14 @@ class PhotoDB:
                     self._photos.append(photo)
                     if photo.photo_id >= self._next_photo_id:
                         self._next_photo_id = photo.photo_id + 1
+
+            elif mhsd_type == 3 and mhsd.children:
+                # File list: keep its order and sizes on re-save
+                mhifs = [m for m in mhsd.children[0].children if m.magic == b"mhif"]
+                self._mhif_order = [m.fields.get("format_id", 0) for m in mhifs]
+                self._mhif_sizes = {
+                    m.fields.get("format_id", 0): m.fields.get("image_size", 0) for m in mhifs
+                }
 
             elif mhsd_type == 2 and mhsd.children:
                 # Album list
@@ -217,6 +276,66 @@ class PhotoDB:
                     if album.album_id >= self._next_album_id:
                         self._next_album_id = album.album_id + 1
 
+        self._merge_master_albums()
+        self._dropped_members = self._drop_members_without_photo()
+        self._master_missing = self.master_album is None
+        if not self._master_missing:
+            self._not_in_master = self._add_missing_to_master()
+
+    def _add_missing_to_master(self) -> int:
+        """Append the photos the master album (Photo Library) lacks, in database order, and
+        return how many: libgpod and iTunes keep every photo in it, and the iPod's Photo
+        Library shows only its members."""
+        master = self.master_album
+        listed = set(master.photo_ids)
+        missing = [p.photo_id for p in self._photos if p.photo_id not in listed]
+        if missing:
+            logger.warning(
+                "Photo Library album: %d photo(s) of the database were missing, added",
+                len(missing),
+            )
+            master.photo_ids.extend(missing)
+        return len(missing)
+
+    def _drop_members_without_photo(self) -> int:
+        """Remove album members (MHIA) whose photo is not in the database and return how many
+        were removed: libgpod crashes reading such a Photo Database and the iPod may show no
+        photos at all."""
+        ids = {p.photo_id for p in self._photos}
+        dropped = 0
+        for album in self._albums:
+            kept = [pid for pid in album.photo_ids if pid in ids]
+            if len(kept) != len(album.photo_ids):
+                missing = [pid for pid in album.photo_ids if pid not in ids]
+                logger.warning(
+                    "photo album %r: members without a photo dropped (%s)",
+                    album.name,
+                    ", ".join(str(pid) for pid in missing),
+                )
+                dropped += len(missing)
+                album.photo_ids = kept
+        return dropped
+
+    def _merge_master_albums(self) -> None:
+        """Merge several master albums (Photo Library) into the first one, keeping the order of
+        the photos: the iPod and libgpod expect exactly one. Older pygpod versions added a
+        second master album when the first one was empty."""
+        masters = [a for a in self._albums if a.is_master]
+        self._merged_masters = len(masters) - 1 if masters else 0
+        if len(masters) < 2:
+            return
+        first = masters[0]
+        for extra in masters[1:]:
+            for pid in extra.photo_ids:
+                if pid not in first.photo_ids:
+                    first.photo_ids.append(pid)
+        self._albums = [a for a in self._albums if not a.is_master or a is first]
+        logger.warning(
+            "Photo Database has %d master photo albums: merged into album %d",
+            len(masters),
+            first.album_id,
+        )
+
     def _build_root(self) -> Record:
         """Build a record tree from the in-memory photo/album model.
 
@@ -224,6 +343,7 @@ class PhotoDB:
         write_artworkdb(). Uses libgpod-compatible padded header sizes
         and field layouts.
         """
+        self._ensure_master_album()  # e.g. a loaded database without one
         # -- MHII records (one per photo) --
         # Structure: MHII → MHOD(type=2) → MHNI → MHOD(type=3, filename)
         mhii_list = []
@@ -231,8 +351,9 @@ class PhotoDB:
             mhii_children = []
 
             for thumb in photo.thumbnails:
-                # Build ithmb filename: ":F{format_id}_{file}.ithmb"
-                ithmb_name = f":F{thumb.format_id}_{thumb.ithmb_file}.ithmb"
+                # ":Thumbs:F{format_id}_{file}.ithmb", relative to the Photos folder like
+                # libgpod writes it (":F..." alone would point to iPod_Control/Artwork)
+                ithmb_name = f":Thumbs:F{thumb.format_id}_{thumb.ithmb_file}.ithmb"
                 fname_bytes = ithmb_name.encode("utf-16-le")
 
                 # MHOD type=3 (filename string, child of MHNI): UTF-16LE, encoding 2 (libgpod)
@@ -247,6 +368,7 @@ class PhotoDB:
                 put32lint(mhod3_h, 4, mhod3_hlen)
                 put32lint(mhod3_h, 8, mhod3_total)
                 put16lint(mhod3_h, 0x0C, 3)  # mhod_type = 3 (filename)
+                mhod3_h[0x0F] = pad  # padding_len: the firmware needs it (libgpod, iTunes)
                 mhod3_rec = Record(b"mhod", mhod3_hlen, mhod3_total)
                 mhod3_rec.raw_header = bytes(mhod3_h)
                 mhod3_rec.raw_bytes = bytes(mhod3_h) + bytes(mhod3_body)
@@ -261,8 +383,8 @@ class PhotoDB:
                 put32lint(mhni_h, 0x10, thumb.format_id)
                 put32lint(mhni_h, 0x14, thumb.image_offset)  # ithmb_offset
                 put32lint(mhni_h, 0x18, thumb.image_size)  # image_size
-                # 0x1C: vertical_padding (16-bit) = 0
-                # 0x1E: horizontal_padding (16-bit) = 0
+                put16lint(mhni_h, 0x1C, thumb.vertical_padding)
+                put16lint(mhni_h, 0x1E, thumb.horizontal_padding)
                 put16lint(mhni_h, 0x20, thumb.height)  # image_height
                 put16lint(mhni_h, 0x22, thumb.width)  # image_width
                 mhni_total = mhni_hlen + mhod3_total
@@ -296,6 +418,10 @@ class PhotoDB:
             put32lint(h, 0x0C, num_children)
             put32lint(h, 0x10, photo.photo_id)
             put64lint(h, 0x14, photo.song_id if photo.song_id else photo.photo_id + 2)
+            put32lint(h, 0x20, photo.rating)
+            put32lint(h, 0x28, photo.creation_date)
+            put32lint(h, 0x2C, photo.digitized_date)
+            put32lint(h, 0x30, photo.artwork_size)
             rec = Record(b"mhii", hlen, hlen)
             rec.raw_header = bytes(h)
             rec.raw_bytes = bytes(h)
@@ -325,9 +451,21 @@ class PhotoDB:
         mhsd1.children = [mhli]
 
         # -- MHBA records (one per album) --
+        # album ids follow the highest photo id, like libgpod (the iPod shares one id space)
+        next_id = max((p.photo_id for p in self._photos), default=PHOTO_ID_START - 1) + 1
+        for album in self._albums:
+            album.album_id = next_id
+            next_id += 1
+        self._next_album_id = next_id
         mhba_list = []
         prev_album_id = 0
-        for album in self._albums:
+        for index, album in enumerate(self._albums):
+            # "prev album id" as iTunes and libgpod write it: 100 for the master album, 101 for
+            # the next one, then the previous value plus the previous album's photo count + 1
+            if index < 2:
+                prev_album_id = 100 + index
+            else:
+                prev_album_id += len(self._albums[index - 1].photo_ids) + 1
             children = []
 
             # MHOD - album name (UTF-8 string)
@@ -343,6 +481,7 @@ class PhotoDB:
             put32lint(mhod_h, 4, mhod_hlen)
             put32lint(mhod_h, 8, mhod_total)
             put16lint(mhod_h, 0x0C, 1)  # mhod_type = 1 (album name)
+            mhod_h[0x0F] = pad  # padding_len
             mhod_rec = Record(b"mhod", mhod_hlen, mhod_total)
             mhod_rec.raw_header = bytes(mhod_h)
             mhod_rec.raw_bytes = bytes(mhod_h) + bytes(mhod_body)
@@ -376,9 +515,7 @@ class PhotoDB:
             # 0x18: unk024 = 0
             # 0x1C: unk028 = 0 (16-bit)
             mhba_h[0x1E] = album.album_type
-            # 0x3C: prev_album_id
             put32lint(mhba_h, 0x3C, prev_album_id)
-            prev_album_id = album.album_id
             mhba_rec = Record(b"mhba", mhba_hlen, 0)
             mhba_rec.raw_header = bytes(mhba_h)
             mhba_rec.raw_bytes = bytes(mhba_h)
@@ -413,12 +550,26 @@ class PhotoDB:
             for thumb in photo.thumbnails:
                 format_ids.add(thumb.format_id)
 
+        # in the device's format order like libgpod once known (photos added), else as loaded
+        known = [f.format_id for f in self._formats] if self._formats else self._mhif_order
+        order = [f for f in dict.fromkeys(known) if f in format_ids]
         mhif_list = []
-        for fmt_id in sorted(format_ids):
-            # size of one thumbnail of this format (libgpod's mhif image_size)
-            total_size = next(
-                t.image_size for p in self._photos for t in p.thumbnails if t.format_id == fmt_id
-            )
+        device_formats = {f.format_id: f for f in self._formats or ()}
+        for fmt_id in order + sorted(format_ids - set(order)):
+            fmt = device_formats.get(fmt_id)
+            if fmt is not None:
+                # libgpod's mhif image_size: width * height * 2 of the device's format, also
+                # when older thumbnails of another size are still in the database
+                total_size = fmt.width * fmt.height * 2
+            elif fmt_id in self._mhif_sizes:  # database loaded, nothing added: as loaded
+                total_size = self._mhif_sizes[fmt_id]
+            else:  # as the first thumbnail
+                total_size = next(
+                    t.image_size
+                    for p in self._photos
+                    for t in p.thumbnails
+                    if t.format_id == fmt_id
+                )
 
             mhif_hlen = 0x7C  # libgpod padded size
             mhif_h = bytearray(mhif_hlen)
@@ -463,8 +614,8 @@ class PhotoDB:
         # 0x0C: unknown1
         put32lint(mhfd_h, 0x10, 2)  # unknown2 (must be 2, iTunes7+ requires this)
         put32lint(mhfd_h, 0x14, 3)  # num_children = 3
-        # 0x1C: next_id
-        put32lint(mhfd_h, 0x1C, self._next_photo_id)
+        # 0x1C: next_id, the highest photo or album id + 1 (libgpod)
+        put32lint(mhfd_h, 0x1C, next_id)
         mhfd_h[0x30] = 2  # unknown_flag1 = 2 (as libgpod sets)
         root = Record(b"mhfd", mhfd_hlen, 0)
         root.raw_header = bytes(mhfd_h)
@@ -473,15 +624,23 @@ class PhotoDB:
         return root
 
     def _photo_formats(self) -> List[ArtworkFormatInfo]:
-        generation = self._generation
-        if generation is None and self._mountpoint:
-            from ..device.device import Device
+        """The device's photo formats in libgpod's write order (the reverse of the table /
+        SysInfoExtended order)."""
+        if self._formats is None:
+            generation = self._generation
+            formats = None
+            if generation is None and self._mountpoint:
+                from ..device.device import Device
 
-            generation = Device.from_mountpoint(self._mountpoint).generation
-        formats = get_photo_formats(generation) if generation is not None else None
-        if not formats:
-            raise ArtworkError(f"no photo thumbnail formats known for this iPod ({generation})")
-        return formats
+                device = Device.from_mountpoint(self._mountpoint)
+                generation = device.generation
+                formats = device.get_photo_formats()
+            elif generation is not None:
+                formats = get_photo_formats(generation)
+            if not formats:
+                raise ArtworkError(f"no photo thumbnail formats known for this iPod ({generation})")
+            self._formats = list(reversed(formats))
+        return self._formats
 
     # ---- Public API ----
 
@@ -500,19 +659,35 @@ class PhotoDB:
                 return a
         return None
 
+    def _ensure_master_album(self) -> PhotoAlbum:
+        """The master album (Photo Library), created first if there is none: libgpod's
+        itdb_photodb_create() and iTunes always write it as the first album, listing every
+        photo of the database."""
+        master = self.master_album
+        if master is None:  # not "if not master": an empty album is falsy (__len__)
+            master = PhotoAlbum(name="Photo Library", album_type=ALBUM_TYPE_MASTER)
+            master.album_id = self._next_album_id
+            self._next_album_id += 1
+            master.photo_ids = [p.photo_id for p in self._photos]
+            self._albums.insert(0, master)
+        return master
+
     def get_photo(self, photo_id: int) -> Optional[Photo]:
         for p in self._photos:
             if p.photo_id == photo_id:
                 return p
         return None
 
-    def add_photo(self, image_path: str) -> Photo:
+    def add_photo(self, image_path: Union[str, bytes]) -> Photo:
         """Add a photo from an image file.
 
         Requires Pillow for image processing.
 
         Args:
-            image_path: Path to image file.
+            image_path: Path to image file, or the encoded image (e.g. JPEG/PNG bytes).
+                The photo's ``artwork_size`` is the file size (the length of the bytes) and
+                its ``creation_date`` the file's modification time (0 for bytes), like libgpod
+                stores them.
 
         Returns:
             New Photo object.
@@ -525,49 +700,59 @@ class PhotoDB:
         except ImportError:
             raise ArtworkError("Pillow is required for photo support")
 
-        if not os.path.isfile(image_path):
-            raise ArtworkError(f"Image file not found: {image_path}")
-
         photo = Photo()
+        if isinstance(image_path, (bytes, bytearray)):
+            if not image_path:
+                raise ArtworkError("empty image data")
+            photo.artwork_size = len(image_path)
+        else:
+            if not os.path.isfile(image_path):
+                raise ArtworkError(f"Image file not found: {image_path}")
+            photo.original_path = image_path
+            photo.artwork_size = os.path.getsize(image_path)
+            photo.creation_date = _file_date(image_path, self._tz_shift())
         photo.photo_id = self._next_photo_id
-        photo.original_path = image_path
 
         # One thumbnail per photo format of the device (libgpod tables)
-        from ..model.artwork import PixelFormat, render_thumbnail
+        from ..model.artwork import PixelFormat, render_fitted_thumbnail
 
         pixel = {
             ThumbFormat.RGB565_LE: PixelFormat.RGB565_LE,
             ThumbFormat.RGB565_BE: PixelFormat.RGB565_BE,
             ThumbFormat.I420_LE: PixelFormat.I420,
+            ThumbFormat.UYVY_BE: PixelFormat.UYVY,
         }
         for fmt in self._photo_formats():
             if fmt.pixel_format not in pixel:
                 continue
-            pixel_data = render_thumbnail(
-                image_path, fmt.width, fmt.height, pixel[fmt.pixel_format]
+            # scaled to fit and centred in the slot, like libgpod (cropped if the format says so)
+            fitted = render_fitted_thumbnail(
+                image_path,
+                fmt.width,
+                fmt.height,
+                pixel[fmt.pixel_format],
+                crop=fmt.crop,
+                back_color=fmt.back_color,
+                row_width=aligned_width(fmt),
             )
-            if not pixel_data:
+            if fitted is None or not fitted.data:
                 continue
             thumb = PhotoThumbnail()
             thumb.format_id = fmt.format_id
-            thumb.width = fmt.width
-            thumb.height = fmt.height
-            thumb.image_size = len(pixel_data)
-            thumb._pixel_data = pixel_data
+            thumb.width = fitted.width
+            thumb.height = fitted.height
+            thumb.horizontal_padding = fitted.horizontal_padding
+            thumb.vertical_padding = fitted.vertical_padding
+            thumb.image_size = len(fitted.data)
+            thumb._pixel_data = fitted.data
             photo.thumbnails.append(thumb)
         if not photo.thumbnails:
-            raise ArtworkError(f"no photo thumbnail could be made from {image_path}")
+            source = "image data" if isinstance(image_path, (bytes, bytearray)) else image_path
+            raise ArtworkError(f"no photo thumbnail could be made from {source}")
         self._next_photo_id += 1
 
+        master = self._ensure_master_album()  # before the append: a new master lists every photo
         self._photos.append(photo)
-
-        # Add to master album (create if missing)
-        master = self.master_album
-        if not master:
-            master = PhotoAlbum(name="Photo Library", album_type=ALBUM_TYPE_MASTER)
-            master.album_id = self._next_album_id
-            self._next_album_id += 1
-            self._albums.insert(0, master)
         master.photo_ids.append(photo.photo_id)
 
         return photo
@@ -620,8 +805,15 @@ class PhotoDB:
 
         Args:
             album: Target album.
-            photo: Photo to add.
+            photo: Photo to add; it must be in this database (added with :meth:`add_photo` or
+                loaded with it), not a photo of another ``PhotoDB`` instance.
+
+        Raises:
+            ValueError: If no photo with ``photo.photo_id`` is in this database (the album would
+                reference a missing photo: libgpod and the iPod cannot read that database).
         """
+        if self.get_photo(photo.photo_id) is None:
+            raise ValueError(f"photo {photo.photo_id} is not in this Photo Database")
         if photo.photo_id not in album.photo_ids:
             album.photo_ids.append(photo.photo_id)
 
@@ -647,15 +839,25 @@ class PhotoDB:
         Every thumbnail (new ones and those already on the iPod) is read first, then written to
         fresh ``F<format>_<N>.ithmb`` files under a file index no current thumbnail uses, then the
         database is replaced atomically, then .ithmb files nothing refers to are deleted. Existing
-        images are never overwritten in place; removed photos' data is dropped.
+        images are never overwritten in place; removed photos' data is dropped. Nothing is
+        written when nothing changed (no new thumbnails, the same database as on disk).
+
+        A Photo Database written by pygpod re-saves byte-identically. One written by iTunes or
+        libgpod is rewritten in pygpod's layout on its first save, even without changes
+        (thumbnails move to new .ithmb files, album ids are renumbered); libgpod and the iPod
+        read the result.
         """
         if not self._mountpoint:
             raise ArtworkError("No mount point set")
+        self._drop_members_without_photo()  # e.g. ids appended to album.photo_ids directly
 
         photos_dir = photos_dir_for(self._mountpoint)
         thumbs_dir = os.path.join(photos_dir, "Thumbs")
         read_dir = self._read_dir or photos_dir
         moving = read_dir != photos_dir
+        if not moving and self._unchanged_on_disk(photos_dir):
+            logger.debug("Photo Database unchanged, nothing written")
+            return
 
         # 1. all pixel data in memory before any file changes
         pixels: Dict[int, bytes] = {}  # id(thumb) -> data
@@ -705,6 +907,19 @@ class PhotoDB:
         if moving:  # the database moved to Photos/: drop pygpod's old iPod_Control/Photos copy
             shutil.rmtree(read_dir, ignore_errors=True)
         self._read_dir = photos_dir
+
+    def _unchanged_on_disk(self, photos_dir: str) -> bool:
+        """True if no thumbnail waits to be written and the database would be written
+        byte-identical to the one on disk."""
+        if any(t._pixel_data is not None for p in self._photos for t in p.thumbnails):
+            return False
+        db_path = os.path.join(photos_dir, "Photo Database")
+        try:
+            with open(db_path, "rb") as f:
+                on_disk = f.read()
+        except OSError:
+            return False
+        return write_artworkdb(self._build_root()) == on_disk
 
     def __repr__(self) -> str:
         return f"<PhotoDB {len(self._photos)} photos, {len(self._albums)} albums>"

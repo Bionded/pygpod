@@ -151,6 +151,11 @@ def _parse_mhii(data: bytes, offset: int) -> Record:
     rec.fields["num_children"] = get32lint(data, offset + 0x0C)
     rec.fields["image_id"] = get32lint(data, offset + 0x10)
     rec.fields["song_id"] = get64lint(data, offset + 0x14)
+    if header_len >= 0x34 and offset + 0x34 <= len(data):
+        rec.fields["rating"] = get32lint(data, offset + 0x20)
+        rec.fields["creation_date"] = get32lint(data, offset + 0x28)  # Mac epoch
+        rec.fields["digitized_date"] = get32lint(data, offset + 0x2C)  # Mac epoch
+        rec.fields["artwork_size"] = get32lint(data, offset + 0x30)  # source image file size
 
     # Parse children: MHOD containers (type=2, wrapping MHNI) or bare MHNI
     pos = offset + header_len
@@ -186,8 +191,9 @@ def _parse_mhni(data: bytes, offset: int) -> Record:
     rec.fields["format_id"] = get32lint(data, offset + 0x10)
     rec.fields["ithumb_offset"] = get32lint(data, offset + 0x14)
     rec.fields["image_size"] = get32lint(data, offset + 0x18)
-    # 0x1C: vertical_padding (16-bit), 0x1E: horizontal_padding (16-bit)
     if offset + 0x24 <= len(data):
+        rec.fields["vertical_padding"] = get16lint(data, offset + 0x1C)
+        rec.fields["horizontal_padding"] = get16lint(data, offset + 0x1E)
         rec.fields["image_height"] = get16lint(data, offset + 0x20)
         rec.fields["image_width"] = get16lint(data, offset + 0x22)
 
@@ -235,7 +241,7 @@ def _parse_artwork_mhod(data: bytes, offset: int) -> Record:
     rec = Record(MHOD_MAGIC, header_len, total_len)
     rec.raw_header = bytes(data[offset : offset + header_len])
     rec.raw_bytes = bytes(data[offset : offset + total_len])
-    rec.fields["mhod_type"] = get32lint(data, offset + 0x0C)
+    rec.fields["mhod_type"] = get16lint(data, offset + 0x0C)  # 0x0E unknown, 0x0F padding_len
     if rec.fields["mhod_type"] == 3 and header_len + 12 <= total_len:
         # .ithmb file name: string_len(4), encoding(4: 2 = UTF-16LE, else UTF-8), unknown(4), string
         body = offset + header_len

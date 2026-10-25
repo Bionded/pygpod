@@ -109,6 +109,10 @@ STRING_MHOD_TYPES = {
     MHOD_ID_ALBUM_ARTIST_MHII,
 }
 
+# Podcast URLs: plain UTF-8 right after the MHOD header, no string sub-header (libgpod
+# itdb_itunesdb.c and iTunes write them this way; pygpod <= 0.1.0 wrote string MHODs)
+URL_MHOD_TYPES = {MHOD_ID_PODCASTURL, MHOD_ID_PODCASTRSS}
+
 # Map of MHOD type to human-readable name
 MHOD_TYPE_NAMES = {
     1: "title",

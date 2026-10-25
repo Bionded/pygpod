@@ -11,10 +11,15 @@ Known issues:
 
 from __future__ import annotations
 
+import json
 import logging
+import ntpath
+import os
+import pathlib
 import platform
+import plistlib
 import subprocess
-from typing import List, NamedTuple, Optional
+from typing import Any, Iterator, List, NamedTuple, Optional, Tuple
 
 from .models import APPLE_VENDOR_ID
 
@@ -59,6 +64,249 @@ def detect_ipod_usb() -> List[USBDeviceInfo]:
     return []
 
 
+def detect_ipod_usb_for_mountpoint(mountpoint: str) -> Optional[USBDeviceInfo]:
+    """Find the USB iPod that backs a mountpoint.
+
+    The mountpoint is first mapped to its USB device (Linux: sysfs; macOS: diskutil and
+    system_profiler; Windows: Get-Partition/Get-Disk). When that is not possible, the bus
+    scan of :func:`detect_ipod_usb` is used only if exactly one iPod is connected: with
+    several iPods there is no way to tell which one is mounted here, so nothing is guessed
+    (a wrong FirewireGuid would sign the database with another iPod's key).
+
+    Args:
+        mountpoint: Path to the iPod mount point.
+
+    Returns:
+        USB device information of the iPod at the mountpoint, or None.
+    """
+    mapped = None
+    try:
+        mapped = usb_device_for_mountpoint(mountpoint)
+    except Exception:
+        logger.debug("Mapping %s to a USB device failed", mountpoint, exc_info=True)
+
+    if mapped is not None and mapped.product_id:
+        return mapped
+
+    try:
+        devices = detect_ipod_usb()
+    except Exception:
+        logger.debug("USB device detection failed", exc_info=True)
+        devices = []
+
+    if mapped is not None:
+        # The mapping knows the device but not its product id (Windows): take it from the bus
+        for dev in devices:
+            if mapped.firewire_guid and dev.firewire_guid == mapped.firewire_guid:
+                return mapped._replace(product_id=dev.product_id)
+        return mapped
+
+    if len(devices) == 1:
+        return devices[0]
+    if len(devices) > 1:
+        logger.warning(
+            "%d iPods are connected and %s cannot be matched to one of them; "
+            "not using USB information for it",
+            len(devices),
+            mountpoint,
+        )
+    return None
+
+
+def usb_device_for_mountpoint(mountpoint: str) -> Optional[USBDeviceInfo]:
+    """Map a mountpoint to the Apple USB device backing it (no bus-scan guessing).
+
+    Returns:
+        USB device information, or None when the mountpoint is not on an Apple USB device
+        or the platform lookup is not possible.
+    """
+    system = platform.system()
+    if system == "Linux":
+        devnum = _block_devnum(mountpoint)
+        return _usb_device_for_devnum_linux(*devnum) if devnum else None
+    elif system == "Darwin":
+        return _usb_device_for_mountpoint_macos(mountpoint)
+    elif system == "Windows":
+        return _usb_device_for_mountpoint_windows(mountpoint)
+    return None
+
+
+# sysfs root, a module attribute so tests can point it at a fake tree
+_SYSFS_ROOT = "/sys"
+
+
+def _block_devnum(mountpoint: str) -> Optional[Tuple[int, int]]:
+    """(major, minor) of the block device holding mountpoint."""
+    try:
+        st_dev = os.stat(mountpoint).st_dev
+    except OSError:
+        return None
+    return os.major(st_dev), os.minor(st_dev)
+
+
+def _usb_device_for_devnum_linux(major: int, minor: int) -> Optional[USBDeviceInfo]:
+    """Walk sysfs from a block device number up to its USB device (Linux)."""
+    link = pathlib.Path(_SYSFS_ROOT) / "dev" / "block" / f"{major}:{minor}"
+    if not link.exists():
+        return None
+    block = link.resolve()
+    # A partition (sdb2) lives inside its disk's directory (sdb)
+    disk = block.parent if (block / "partition").exists() else block
+    for parent in [block] + list(block.parents):
+        vendor_file = parent / "idVendor"
+        if not vendor_file.exists():
+            continue
+        try:
+            if int(vendor_file.read_text().strip(), 16) != APPLE_VENDOR_ID:
+                return None
+            product = int((parent / "idProduct").read_text().strip(), 16)
+            usb_serial = _read_sysfs_attr(parent / "serial")
+            capacity = None
+            size = _read_sysfs_attr(disk / "size")
+            if size:
+                capacity = round(int(size) * 512 / (1000**3), 1)
+            real_serial = _read_scsi_serial(f"/dev/{disk.name}") or ""
+        except (ValueError, OSError):
+            logger.debug("Failed to read sysfs USB device %s", parent, exc_info=True)
+            return None
+        logger.debug("Block device %d:%d is backed by USB device %s", major, minor, parent)
+        return USBDeviceInfo(
+            vendor_id=APPLE_VENDOR_ID,
+            product_id=product,
+            serial=real_serial or usb_serial,
+            manufacturer=_read_sysfs_attr(parent / "manufacturer"),
+            product=_read_sysfs_attr(parent / "product"),
+            firewire_guid=_guid_from_serial(usb_serial),
+            capacity_gb=capacity,
+        )
+    return None
+
+
+def _read_sysfs_attr(path: pathlib.Path) -> str:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return ""
+
+
+def _usb_device_for_mountpoint_macos(mountpoint: str) -> Optional[USBDeviceInfo]:
+    """Map a mountpoint to its USB iPod on macOS (diskutil + system_profiler JSON)."""
+    try:
+        out = subprocess.check_output(["diskutil", "info", "-plist", mountpoint], timeout=10)
+        disk = plistlib.loads(out)
+    except (subprocess.SubprocessError, OSError, ValueError, plistlib.InvalidFileException):
+        logger.debug("diskutil info failed for %s", mountpoint, exc_info=True)
+        return None
+    bsd_name = disk.get("ParentWholeDisk") or disk.get("DeviceIdentifier")
+    if not bsd_name:
+        return None
+
+    # SPUSBHostDataType replaces SPUSBDataType on newer macOS releases
+    for data_type in ("SPUSBDataType", "SPUSBHostDataType"):
+        try:
+            out = subprocess.check_output(
+                ["system_profiler", data_type, "-json"], timeout=30, stderr=subprocess.DEVNULL
+            )
+            tree = json.loads(out)
+        except (subprocess.SubprocessError, OSError, ValueError):
+            logger.debug("system_profiler %s failed", data_type, exc_info=True)
+            continue
+        for item in _walk_profiler_items(tree):
+            media = item.get("Media") or []
+            if not any(isinstance(m, dict) and m.get("bsd_name") == bsd_name for m in media):
+                continue
+            vendor = _profiler_int(item.get("vendor_id") or item.get("USBDeviceKeyVendorID"))
+            if vendor != APPLE_VENDOR_ID:
+                return None
+            serial = str(item.get("serial_num") or item.get("USBDeviceKeySerialNumber") or "")
+            return USBDeviceInfo(
+                vendor_id=APPLE_VENDOR_ID,
+                product_id=_profiler_int(
+                    item.get("product_id") or item.get("USBDeviceKeyProductID")
+                ),
+                serial=serial,
+                manufacturer="Apple Inc.",
+                product=str(item.get("_name") or "iPod"),
+                firewire_guid=_guid_from_serial(serial),
+            )
+    return None
+
+
+def _walk_profiler_items(node: Any) -> Iterator[dict]:
+    """Every dict in a system_profiler JSON tree."""
+    if isinstance(node, dict):
+        yield node
+        for value in node.values():
+            yield from _walk_profiler_items(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _walk_profiler_items(value)
+
+
+def _profiler_int(value: Any) -> int:
+    """Parse '0x05ac  (Apple Inc.)', '0x1261' or 1452."""
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).split()[0], 0)
+    except (ValueError, IndexError):
+        return 0
+
+
+def _usb_device_for_mountpoint_windows(mountpoint: str) -> Optional[USBDeviceInfo]:
+    """Map a drive letter to its USB iPod on Windows (Get-Partition | Get-Disk).
+
+    The disk Path holds the USBSTOR instance id, whose serial part is the iPod's USB
+    serial (= FirewireGuid); the product id is not part of it (filled from the bus scan).
+    """
+    drive, _ = ntpath.splitdrive(mountpoint)
+    letter = drive[:1].upper()
+    if not (letter.isascii() and letter.isalpha()):
+        return None
+    lines = _run_powershell(
+        f"Get-Partition -DriveLetter {letter} -ErrorAction Stop | Get-Disk"
+        " | Select-Object Path,SerialNumber,Size | ConvertTo-Json -Compress"
+    )
+    try:
+        disk = json.loads("".join(lines))
+    except ValueError:
+        return None
+    if isinstance(disk, list):
+        disk = disk[0] if disk else {}
+    if not isinstance(disk, dict):
+        return None
+    usb_serial = _usbstor_serial(str(disk.get("Path") or ""))
+    if usb_serial is None:
+        return None
+    real_serial = str(disk.get("SerialNumber") or "").strip()
+    if all(c in "0123456789ABCDEFabcdef" for c in real_serial):
+        real_serial = ""  # a GUID, not the iPod serial
+    size = disk.get("Size")
+    return USBDeviceInfo(
+        vendor_id=APPLE_VENDOR_ID,
+        product_id=0,
+        serial=real_serial or usb_serial,
+        manufacturer="Apple Inc.",
+        product="iPod",
+        firewire_guid=_guid_from_serial(usb_serial),
+        capacity_gb=round(size / 1000**3, 1) if isinstance(size, int) and size > 0 else None,
+    )
+
+
+def _usbstor_serial(path: str) -> Optional[str]:
+    r"""USB serial from an Apple USBSTOR disk path.
+
+    E.g. ``\\?\usbstor#disk&ven_apple&prod_ipod&rev_1.62#000a27001234567800000000&0#{...}``.
+    """
+    parts = path.split("#")
+    if len(parts) < 3 or not parts[0].lower().endswith("usbstor"):
+        return None
+    if "ven_apple" not in parts[1].lower():
+        return None
+    serial = parts[2].split("&")[0]
+    return serial.upper() or None
+
+
 def _detect_pyusb() -> Optional[List[USBDeviceInfo]]:
     """Try detection via pyusb."""
     try:
@@ -70,9 +318,7 @@ def _detect_pyusb() -> Optional[List[USBDeviceInfo]]:
     results = []
     try:
         devices = usb.core.find(find_all=True, idVendor=APPLE_VENDOR_ID)
-        capacity = None
-        if platform.system() == "Linux":
-            capacity = _get_ipod_capacity_gb()
+        linux = platform.system() == "Linux"
 
         for dev in devices:
             usb_serial = ""
@@ -91,6 +337,7 @@ def _detect_pyusb() -> Optional[List[USBDeviceInfo]]:
                 )
 
             guid = _guid_from_serial(usb_serial)
+            capacity = _get_ipod_capacity_gb(usb_serial or None) if linux else None
 
             # USB serial on iPod Classics is the FireWire GUID, not the
             # real serial. Try SCSI VPD to get the actual device serial.
@@ -119,11 +366,9 @@ def _detect_linux_sysfs() -> List[USBDeviceInfo]:
     import pathlib
 
     results = []
-    sysfs = pathlib.Path("/sys/bus/usb/devices")
+    sysfs = pathlib.Path(_SYSFS_ROOT) / "bus" / "usb" / "devices"
     if not sysfs.exists():
         return results
-
-    capacity = _get_ipod_capacity_gb()
 
     for dev_path in sysfs.iterdir():
         vendor_file = dev_path / "idVendor"
@@ -143,6 +388,7 @@ def _detect_linux_sysfs() -> List[USBDeviceInfo]:
 
             guid = _guid_from_serial(usb_serial)
             real_serial = read_ipod_serial(usb_serial) or ""
+            capacity = _get_ipod_capacity_gb(usb_serial or None)
 
             results.append(
                 USBDeviceInfo(
@@ -167,7 +413,10 @@ def _detect_macos_ioreg() -> List[USBDeviceInfo]:
     results = []
     try:
         output = subprocess.check_output(
-            ["system_profiler", "SPUSBDataType", "-detailLevel", "mini"], text=True, timeout=10
+            ["system_profiler", "SPUSBDataType", "-detailLevel", "mini"],
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
         )
         # Basic parsing of system_profiler output
         # This is a simplified parser
@@ -240,8 +489,12 @@ def _detect_windows_wmi() -> List[USBDeviceInfo]:
     if not instance_ids:
         return results
 
-    # Step 2: Get real serial from Get-Disk (Apple iPod disk)
-    real_serial = _read_serial_windows() or ""
+    # Step 2: real serial per iPod from Get-Disk (its Path holds the USB serial); with one
+    # iPod and no match, the Apple disk's serial as before
+    disk_serials = _windows_disk_serials()
+    fallback_serial = ""
+    if not disk_serials and len(instance_ids) == 1:
+        fallback_serial = _read_serial_windows() or ""
 
     # Step 3: Parse each instance ID
     # Format: USB\VID_05AC&PID_XXXX\<usb_serial>
@@ -261,6 +514,7 @@ def _detect_windows_wmi() -> List[USBDeviceInfo]:
         usb_serial = parts[-1] if len(parts) >= 3 else ""
 
         guid = _guid_from_serial(usb_serial)
+        real_serial = disk_serials.get(usb_serial.upper(), "") or fallback_serial
 
         results.append(
             USBDeviceInfo(
@@ -276,12 +530,42 @@ def _detect_windows_wmi() -> List[USBDeviceInfo]:
     return results
 
 
+def _windows_disk_serials() -> dict:
+    """USB serial (upper case) -> disk serial number of every Apple USB disk (Get-Disk)."""
+    lines = _run_powershell(
+        "Get-Disk | Where-Object {$_.BusType -eq 'USB'} | Select-Object Path,SerialNumber"
+        " | ConvertTo-Json -Compress"
+    )
+    try:
+        disks = json.loads("".join(lines)) if lines else []
+    except ValueError:
+        return {}
+    if isinstance(disks, dict):
+        disks = [disks]
+    result = {}
+    for disk in disks if isinstance(disks, list) else []:
+        if not isinstance(disk, dict):
+            continue
+        usb_serial = _usbstor_serial(str(disk.get("Path") or ""))
+        serial = str(disk.get("SerialNumber") or "").strip()
+        if usb_serial and serial and not all(c in "0123456789ABCDEFabcdef" for c in serial):
+            result[usb_serial] = serial
+    return result
+
+
 def _run_powershell(command: str) -> List[str]:
     """Run a PowerShell command and return output lines."""
     try:
         output = subprocess.check_output(
-            ["powershell", "-NoProfile", "-Command", command],
-            text=True,
+            # UTF-8 output instead of the console code page
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "[Console]::OutputEncoding = [Text.Encoding]::UTF8; " + command,
+            ],
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             stderr=subprocess.DEVNULL,
         )
@@ -390,10 +674,16 @@ def _find_all_ipod_block_devices() -> List[tuple]:
     Returns:
         List of (block_device_path, usb_serial) tuples.
     """
-    import pathlib
+    return [(dev, serial) for dev, serial, _ in _ipod_block_devices()]
 
-    results = []
-    for block in pathlib.Path("/sys/block").iterdir():
+
+def _ipod_block_devices() -> List[Tuple[str, str, Optional[int]]]:
+    """(block device path, USB serial, size in 512-byte sectors) of every Apple USB disk."""
+    results: List[Tuple[str, str, Optional[int]]] = []
+    root = pathlib.Path(_SYSFS_ROOT) / "block"
+    if not root.is_dir():
+        return results
+    for block in sorted(root.iterdir()):
         device_link = block / "device"
         if not device_link.exists():
             continue
@@ -403,50 +693,42 @@ def _find_all_ipod_block_devices() -> List[tuple]:
             vendor_file = parent / "idVendor"
             if vendor_file.exists():
                 try:
-                    vendor = vendor_file.read_text().strip()
-                    if vendor == "05ac":
-                        serial_file = parent / "serial"
-                        usb_serial = ""
-                        if serial_file.exists():
-                            usb_serial = serial_file.read_text().strip()
-                        results.append((f"/dev/{block.name}", usb_serial))
+                    if vendor_file.read_text().strip() == "05ac":
+                        size = _read_sysfs_attr(block / "size")
+                        results.append(
+                            (
+                                f"/dev/{block.name}",
+                                _read_sysfs_attr(parent / "serial"),
+                                int(size) if size.isdigit() else None,
+                            )
+                        )
                 except OSError:
                     pass
                 break
     return results
 
 
-def _get_ipod_capacity_gb() -> Optional[float]:
+def _get_ipod_capacity_gb(usb_serial: Optional[str] = None) -> Optional[float]:
     """Read the disk capacity of a connected iPod from Linux sysfs.
 
     Reads /sys/block/<dev>/size which is world-readable (no root needed).
     Useful for narrowing down the iPod model when serial is unavailable.
 
+    Args:
+        usb_serial: USB serial of the iPod; with several iPods connected only that one's
+            disk counts (None: the first iPod, or None when its disk is not found).
+
     Returns:
         Capacity in GB (base-10, as used in Apple marketing), or None.
     """
-    import pathlib
-
-    for block in pathlib.Path("/sys/block").iterdir():
-        device_link = block / "device"
-        if not device_link.exists():
+    for _, serial, sectors in _ipod_block_devices():
+        if usb_serial and serial.upper() != usb_serial.upper():
             continue
-        real = device_link.resolve()
-        for parent in [real] + list(real.parents):
-            vendor_file = parent / "idVendor"
-            if vendor_file.exists():
-                try:
-                    vendor = vendor_file.read_text().strip()
-                    if vendor == "05ac":
-                        size_file = block / "size"
-                        if size_file.exists():
-                            sectors = int(size_file.read_text().strip())
-                            gb = round(sectors * 512 / (1000**3), 1)
-                            logger.debug("iPod sysfs capacity: %.1f GB", gb)
-                            return gb
-                except (OSError, ValueError):
-                    pass
-                break
+        if sectors is None:
+            return None
+        gb = round(sectors * 512 / (1000**3), 1)
+        logger.debug("iPod sysfs capacity: %.1f GB", gb)
+        return gb
     return None
 
 
@@ -491,8 +773,8 @@ def _read_serial_linux(usb_serial: Optional[str] = None) -> Optional[str]:
                 if serial:
                     logger.info("Read SCSI serial from %s: %s", block_dev, serial)
                     return serial
-    # Fallback: return first iPod found
-    if all_devices:
+    # Fallback: the only iPod (with several, another iPod's serial would be returned)
+    if len(all_devices) == 1:
         serial = _read_scsi_serial(all_devices[0][0])
         if serial:
             logger.info("Read SCSI serial from %s: %s", all_devices[0][0], serial)
@@ -504,21 +786,17 @@ def _read_serial_macos() -> Optional[str]:
     """Read iPod serial on macOS via diskutil or system_profiler."""
     # Try diskutil first - it reads the SCSI serial for USB mass storage
     try:
-        output = subprocess.check_output(
-            ["diskutil", "list", "-plist", "external"], text=True, timeout=10
-        )
+        output = subprocess.check_output(["diskutil", "list", "-plist", "external"], timeout=10)
         import plistlib
 
-        plist = plistlib.loads(output.encode())
+        plist = plistlib.loads(output)
         for disk_name in plist.get("AllDisksAndPartitions", []):
             dev = disk_name.get("DeviceIdentifier", "")
             if not dev:
                 continue
             try:
-                info_out = subprocess.check_output(
-                    ["diskutil", "info", "-plist", dev], text=True, timeout=10
-                )
-                info = plistlib.loads(info_out.encode())
+                info_out = subprocess.check_output(["diskutil", "info", "-plist", dev], timeout=10)
+                info = plistlib.loads(info_out)
                 vendor = info.get("MediaName", "") or info.get("IORegistryEntryName", "")
                 if "iPod" in vendor or "Apple" in vendor:
                     # Get serial from IOKit - try system_profiler
@@ -538,7 +816,10 @@ def _macos_ioreg_serial() -> Optional[str]:
     """Read iPod serial from macOS ioreg (IOKit registry)."""
     try:
         output = subprocess.check_output(
-            ["ioreg", "-r", "-c", "IOUSBHostDevice", "-l"], text=True, timeout=10
+            ["ioreg", "-r", "-c", "IOUSBHostDevice", "-l"],
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
         )
         in_apple = False
         for line in output.splitlines():
@@ -592,6 +873,7 @@ def _read_serial_windows() -> Optional[str]:
                 "/value",
             ],
             text=True,
+            errors="replace",  # console code page
             timeout=10,
             stderr=subprocess.DEVNULL,
         )

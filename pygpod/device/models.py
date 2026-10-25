@@ -107,13 +107,10 @@ class IpodInfo(NamedTuple):
     musicdirs: int  # Number of Fxx music directories
 
 
-# Generations that require hash58 (HMAC-SHA1) - from libgpod itdb_device.c
-# These are the FALLBACK types when SysInfoExtended is not available.
+# Generations that require hash58 (HMAC-SHA1) - from libgpod itdb_device_get_checksum_type.
+# These are the FALLBACK types when SysInfoExtended is not available. The iPod Video 5G/5.5G
+# and the nano 1G/2G take an unsigned database (libgpod and iTunes leave the hash area zero).
 HASH58_GENERATIONS = {
-    IpodGeneration.VIDEO_1,
-    IpodGeneration.VIDEO_2,
-    IpodGeneration.NANO_1,
-    IpodGeneration.NANO_2,
     IpodGeneration.NANO_3,
     IpodGeneration.NANO_4,
     IpodGeneration.CLASSIC_1,
@@ -543,7 +540,7 @@ def get_checksum_type(
 
     Args:
         gen: iPod generation.
-        sysinfo_db_version: db_version from SysInfoExtended (0-4), if available.
+        sysinfo_db_version: db_version from SysInfoExtended (0-5), if available.
 
     Returns:
         ChecksumType enum value.
@@ -554,8 +551,10 @@ def get_checksum_type(
             return ChecksumType.NONE
         elif sysinfo_db_version == 3:
             return ChecksumType.HASH58
-        elif sysinfo_db_version >= 4:
+        elif sysinfo_db_version == 4:
             return ChecksumType.HASH72
+        else:  # 5 (nano 6G); libgpod knows no later scheme
+            return ChecksumType.HASHAB
 
     # Fallback: generation-based mapping (from libgpod itdb_device.c)
     if gen in HASHAB_GENERATIONS:

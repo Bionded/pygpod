@@ -11,6 +11,7 @@ import os
 import shutil
 import struct
 import subprocess
+import time
 import zlib
 
 import pytest
@@ -24,6 +25,14 @@ def pytest_sessionfinish(session, exitstatus):
     )
     if os.path.isdir(test_files):
         shutil.rmtree(test_files, ignore_errors=True)
+
+
+def require_tz_database():
+    """Skip the calling test without an IANA time zone database (Windows without tzdata)."""
+    from pygpod.utils.timezone import _get_tz_offset
+
+    if _get_tz_offset("Asia/Tokyo") is None:
+        pytest.skip("no IANA time zone database (install tzdata)")
 
 
 # Root of the project
@@ -468,3 +477,18 @@ def tool(tmp_path_factory):
     binary = str(tmp_path_factory.mktemp("libgpod") / "libgpod_tool")
     subprocess.run(["gcc", "-Wall", "-o", binary, LIBGPOD_TOOL_SRC, *flags], check=True)
     return binary
+
+
+@pytest.fixture
+def host_tz(monkeypatch):
+    """set(name): run the rest of the test with the host's timezone ``name`` (TZ + tzset)."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset() is not available on this platform")
+
+    def set_tz(name):
+        monkeypatch.setenv("TZ", name)
+        time.tzset()
+
+    yield set_tz
+    monkeypatch.undo()
+    time.tzset()

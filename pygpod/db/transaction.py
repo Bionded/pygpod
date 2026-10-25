@@ -174,6 +174,23 @@ def _apply_journal(mountpoint: str) -> None:
     _fsync_dir(os.path.dirname(path))
 
 
+def interrupted_commit(mountpoint: str) -> bool:
+    """True if an interrupted commit left its journal (recover() completes it)."""
+    return os.path.isfile(_journal_path(mountpoint))
+
+
+def leftover_files(mountpoint: str) -> list:
+    """Staging files of an interrupted commit that recover() would remove (absolute paths)."""
+    out = []
+    for rel_dir in STAGING_DIRS:
+        d = os.path.join(mountpoint, rel_dir)
+        if os.path.isdir(d):
+            for name in sorted(os.listdir(d)):
+                if name.endswith(STAGING_SUFFIX) or name == JOURNAL_NAME + ".tmp":
+                    out.append(os.path.join(d, name))
+    return out
+
+
 def recover(mountpoint: str) -> Optional[str]:
     """Finish or discard an interrupted commit.
 

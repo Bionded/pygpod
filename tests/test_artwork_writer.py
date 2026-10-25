@@ -1,5 +1,7 @@
 """Tests for ArtworkDB binary writer."""
 
+import pytest
+
 
 def test_artworkdb_round_trip(artworkdb_path):
     """Parse and write back should produce identical bytes."""
@@ -82,3 +84,17 @@ def test_artworkdb_image_ids_preserved(artworkdb_path):
     new_ids = [c.fields["image_id"] for c in mhli2.children]
 
     assert original_ids == new_ids
+
+
+@pytest.mark.parametrize("format_id", [1013, 101, 10130])
+def test_filename_mhod_padded_with_padding_length(format_id):
+    """libgpod pads the .ithmb file name MHOD to 4 bytes and stores the pad count at 0x0F."""
+    from pygpod.model.artwork_manager import ArtworkManager
+
+    name = f":F{format_id}_1.ithmb"
+    rec = ArtworkManager._create_filename_mhod(None, name)
+    data = rec.raw_bytes
+    assert len(data) % 4 == 0 and rec.total_len == len(data)
+    pad = len(data) - 24 - 12 - 2 * len(name)
+    assert data[0x0F] == pad < 4 and data[0x0C:0x0E] == b"\x03\x00"
+    assert data[24 + 12 : 24 + 12 + 2 * len(name)].decode("utf-16-le") == name

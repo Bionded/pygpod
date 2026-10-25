@@ -504,11 +504,12 @@ def test_hash58_generation_set():
     """Verify hash58 generation set exists and includes correct devices."""
     from pygpod.device.models import HASH58_GENERATIONS, IpodGeneration
 
-    assert IpodGeneration.VIDEO_1 in HASH58_GENERATIONS
-    assert IpodGeneration.VIDEO_2 in HASH58_GENERATIONS
-    assert IpodGeneration.NANO_1 in HASH58_GENERATIONS
-    assert IpodGeneration.NANO_2 in HASH58_GENERATIONS
-    # Classics and Nano 3-4 also use hash58 (per libgpod itdb_device.c)
+    # 5G/5.5G and nano 1G/2G are unsigned (libgpod itdb_device_get_checksum_type)
+    assert IpodGeneration.VIDEO_1 not in HASH58_GENERATIONS
+    assert IpodGeneration.VIDEO_2 not in HASH58_GENERATIONS
+    assert IpodGeneration.NANO_1 not in HASH58_GENERATIONS
+    assert IpodGeneration.NANO_2 not in HASH58_GENERATIONS
+    # Classics and Nano 3-4 use hash58 (per libgpod itdb_device.c)
     assert IpodGeneration.CLASSIC_1 in HASH58_GENERATIONS
     assert IpodGeneration.CLASSIC_3 in HASH58_GENERATIONS
     assert IpodGeneration.NANO_3 in HASH58_GENERATIONS
