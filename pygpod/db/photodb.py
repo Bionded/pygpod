@@ -31,6 +31,8 @@ from ..utils.datetime import MAC_EPOCH_OFFSET
 from .artwork_parser import parse_artworkdb
 from .artwork_writer import write_artworkdb
 from .parser import Record
+from .transaction import Transaction, interrupted_commit
+from .writelock import writer_lock
 
 logger = logging.getLogger(__name__)
 
@@ -714,7 +716,7 @@ class PhotoDB:
         photo.photo_id = self._next_photo_id
 
         # One thumbnail per photo format of the device (libgpod tables)
-        from ..model.artwork import PixelFormat, render_fitted_thumbnail
+        from ..model.artwork import PixelFormat, _open_rgb, render_fitted_thumbnail
 
         pixel = {
             ThumbFormat.RGB565_LE: PixelFormat.RGB565_LE,
@@ -722,12 +724,15 @@ class PhotoDB:
             ThumbFormat.I420_LE: PixelFormat.I420,
             ThumbFormat.UYVY_BE: PixelFormat.UYVY,
         }
+        source = None
         for fmt in self._photo_formats():
             if fmt.pixel_format not in pixel:
                 continue
             # scaled to fit and centred in the slot, like libgpod (cropped if the format says so)
+            if source is None:
+                source = _open_rgb(image_path)  # decoded once for all formats
             fitted = render_fitted_thumbnail(
-                image_path,
+                source,
                 fmt.width,
                 fmt.height,
                 pixel[fmt.pixel_format],
@@ -837,10 +842,14 @@ class PhotoDB:
         """Save the photo database back to the iPod.
 
         Every thumbnail (new ones and those already on the iPod) is read first, then written to
-        fresh ``F<format>_<N>.ithmb`` files under a file index no current thumbnail uses, then the
-        database is replaced atomically, then .ithmb files nothing refers to are deleted. Existing
-        images are never overwritten in place; removed photos' data is dropped. Nothing is
-        written when nothing changed (no new thumbnails, the same database as on disk).
+        fresh ``F<format>_<N>.ithmb`` files under a file index that no .ithmb file on the iPod
+        has; these, the new database and the deletion of the .ithmb files nothing refers to any
+        more are committed together (crash-safe, like ``Database.save()``). Existing images are
+        never overwritten in place; removed photos' data is dropped. If the save fails, the
+        files on the iPod and the photos' thumbnail references stay as they were, and saving
+        again is safe. Nothing is written when nothing changed (no new thumbnails, the same
+        database as on disk). The save holds the database writer lock (ConflictError while
+        another process saves the iPod's databases), as the commit journal is shared.
 
         A Photo Database written by pygpod re-saves byte-identically. One written by iTunes or
         libgpod is rewritten in pygpod's layout on its first save, even without changes
@@ -858,8 +867,21 @@ class PhotoDB:
         if not moving and self._unchanged_on_disk(photos_dir):
             logger.debug("Photo Database unchanged, nothing written")
             return
+        # the commit journal is shared with Database.save(): one writer at a time
+        itunes_dir = os.path.join(self._mountpoint, "iPod_Control", "iTunes")
+        os.makedirs(itunes_dir, exist_ok=True)
+        with writer_lock(itunes_dir):
+            self._save_locked(photos_dir, thumbs_dir, read_dir, moving)
+
+    def _save_locked(self, photos_dir: str, thumbs_dir: str, read_dir: str, moving: bool) -> None:
+        if interrupted_commit(self._mountpoint):  # its journal would be overwritten
+            raise ArtworkError(
+                "an interrupted save is not completed yet: open the iPod database with "
+                "Database (it completes the save) before saving photos"
+            )
 
         # 1. all pixel data in memory before any file changes
+        old_thumbnails = [(photo, photo.thumbnails) for photo in self._photos]
         pixels: Dict[int, bytes] = {}  # id(thumb) -> data
         for photo in self._photos:
             kept = []
@@ -876,34 +898,60 @@ class PhotoDB:
                 kept.append(thumb)
             photo.thumbnails = kept
 
-        # 2. new .ithmb files under an unused index per format
+        # 2. new .ithmb files under an index neither the database on disk nor any file there
+        # uses, staged with the database and committed together: a failed save leaves the
+        # old files and the thumbnails' addresses as they were
         by_format: Dict[int, List[PhotoThumbnail]] = {}
-        os.makedirs(thumbs_dir, exist_ok=True)
         for photo in self._photos:
             for thumb in photo.thumbnails:
                 by_format.setdefault(thumb.format_id, []).append(thumb)
-        for fmt_id, thumbs in by_format.items():
-            used = {t.ithmb_file for t in thumbs if t._pixel_data is None and not moving}
-            index = next(i for i in range(1, len(used) + 2) if i not in used)
-            blob = bytearray()
-            for thumb in thumbs:
-                thumb.image_offset = len(blob)
-                thumb.image_size = len(pixels[id(thumb)])
-                blob += pixels[id(thumb)]
-            _atomic_write(os.path.join(thumbs_dir, f"F{fmt_id}_{index}.ithmb"), bytes(blob))
-            for thumb in thumbs:
-                thumb.ithmb_file = index
-                thumb._pixel_data = None
+        on_disk = _ithmb_indexes(thumbs_dir, photos_dir)
+        old_root = self._root
+        saved = [
+            (thumb, thumb.ithmb_file, thumb.image_offset, thumb.image_size, thumb._pixel_data)
+            for thumbs in by_format.values()
+            for thumb in thumbs
+        ]
+        tx = Transaction(self._mountpoint)
+        try:
+            os.makedirs(thumbs_dir, exist_ok=True)
+            blobs: Dict[str, bytes] = {}
+            for fmt_id, thumbs in by_format.items():
+                used = set(on_disk.get(fmt_id, ()))
+                if not moving:
+                    used |= {t.ithmb_file for t in thumbs if t._pixel_data is None}
+                index = next(i for i in range(1, len(used) + 2) if i not in used)
+                blob = bytearray()
+                for thumb in thumbs:
+                    thumb.image_offset = len(blob)
+                    thumb.image_size = len(pixels[id(thumb)])
+                    thumb.ithmb_file = index
+                    thumb._pixel_data = None
+                    blob += pixels[id(thumb)]
+                blobs[f"F{fmt_id}_{index}.ithmb"] = bytes(blob)
+            for name, blob in blobs.items():
+                tx.stage_bytes(os.path.join(thumbs_dir, name), blob)
 
-        # 3. the database, then 4. unreferenced .ithmb files
-        self._root = self._build_root()
-        _atomic_write(os.path.join(photos_dir, "Photo Database"), write_artworkdb(self._root))
-        referenced = {
-            f"F{t.format_id}_{t.ithmb_file}.ithmb" for p in self._photos for t in p.thumbnails
-        }
-        for name in os.listdir(thumbs_dir):
-            if _ITHMB_NAME.fullmatch(name) and name not in referenced:
-                os.unlink(os.path.join(thumbs_dir, name))
+            # 3. the database; 4. .ithmb files nothing refers to are deleted on commit
+            self._root = self._build_root()
+            tx.stage_bytes(os.path.join(photos_dir, "Photo Database"), write_artworkdb(self._root))
+            for name in os.listdir(thumbs_dir):
+                if _ITHMB_NAME.fullmatch(name) and name not in blobs:
+                    tx.delete_on_commit(os.path.join(thumbs_dir, name))
+            tx.commit()
+        except BaseException:
+            tx.abort()
+            if interrupted_commit(self._mountpoint):
+                raise  # past the commit point: the new files take effect when it is completed
+            self._root = old_root
+            for photo, thumbnails in old_thumbnails:
+                photo.thumbnails = thumbnails
+            for thumb, ithmb_file, offset, size, data in saved:
+                thumb.ithmb_file = ithmb_file
+                thumb.image_offset = offset
+                thumb.image_size = size
+                thumb._pixel_data = data
+            raise
         if moving:  # the database moved to Photos/: drop pygpod's old iPod_Control/Photos copy
             shutil.rmtree(read_dir, ignore_errors=True)
         self._read_dir = photos_dir
@@ -925,13 +973,19 @@ class PhotoDB:
         return f"<PhotoDB {len(self._photos)} photos, {len(self._albums)} albums>"
 
 
-def _atomic_write(path: str, data: bytes) -> None:
-    tmp = path + ".pygpod-tmp"
-    with open(tmp, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+def _ithmb_indexes(*dirs: str) -> Dict[int, set]:
+    """format id -> the N of every ``F<format>_<N>.ithmb`` file in ``dirs``."""
+    out: Dict[int, set] = {}
+    for d in dirs:
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
+            m = _ITHMB_NAME.fullmatch(name)
+            if m:
+                out.setdefault(int(m.group(1)), set()).add(int(m.group(2)))
+    return out
 
 
 def photos_dir_for(mountpoint: str) -> str:

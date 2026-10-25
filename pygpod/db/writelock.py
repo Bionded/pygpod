@@ -1,12 +1,17 @@
 """Writer lock for an iPod database (one writer at a time).
 
 ``iPod_Control/iTunes/pygpod.lock`` is created exclusively (O_CREAT | O_EXCL) for the duration
-of a save and holds ``{"pid", "host", "time", "token"}``. A lock is stale - and removed - when its
-process is gone on this host or it is older than ``STALE_AFTER_S`` (a writer on another machine
-that crashed; a save takes seconds). Limits: FAT has no ``flock``/advisory locks, so this only
-coordinates pygpod writers; the exclusive create is atomic on local file systems, a network or
-FUSE mount may not guarantee it. Taking over a stale lock renames it aside first (atomic) and
-checks it is still the lock judged stale; a writer only ever deletes the lock with its own token.
+of a save and holds ``{"pid", "host", "time", "token"}``, on Linux also the holder's boot id and
+process start ticks (``"boot"``, ``"start"``). The holder touches the file every ``HEARTBEAT_S``
+seconds while it holds it (a restore may copy music for an hour). A lock is stale - and removed -
+when its process is gone on this host (or its pid now belongs to another process: a different start
+tick count or boot id; these do not move with the wall clock, so a clock step after boot cannot make
+a live writer look stale), or, for a writer on another machine, when it was not touched
+for ``STALE_AFTER_S`` (that writer crashed). A live local writer is never taken over. Limits: FAT
+has no ``flock``/advisory locks, so this only coordinates pygpod writers; the exclusive create is
+atomic on local file systems, a network or FUSE mount may not guarantee it. Taking over a stale lock
+renames it aside first (atomic) and checks it is still the lock judged stale; a writer only ever
+deletes the lock with its own token.
 """
 
 from __future__ import annotations
@@ -15,15 +20,19 @@ import json
 import os
 import socket
 import sys
+import threading
 import time
 import uuid
-from contextlib import contextmanager
-from typing import Iterator
+from contextlib import ExitStack, contextmanager
+from typing import Iterator, Optional
 
 from ..exceptions import ConflictError
 
 LOCK_NAME = "pygpod.lock"
 STALE_AFTER_S = 600.0
+HEARTBEAT_S = 60.0
+# How long opening a database waits for a running save before it reads without recovering
+OPEN_WAIT_S = 5.0
 
 
 def _alive(pid: int) -> bool:
@@ -61,6 +70,50 @@ def _alive_windows(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
+def _start_ticks(pid: object = "self") -> Optional[int]:
+    """Start time of process ``pid`` in clock ticks since boot (Linux /proc), None if unknown."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            return int(f.read().rsplit(b")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _boot_id() -> Optional[str]:
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as f:
+            return f.read().strip() or None
+    except (OSError, ValueError):
+        return None
+
+
+def _same_process(pid: int, boot: str, start: int) -> Optional[bool]:
+    """Is ``pid`` still the process that wrote a lock with ``boot`` / ``start``? None when this
+    cannot be told here (no /proc)."""
+    current = _boot_id()
+    if current is None:
+        return None
+    if current != boot:
+        return False  # written before a reboot: its process is gone
+    ticks = _start_ticks(pid)
+    return None if ticks is None else ticks == start
+
+
+def _started_after(pid: int, when: float) -> bool:
+    """Did the process ``pid`` start after ``when`` (so it reused a crashed writer's pid)?
+    False when that cannot be told (only Linux' /proc is consulted)."""
+    ticks = _start_ticks(pid)
+    if ticks is None:
+        return False
+    try:
+        with open("/proc/stat", "rb") as f:
+            btime = next(int(line.split()[1]) for line in f if line.startswith(b"btime "))
+        started = btime + ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError, StopIteration, AttributeError):
+        return False
+    return started > when + 2.0  # btime is whole seconds
+
+
 def _read(path: str) -> bytes | None:
     try:
         with open(path, "rb") as f:
@@ -82,9 +135,21 @@ def _stale(path: str, data: bytes | None = None) -> bool:
             return time.time() - os.path.getmtime(path) > STALE_AFTER_S
         except OSError:
             return True
-    if time.time() - started > STALE_AFTER_S:
-        return True
-    return host == socket.gethostname() and not _alive(pid)
+    if host == socket.gethostname():
+        if not _alive(pid):
+            return True
+        boot, start = info.get("boot"), info.get("start")
+        if isinstance(boot, str) and isinstance(start, int):
+            same = _same_process(pid, boot, start)
+            if same is not None:
+                return not same
+        # a lock without them (older pygpod) or no /proc: compare wall-clock start times
+        return _started_after(pid, started)
+    try:
+        touched = max(started, os.path.getmtime(path))
+    except OSError:
+        touched = started
+    return time.time() - touched > STALE_AFTER_S
 
 
 def _take_over(path: str, seen: bytes) -> bool:
@@ -140,17 +205,56 @@ def writer_lock(itunes_dir: str) -> Iterator[None]:
         raise ConflictError(f"could not take the database lock {path}")
     token = uuid.uuid4().hex
     info = {"pid": os.getpid(), "host": socket.gethostname(), "time": time.time(), "token": token}
+    boot, start = _boot_id(), _start_ticks()
+    if boot is not None and start is not None:
+        info["boot"], info["start"] = boot, start
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(info, f)
         f.flush()
         os.fsync(f.fileno())
     if not _owned(path, token):
         raise busy  # taken over between create and write (judged garbage by age): not ours
+    stop = threading.Event()
+
+    def heartbeat() -> None:
+        while not stop.wait(HEARTBEAT_S):
+            try:
+                os.utime(path)
+            except OSError:
+                pass
+
+    beat = threading.Thread(target=heartbeat, name="pygpod-lock-heartbeat", daemon=True)
+    beat.start()
     try:
         yield
     finally:
+        stop.set()
+        beat.join()
         if _owned(path, token):  # never remove another writer's lock
             try:
                 os.unlink(path)
             except FileNotFoundError:
                 pass
+
+
+@contextmanager
+def try_writer_lock(itunes_dir: str, wait: Optional[float] = None) -> Iterator[bool]:
+    """Hold the writer lock if possible: yields True while held, False when another live writer
+    still has it after ``wait`` seconds (default ``OPEN_WAIT_S``) or the lock cannot be created
+    (a read-only mount)."""
+    deadline = time.monotonic() + (OPEN_WAIT_S if wait is None else wait)
+    stack = ExitStack()
+    while True:
+        try:
+            stack.enter_context(writer_lock(itunes_dir))
+            held = True
+        except ConflictError:
+            if time.monotonic() < deadline:
+                time.sleep(0.1)
+                continue
+            held = False
+        except OSError:
+            held = False
+        break
+    with stack:
+        yield held

@@ -67,6 +67,25 @@ def generate_ipod_filename(
     return filename
 
 
+def _check_below(root: str, path: pathlib.Path) -> None:
+    """UnsafePathError unless ``path`` (symbolic links resolved) lies inside iPod_Control/Music
+    of the resolved mount point ``root``."""
+    from ..exceptions import UnsafePathError
+
+    real = os.path.normcase(os.path.realpath(str(path)))
+    base = os.path.normcase(root)
+    try:
+        inside = os.path.commonpath([base, real]) == base
+    except ValueError:  # another drive (Windows)
+        inside = False
+    rel = os.path.relpath(real, base).replace(os.sep, "/").lower() if inside else ""
+    if not (rel + "/").startswith("ipod_control/music/"):
+        raise UnsafePathError(
+            f"refusing to write {path}: it leads outside the iPod's iPod_Control/Music "
+            "(a symbolic link?)"
+        )
+
+
 def copy_track_to_ipod(
     source: str,
     mountpoint: str,
@@ -98,20 +117,24 @@ def copy_track_to_ipod(
     ext = src_path.suffix.lower()
 
     dest_dir = pick_music_dir(mountpoint, num_dirs, rng=rng)
+    root = os.path.realpath(mountpoint)
+    _check_below(root, dest_dir)  # before mkdir: a linked Music or Fxx must not lead outside
     dest_dir.mkdir(parents=True, exist_ok=True)
+    _check_below(root, dest_dir)
 
     dest_name = generate_ipod_filename(
         ext, prefix=prefix, rand_len=rand_len, charset=charset, rng=rng
     )
     dest_path = dest_dir / dest_name
 
-    # Ensure unique filename
-    while dest_path.exists():
+    # Ensure unique filename (lexists: a dangling link there would redirect the copy)
+    while os.path.lexists(str(dest_path)):
         dest_name = generate_ipod_filename(
             ext, prefix=prefix, rand_len=rand_len, charset=charset, rng=rng
         )
         dest_path = dest_dir / dest_name
 
+    _check_below(root, dest_path)
     shutil.copy2(str(src_path), str(dest_path))
 
     # Convert to iPod path

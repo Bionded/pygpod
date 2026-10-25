@@ -90,7 +90,7 @@ String and safe numeric fields have setters.
 | `gapless_track_flag` | `bool` | yes | The track has gapless playback data. |
 | `genre` | `str` | yes |  |
 | `grouping` | `str` | yes |  |
-| `has_artwork` | `bool` |  |  |
+| `has_artwork` | `bool` |  | True if the track has cover art (MHIT 0xA4 is 1; libgpod and iTunes write 2 for none). |
 | `ipod_path` | `str` |  | iPod-style colon-separated file path (read-only). |
 | `is_audiobook` | `bool` |  |  |
 | `is_podcast` | `bool` |  |  |

@@ -603,3 +603,170 @@ def test_backup_read_errors_are_not_retried(full_ipod, tmp_path, monkeypatch):
     with pytest.raises(BackupError, match="disk error"):
         pygpod.backup(full_ipod, str(tmp_path / "x.tar"))
     assert len(calls) == 1
+
+
+def _symlink(target, link):
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError):
+        pytest.skip("symbolic links not available")
+
+
+def _tree_bytes(path):
+    """{relative path: bytes} below ``path``, symbolic links listed, not followed."""
+    out = {}
+    for d, dirs, files in os.walk(path):
+        for name in dirs + files:
+            p = os.path.join(d, name)
+            if os.path.islink(p):
+                out[os.path.relpath(p, path)] = "-> " + os.readlink(p)
+            elif os.path.isfile(p):
+                with open(p, "rb") as f:
+                    out[os.path.relpath(p, path)] = f.read()
+    return out
+
+
+def _track_file(mp):
+    track = Database(mp).tracks[0]
+    return os.path.join(mp, *track.ipod_path.strip(":").split(":"))
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_restore_refuses_a_symlinked_music_folder(full_ipod, tmp_path, dry_run):
+    archive = str(tmp_path / "ipod.tar")
+    pygpod.backup(full_ipod, archive)
+    song = _track_file(full_ipod)
+    folder = os.path.dirname(song)
+    outside = tmp_path / "outside"
+    shutil.move(folder, str(outside))  # the folder now lives outside, a link points to it
+    victim = outside / os.path.basename(song)
+    victim.write_bytes(b"not the iPod's")
+    _symlink(str(outside), folder)
+    outside_before = _tree_bytes(str(outside))
+    before = _tree_bytes(full_ipod)
+    with pytest.raises(BackupError, match="outside the mount point"):
+        pygpod.restore(archive, full_ipod, dry_run=dry_run)
+    assert victim.read_bytes() == b"not the iPod's"
+    assert _tree_bytes(str(outside)) == outside_before  # no temporary file either
+    assert _tree_bytes(full_ipod) == before
+
+
+def test_restore_refuses_a_symlink_in_place_of_a_temporary_file(full_ipod, tmp_path):
+    archive = str(tmp_path / "ipod.tar")
+    pygpod.backup(full_ipod, archive)
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"keep me")
+    _symlink(str(victim), _track_file(full_ipod) + ".pygpod-restore")
+    before = _tree_bytes(full_ipod)
+    with pytest.raises(BackupError, match="outside the mount point"):
+        pygpod.restore(archive, full_ipod)
+    assert victim.read_bytes() == b"keep me"
+    assert _tree_bytes(full_ipod) == before
+
+
+def test_restore_refuses_a_symlinked_pre_restore_file(full_ipod, tmp_path):
+    archive = str(tmp_path / "ipod.tar")
+    pygpod.backup(full_ipod, archive)
+    itunes = os.path.join(full_ipod, "iPod_Control", "iTunes")
+    with open(os.path.join(itunes, "Play Counts"), "wb") as f:
+        f.write(b"recorded after the backup")  # moved aside by a restore
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"keep me")
+    _symlink(str(victim), os.path.join(itunes, "Play Counts.pre-restore"))
+    before = _tree_bytes(full_ipod)
+    with pytest.raises(BackupError, match="outside the mount point"):
+        pygpod.restore(archive, full_ipod)
+    assert victim.read_bytes() == b"keep me"
+    assert _tree_bytes(full_ipod) == before
+
+
+def test_restore_refuses_a_symlinked_photos_folder(photo_ipod, tmp_path):
+    archive = str(tmp_path / "ipod.tar")
+    pygpod.backup(photo_ipod, archive)
+    outside = tmp_path / "outside-photos"
+    photos = os.path.join(photo_ipod, "Photos")
+    shutil.move(photos, str(outside))
+    _symlink(str(outside), photos)
+    outside_before = _tree_bytes(str(outside))
+    before = _tree_bytes(photo_ipod)
+    with pytest.raises(BackupError, match="outside the mount point"):
+        pygpod.restore(archive, photo_ipod)
+    assert _tree_bytes(str(outside)) == outside_before
+    assert _tree_bytes(photo_ipod) == before
+
+
+HASH72_VECTOR = os.path.join(os.path.dirname(__file__), "data", "hash72_libgpod")
+HASH72_IV, HASH72_RND = bytes(range(0x64, 0x74)), bytes(range(1, 13))
+
+
+def _hash72_target(tmp_path, hash_info=False):
+    """A nano 5G (hash72) with its iTunesDB signed by libgpod; HashInfo only if asked."""
+    mp = tmp_path / "nano"
+    for d in ("iTunes", "Device", "Music/F00"):
+        (mp / "iPod_Control" / d).mkdir(parents=True)
+    shutil.copy(os.path.join(HASH72_VECTOR, "iTunesDB"), str(mp / "iPod_Control" / "iTunes"))
+    names = ["SysInfo", "SysInfoExtended"] + (["HashInfo"] if hash_info else [])
+    for name in names:
+        shutil.copy(os.path.join(HASH72_VECTOR, name), str(mp / "iPod_Control" / "Device"))
+    return str(mp)
+
+
+def _assert_signed_for_the_nano(mp):
+    from pygpod.hash.hash72 import compute_hash72, extract_hash72_params
+
+    with open(os.path.join(mp, "iPod_Control", "iTunes", "iTunesDB"), "rb") as f:
+        data = f.read()
+    assert extract_hash72_params(data) == (HASH72_IV, HASH72_RND)
+    assert compute_hash72(data, iv=HASH72_IV, random_bytes=HASH72_RND) == data
+    with open(os.path.join(mp, "iPod_Control", "Device", "HashInfo"), "rb") as f, open(
+        os.path.join(HASH72_VECTOR, "HashInfo"), "rb"
+    ) as g:
+        assert f.read() == g.read()
+
+
+@pytest.mark.parametrize("hash_info", [False, True])
+def test_forced_restore_onto_a_hash72_ipod_keeps_its_signing_parameters(
+    full_ipod, tmp_path, hash_info
+):
+    archive = str(tmp_path / "classic.tar")
+    pygpod.backup(full_ipod, archive)
+    nano = _hash72_target(tmp_path, hash_info=hash_info)
+    result = pygpod.restore(archive, nano, force=True)
+    assert result.resigned
+    _assert_signed_for_the_nano(nano)
+    db = Database(nano, recover=False)
+    assert sorted(t.title for t in db.tracks) == ["Без бою", "Човен"]
+    assert not ({"checksum_mismatch", "checksum_unknown"} & db.check().kinds())
+
+
+def test_forced_restore_commits_a_database_already_signed_for_the_target(
+    full_ipod, tmp_path, monkeypatch
+):
+    """Even if the re-save after the commit fails, the committed database is signed with
+    the target's hash72 parameters and HashInfo exists."""
+    archive = str(tmp_path / "classic.tar")
+    pygpod.backup(full_ipod, archive)
+    nano = _hash72_target(tmp_path)
+
+    def fail(self, *a, **kw):
+        raise RuntimeError("interrupted after the commit")
+
+    monkeypatch.setattr(Database, "save", fail)
+    with pytest.raises(RuntimeError):
+        pygpod.restore(archive, nano, force=True)
+    _assert_signed_for_the_nano(nano)
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_forced_restore_refuses_when_the_hash72_parameters_are_lost(full_ipod, tmp_path, dry_run):
+    archive = str(tmp_path / "classic.tar")
+    pygpod.backup(full_ipod, archive)
+    nano = _hash72_target(tmp_path)
+    db_path = os.path.join(nano, "iPod_Control", "iTunes", "iTunesDB")
+    with open(db_path, "rb+") as f:  # not signed by iTunes/libgpod: nothing to recover
+        f.seek(0x72)
+        f.write(bytes(46))
+    before = _snapshot(nano)
+    with pytest.raises(BackupError, match="hash72"):
+        pygpod.restore(archive, nano, force=True, dry_run=dry_run)
+    assert _snapshot(nano) == before

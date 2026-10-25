@@ -1,4 +1,4 @@
-"""Crash-safe multi-file commit for iTunesDB, ArtworkDB and .ithmb files.
+"""Crash-safe multi-file commit for iTunesDB, ArtworkDB, Photo Database and .ithmb files.
 
 A single rename is atomic, but a save touches several files (iTunesDB,
 ArtworkDB, compacted .ithmb files, deleted .ithmb files). A small redo
@@ -14,28 +14,39 @@ journal makes the whole set atomic:
 
 On open, recover() replays a leftover journal (roll forward; every step is
 idempotent) and removes staging files that never got a journal (roll back).
+The journal holds the SHA-256 of every staged file: a staging file that is gone
+is only accepted when its target already has that content (renamed before the
+interruption); otherwise the replay raises before it changes anything. Callers
+run recover() under the writer lock (db/writelock.py) so it never touches the
+files of a save in progress.
 os.replace() over an existing file works on FAT (vfat), HFS+ and NTFS-3G.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 from typing import Callable, List, Optional, Tuple
 
+from ..exceptions import DatabaseError
+
 logger = logging.getLogger(__name__)
 
 STAGING_SUFFIX = ".pygpod-new"
 JOURNAL_NAME = "pygpod.journal"
-# Directories (relative to the mount point) that may hold staged files.
+# Directories (relative to the mount point) that may hold staged files: the iTunesDB and
+# ArtworkDB folders and the Photo Database with its thumbnails (Photos, Photos/Thumbs).
 STAGING_DIRS = (
     os.path.join("iPod_Control", "iTunes"),
     os.path.join("iPod_Control", "Artwork"),
+    "Photos",
+    os.path.join("Photos", "Thumbs"),
 )
 
 
-class TransactionError(Exception):
+class TransactionError(DatabaseError):
     """A journal entry is invalid (e.g. points outside the mount point)."""
 
 
@@ -72,11 +83,18 @@ class Transaction:
 
     def __init__(self, mountpoint: str) -> None:
         self._mountpoint = mountpoint
-        self._staged: List[Tuple[str, str]] = []  # (staging path, target path), absolute
+        self._staged: List[Tuple[str, str, str]] = []  # (staging, target, sha256), absolute
         self._deletes: List[str] = []
         self._on_commit: List[Callable[[], None]] = []
         self._on_abort: List[Callable[[], None]] = []
         self._done = False
+        self._journal_written = False
+
+    @property
+    def journal_written(self) -> bool:
+        """True once the commit point was reached: the changes are made by commit() or, if
+        it failed after that, by the next recover()."""
+        return self._journal_written
 
     def _rel(self, path: str) -> str:
         rel = os.path.relpath(os.path.realpath(path), os.path.realpath(self._mountpoint))
@@ -87,10 +105,15 @@ class Transaction:
         """Stage a new version of ``target``; ``write(path)`` creates the file at ``path``."""
         self._rel(target)
         tmp = target + STAGING_SUFFIX
-        self._staged.append((tmp, target))
+        self._rel(tmp)  # a symbolic link there must not redirect the write either
+        self._staged.append((tmp, target, ""))
         write(tmp)
+        digest = hashlib.sha256()
         with open(tmp, "rb+") as f:
             os.fsync(f.fileno())
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+        self._staged[-1] = (tmp, target, digest.hexdigest())
 
     def stage_bytes(self, target: str, data: bytes) -> None:
         def write(path: str) -> None:
@@ -110,10 +133,10 @@ class Transaction:
         self._on_abort.append(callback)
 
     def _write_journal(self) -> None:
-        for d in {os.path.dirname(t) for t, _ in self._staged}:
+        for d in {os.path.dirname(t) for t, _, _ in self._staged}:
             _fsync_dir(d)
         journal = {
-            "replace": [[self._rel(t), self._rel(f)] for t, f in self._staged],
+            "replace": [[self._rel(t), self._rel(f), h] for t, f, h in self._staged],
             "delete": [self._rel(p) for p in self._deletes],
         }
         path = _journal_path(self._mountpoint)
@@ -132,8 +155,15 @@ class Transaction:
             raise TransactionError("transaction already finished")
         self._write_journal()
         self._done = True
+        self._journal_written = True
         _apply_journal(self._mountpoint)
-        for cb in self._on_commit:
+        self.run_commit_callbacks()
+
+    def run_commit_callbacks(self) -> None:
+        """Run the on_commit callbacks (once): by commit(), or by the caller after recover()
+        completed this transaction's interrupted commit."""
+        callbacks, self._on_commit = self._on_commit, []
+        for cb in callbacks:
             cb()
 
     def abort(self) -> None:
@@ -141,7 +171,7 @@ class Transaction:
         if self._done:
             return
         self._done = True
-        for tmp, _ in self._staged:
+        for tmp, _, _ in self._staged:
             try:
                 os.unlink(tmp)
             except OSError:
@@ -154,13 +184,23 @@ def _apply_journal(mountpoint: str) -> None:
     path = _journal_path(mountpoint)
     with open(path, "r", encoding="utf-8") as f:
         journal = json.load(f)
-    dirs = set()
-    for tmp_rel, target_rel in journal.get("replace", []):
-        tmp = _resolve(mountpoint, tmp_rel)
-        target = _resolve(mountpoint, target_rel)
+    replace = []
+    for entry in journal.get("replace", []):
+        tmp, target = _resolve(mountpoint, entry[0]), _resolve(mountpoint, entry[1])
+        if not os.path.exists(tmp):
+            # renamed before the interruption - or lost: then the commit cannot be completed
+            # (journals of older versions carry no hash and are trusted as before)
+            if len(entry) > 2 and entry[2] and _sha256(target) != entry[2]:
+                raise TransactionError(
+                    f"the interrupted save cannot be completed: {entry[0]} is missing and "
+                    f"{entry[1]} does not hold its content; nothing was replaced (remove "
+                    f"{_journal_path(mountpoint)} to keep the current files, or restore a backup)"
+                )
+        replace.append((tmp, target))
+    dirs = {os.path.dirname(target) for _, target in replace}
+    for tmp, target in replace:
         if os.path.exists(tmp):
             os.replace(tmp, target)
-        dirs.add(os.path.dirname(target))
     for rel in journal.get("delete", []):
         target = _resolve(mountpoint, rel)
         try:
@@ -174,16 +214,54 @@ def _apply_journal(mountpoint: str) -> None:
     _fsync_dir(os.path.dirname(path))
 
 
+def _sha256(path: str) -> Optional[str]:
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
 def interrupted_commit(mountpoint: str) -> bool:
     """True if an interrupted commit left its journal (recover() completes it)."""
     return os.path.isfile(_journal_path(mountpoint))
 
 
+def _child_dir(parent: str, name: str) -> Optional[str]:
+    """The directory of ``parent`` named ``name``, matched case-insensitively (FAT keeps the case it
+    was created with), spelled as it is on disk, else None. The listing comes first: on a
+    case-insensitive file system ``parent/name`` exists in any spelling."""
+    try:
+        names = os.listdir(parent)
+    except OSError:
+        return None
+    if name in names and os.path.isdir(os.path.join(parent, name)):
+        return os.path.join(parent, name)
+    for n in names:
+        if n.lower() == name.lower() and os.path.isdir(os.path.join(parent, n)):
+            return os.path.join(parent, n)
+    return None
+
+
+def _staging_dirs(mountpoint: str) -> List[str]:
+    """The existing STAGING_DIRS as absolute paths, matched case-insensitively."""
+    out = []
+    for rel_dir in STAGING_DIRS:
+        d: Optional[str] = mountpoint
+        for part in rel_dir.split(os.sep):
+            d = _child_dir(d, part) if d is not None else None
+        if d is not None and d not in out:
+            out.append(d)
+    return out
+
+
 def leftover_files(mountpoint: str) -> list:
     """Staging files of an interrupted commit that recover() would remove (absolute paths)."""
     out = []
-    for rel_dir in STAGING_DIRS:
-        d = os.path.join(mountpoint, rel_dir)
+    for d in _staging_dirs(mountpoint):
         if os.path.isdir(d):
             for name in sorted(os.listdir(d)):
                 if name.endswith(STAGING_SUFFIX) or name == JOURNAL_NAME + ".tmp":
@@ -202,10 +280,7 @@ def recover(mountpoint: str) -> Optional[str]:
         logger.warning("Completing an interrupted database commit at %s", mountpoint)
         _apply_journal(mountpoint)
         result = "rolled-forward"
-    for rel_dir in STAGING_DIRS:
-        d = os.path.join(mountpoint, rel_dir)
-        if not os.path.isdir(d):
-            continue
+    for d in _staging_dirs(mountpoint):
         for name in os.listdir(d):
             if name.endswith(STAGING_SUFFIX) or name == JOURNAL_NAME + ".tmp":
                 try:

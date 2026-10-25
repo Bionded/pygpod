@@ -87,7 +87,9 @@ def probe_video(filepath: str) -> Optional[Dict[str, Any]]:
     """ffprobe facts about a media file, None when ffprobe is missing or fails.
 
     Returns ``{"format": names, "duration": s, "video": stream or None, "audio": stream or
-    None}``; cover pictures (attached_pic streams) do not count as video.
+    None}``; pictures do not count as video: cover art (attached_pic streams), chapter
+    pictures (timed_thumbnails) and still-image streams of a single frame. A Motion-JPEG
+    or PNG stream of several frames is video.
     """
     ffprobe = find_ffprobe()
     if not ffprobe:
@@ -104,10 +106,7 @@ def probe_video(filepath: str) -> Optional[Dict[str, Any]]:
     result: Dict[str, Any] = {"video": None, "audio": None}
     for st in data.get("streams") or []:
         kind = st.get("codec_type")
-        if kind == "video" and (
-            (st.get("disposition") or {}).get("attached_pic")
-            or st.get("codec_name") in _STILL_IMAGE_CODECS
-        ):
+        if kind == "video" and _is_picture(st):
             continue  # cover or chapter pictures, not video
         if kind in ("video", "audio") and result[kind] is None:
             result[kind] = st
@@ -115,6 +114,18 @@ def probe_video(filepath: str) -> Optional[Dict[str, Any]]:
     result["format"] = fmt.get("format_name") or ""
     result["duration"] = _num(fmt.get("duration"))
     return result
+
+
+def _is_picture(stream: Dict[str, Any]) -> bool:
+    """True for a video stream that is a picture: cover art, chapter pictures, or a single
+    still image (a still-image codec with at most one frame)."""
+    disposition = stream.get("disposition") or {}
+    if disposition.get("attached_pic") or disposition.get("timed_thumbnails"):
+        return True
+    if stream.get("codec_name") not in _STILL_IMAGE_CODECS:
+        return False
+    frames = stream.get("nb_frames")
+    return frames is not None and str(frames).isdigit() and int(frames) <= 1
 
 
 def _num(value: Any) -> float:
@@ -268,20 +279,26 @@ def convert_for_ipod(
 
     Returns the path of a new temporary file (the caller deletes it). Tags are copied as far as
     ffmpeg maps them; embedded pictures are not (add_track reads tags and artwork from the
-    original). A file with a video stream (found by ffprobe; cover pictures do not count)
-    goes to convert_video_for_ipod(size=video_size) when the iPod plays video or the
-    generation is unknown. Raises UnsupportedFormatError when ffmpeg is missing or fails.
+    original). A file with a video stream (found by ffprobe; cover and chapter pictures do
+    not count, a Motion-JPEG video does) goes to convert_video_for_ipod(size=video_size)
+    when the iPod plays video or the generation is unknown; on an iPod without video only
+    its audio is converted (with a warning). Raises UnsupportedFormatError when ffmpeg is
+    missing or fails.
     """
     from .device.models import MAX_CHANNELS, MAX_SAMPLE_RATE, VIDEO_GENERATIONS, IpodGeneration
     from .tags import probe_media
 
-    if generation in VIDEO_GENERATIONS or generation in (None, IpodGeneration.UNKNOWN):
-        probe = probe_video(filepath)
-        if probe is not None and probe.get("video"):
-            return convert_video_for_ipod(filepath, generation, video_size, workdir, probe)
+    probe = probe_video(filepath)
+    has_video = probe is not None and bool(probe.get("video"))
+    if has_video and (
+        generation in VIDEO_GENERATIONS or generation in (None, IpodGeneration.UNKNOWN)
+    ):
+        return convert_video_for_ipod(filepath, generation, video_size, workdir, probe)
     info = probe_media(filepath)
     if info.is_video:
         raise UnsupportedFormatError(f"{filepath}: video is not converted")
+    if has_video:
+        logger.warning("%s: this iPod does not play video, only the audio is converted", filepath)
     codec = target_codec(info.codec, generation)
     fd, dest = tempfile.mkstemp(prefix="pygpod-", suffix=".m4a", dir=workdir)
     os.close(fd)

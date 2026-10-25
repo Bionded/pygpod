@@ -47,7 +47,7 @@ def _thumbs(mgr, image_id):
                 if mhni.magic != MHNI_MAGIC:
                     continue
                 fmt = mhni.fields["format_id"]
-                path = os.path.join(mgr._artwork_dir, f"F{fmt}_1.ithmb")
+                path = os.path.join(mgr._artwork_dir, ArtworkManager._mhni_file(mhni))
                 with open(path, "rb") as f:
                     f.seek(mhni.fields["ithumb_offset"])
                     out[fmt] = f.read(mhni.fields["image_size"])
@@ -169,6 +169,91 @@ def test_crash_after_commit_point_rolls_forward(ipod, monkeypatch):
     assert _leftovers(ipod) == []
 
 
+def _fail_itunesdb_replace_once(monkeypatch):
+    real_replace = os.replace
+    failed = []
+
+    def fail_once(src, dst):
+        if dst.endswith("iTunesDB") and not failed:
+            failed.append(dst)
+            raise OSError(5, "Input/output error")  # after the journal is written
+        real_replace(src, dst)
+
+    monkeypatch.setattr(transaction.os, "replace", fail_once)
+
+
+def test_retry_after_a_failure_past_the_journal_is_no_conflict(ipod, monkeypatch, tmp_path):
+    db = Database(ipod)
+    mp3 = str(tmp_path / "Гуцулка.mp3")
+    _make_minimal_mp3(mp3)
+    png = str(tmp_path / "обкладинка.png")
+    _make_minimal_png(png, 64, 64, (0, 90, 200))
+    track = db.add_track(mp3, title="Гуцулка Ксеня", cover_art=png)
+    _fail_itunesdb_replace_once(monkeypatch)
+    with pytest.raises(OSError):
+        db.save()
+    assert os.path.isfile(os.path.join(ipod, "iPod_Control", "iTunes", JOURNAL_NAME))
+    db.save()  # completes its own interrupted commit, no ConflictError
+    monkeypatch.undo()
+    assert _leftovers(ipod) == []
+    again = Database(ipod)
+    assert [t.title for t in again.tracks if t.title == "Гуцулка Ксеня"] == ["Гуцулка Ксеня"]
+    assert _thumbs(again._get_artwork_manager(), track.mhii_link)
+    assert again.check().ok, again.check().summary()
+    db.tracks[0].title = "ще раз"  # and the object keeps saving normally
+    db.save()
+    assert Database(ipod).tracks[0].title == "ще раз"
+
+
+def test_retry_after_another_process_recovered_the_commit(ipod, monkeypatch):
+    db = Database(ipod)
+    _rename_first(db, "Ой у лузі")
+    _fail_itunesdb_replace_once(monkeypatch)
+    with pytest.raises(OSError):
+        db.save()
+    monkeypatch.undo()
+    assert Database(ipod).tracks[0].title == "Ой у лузі"  # this open recovered it
+    db.save()
+    assert Database(ipod).tracks[0].title == "Ой у лузі"
+
+
+def test_edits_after_an_interrupted_save_stay_modified_when_the_retry_fails(ipod, monkeypatch):
+    db = Database(ipod)
+    _rename_first(db, "Друга")
+    _fail_itunesdb_replace_once(monkeypatch)
+    with pytest.raises(OSError):
+        db.save()
+    monkeypatch.undo()
+    db.tracks[0].title = "Третя"  # not saved yet
+    assert db.modified
+
+    def fail_before_the_commit_point(self):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(Database, "_prepare_for_save", fail_before_the_commit_point)
+    with pytest.raises(OSError):
+        db.save()
+    monkeypatch.undo()
+    assert Database(ipod).tracks[0].title == "Друга"
+    assert db.modified  # "Третя" is still unsaved (a context-manager exit must save it)
+
+
+def test_another_writers_interrupted_commit_still_conflicts(ipod, monkeypatch):
+    from pygpod.exceptions import ConflictError, DatabaseError
+
+    mine, other = Database(ipod), Database(ipod)
+    _rename_first(other, "Чужа зміна")
+    _fail_itunesdb_replace_once(monkeypatch)
+    with pytest.raises(OSError):
+        other.save()
+    monkeypatch.undo()
+    _rename_first(mine, "Моя зміна")
+    with pytest.raises(ConflictError):
+        mine.save()
+    assert Database(ipod).tracks[0].title == "Чужа зміна"
+    assert issubclass(TransactionError, DatabaseError)
+
+
 def test_partial_multi_file_commit_completes(ipod, monkeypatch):
     itunes = os.path.join(ipod, "iPod_Control", "iTunes")
     a, b = os.path.join(itunes, "A.bin"), os.path.join(itunes, "B.bin")
@@ -216,6 +301,19 @@ def test_journal_path_escape_refused(ipod, tmp_path):
         f.write('{"replace": [], "delete": ["../outside.txt"]}')
     with pytest.raises(TransactionError):
         transaction.recover(ipod)
+    assert outside.read_text() == "keep"
+
+
+def test_symlinked_staging_file_refused(ipod, tmp_path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("keep")
+    try:
+        os.symlink(str(outside), _db_path(ipod) + STAGING_SUFFIX)
+    except (OSError, NotImplementedError):
+        pytest.skip("symbolic links not available")
+    tx = Transaction(ipod)
+    with pytest.raises(TransactionError):
+        tx.stage_bytes(_db_path(ipod), b"new")
     assert outside.read_text() == "keep"
 
 

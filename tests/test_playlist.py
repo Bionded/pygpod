@@ -117,3 +117,70 @@ def test_empty_playlist():
     assert not pl.is_master
     assert not pl.is_podcast
     assert pl.playlist_id == 0
+
+
+def test_fixed_seed_gives_unique_playlist_ids_across_reopen(writable_ipod):
+    from pygpod.model.config import DatabaseConfig
+    from pygpod.model.database import Database
+
+    cfg = DatabaseConfig(random_seed=7)
+    db = Database(writable_ipod, config=cfg)
+    one = db.create_playlist("Перший").playlist_id
+    db.save()
+    db = Database(writable_ipod, config=cfg)  # the same sequence again
+    two = db.create_playlist("Другий").playlist_id
+    assert one != two
+    db.save()
+    db = Database(writable_ipod, config=cfg)
+    db.delete_playlist(db.get_playlist("Другий"))
+    db.save()
+    assert Database(writable_ipod).get_playlist("Перший") is not None
+
+
+def _positions(db, playlist_id):
+    """Item positions (MHOD 100) of one playlist, per playlist list (MHSD 2 and 3)."""
+    import struct
+
+    from pygpod.db.constants import MHIP_MAGIC, MHOD_ID_PLAYLIST, MHYP_MAGIC
+
+    out = {}
+    for mhsd in db._root.children:
+        kind = mhsd.fields.get("mhsd_type")
+        if kind not in (2, 3) or not mhsd.children:
+            continue
+        for mhyp in mhsd.children[0].children:
+            if mhyp.magic != MHYP_MAGIC or mhyp.fields.get("playlist_id") != playlist_id:
+                continue
+            found = []
+            for mhip in mhyp.children:
+                if mhip.magic != MHIP_MAGIC:
+                    continue
+                for mhod in mhip.children:
+                    if mhod.fields.get("mhod_type") == MHOD_ID_PLAYLIST:
+                        found.append(struct.unpack_from("<I", mhod.raw_bytes, mhod.header_len)[0])
+            out[kind] = found
+    return out
+
+
+def test_positions_are_renumbered_after_remove_and_add(writable_ipod, tmp_path):
+    from pygpod.model.database import Database
+
+    from .conftest import _make_minimal_mp3
+
+    mp3 = str(tmp_path / "пісня.mp3")
+    _make_minimal_mp3(mp3)
+    db = Database(writable_ipod)
+    a, b, c = (db.add_track(mp3, title=t) for t in ("Аркан", "Бандура", "Вербова"))
+    pl = db.create_playlist("Танці")
+    db.add_track_to_playlist(pl, a)
+    db.add_track_to_playlist(pl, b)
+    db.remove_track_from_playlist(pl, a)
+    db.add_track_to_playlist(pl, c)
+    assert _positions(db, pl.playlist_id) == {2: [0, 1], 3: [0, 1]}
+    db.save()
+    db = Database(writable_ipod)
+    pl = db.get_playlist("Танці")
+    assert [t.title for t in pl.tracks] == ["Бандура", "Вербова"]
+    assert _positions(db, pl.playlist_id) == {2: [0, 1], 3: [0, 1]}
+    db.remove_tracks([t for t in db.tracks if t.title == "Бандура"])
+    assert _positions(db, pl.playlist_id) == {2: [0], 3: [0]}

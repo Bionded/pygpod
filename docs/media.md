@@ -98,9 +98,11 @@ Convert ``filepath`` to an .m4a (or, for video, .m4v) the iPod plays.
 
 Returns the path of a new temporary file (the caller deletes it). Tags are copied as far as
 ffmpeg maps them; embedded pictures are not (add_track reads tags and artwork from the
-original). A file with a video stream (found by ffprobe; cover pictures do not count)
-goes to convert_video_for_ipod(size=video_size) when the iPod plays video or the
-generation is unknown. Raises UnsupportedFormatError when ffmpeg is missing or fails.
+original). A file with a video stream (found by ffprobe; cover and chapter pictures do
+not count, a Motion-JPEG video does) goes to convert_video_for_ipod(size=video_size)
+when the iPod plays video or the generation is unknown; on an iPod without video only
+its audio is converted (with a warning). Raises UnsupportedFormatError when ffmpeg is
+missing or fails.
 ```
 
 ### `pygpod.convert.convert_video_for_ipod(filepath: 'str', generation=None, size: 'str' = 'small', workdir: 'Optional[str]' = None, probe: 'Optional[Dict[str, Any]]' = None) -> 'str'`
@@ -135,7 +137,9 @@ Limits of an iPod H.264 video profile (Baseline, yuv420p, AAC-LC stereo audio).
 ffprobe facts about a media file, None when ffprobe is missing or fails.
 
 Returns ``{"format": names, "duration": s, "video": stream or None, "audio": stream or
-None}``; cover pictures (attached_pic streams) do not count as video.
+None}``; pictures do not count as video: cover art (attached_pic streams), chapter
+pictures (timed_thumbnails) and still-image streams of a single frame. A Motion-JPEG
+or PNG stream of several frames is video.
 ```
 
 ### `pygpod.convert.video_problems(probe: 'Dict[str, Any]', profile: 'VideoProfile', filepath: 'Optional[str]' = None) -> 'List[str]'`
@@ -242,9 +246,10 @@ Raises:
 ### `pygpod.tags.mp4_has_video(filepath: 'str') -> 'bool'`
 
 ```text
-True if the MP4/M4V/MOV file has a real video track: an enabled 'vide' track whose
-samples are not still images (chapter pictures of enhanced podcasts and audiobooks
-are jpeg/png tracks and do not count).
+True if the MP4/M4V/MOV file has a real video track: an enabled 'vide' track that is
+not the chapter-picture track of another track ('chap' track reference, as in enhanced
+podcasts and audiobooks) and, if its samples are still images (JPEG, PNG, ...), has
+more than one of them (a Motion-JPEG video is video, a single picture is not).
 ```
 
 ### `pygpod.gapless.read_gapless(filepath: 'str') -> 'Optional[Dict[str, int]]'`

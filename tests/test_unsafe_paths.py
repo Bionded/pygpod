@@ -76,4 +76,46 @@ def test_remove_track_valid_path_deletes_file(writable_ipod_with_mp3):
     fpath = ipod_path_to_os(track.ipod_path, mp)
     assert os.path.isfile(fpath)
     db.remove_track(track, delete_file=True)
+    assert os.path.isfile(fpath)  # deleted by the save, not before it
+    db.save()
     assert not os.path.exists(fpath)
+
+
+def _link_or_skip(target, link):
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError):
+        pytest.skip("symbolic links not available")
+
+
+@pytest.mark.parametrize("linked", ["Music", "Fxx"])
+def test_add_track_never_writes_through_a_link_leading_outside(
+    writable_ipod_with_mp3, tmp_path, linked
+):
+    import shutil
+
+    mp, mp3 = writable_ipod_with_mp3
+    outside = tmp_path / "назовні"
+    outside.mkdir()
+    music = os.path.join(mp, "iPod_Control", "Music")
+    if linked == "Music":
+        shutil.rmtree(music)
+        _link_or_skip(str(outside), music)
+    else:
+        for name in os.listdir(music):  # every Fxx folder leads outside
+            shutil.rmtree(os.path.join(music, name))
+        for i in range(100):
+            _link_or_skip(str(outside), os.path.join(music, f"F{i:02d}"))
+    db = Database(mp)
+    n = len(db.tracks)
+    with pytest.raises(UnsafePathError):
+        db.add_track(mp3, title="Мандрівка")
+    assert list(outside.iterdir()) == []
+    assert len(db.tracks) == n
+
+
+def test_add_track_still_copies_into_music(writable_ipod_with_mp3):
+    mp, mp3 = writable_ipod_with_mp3
+    db = Database(mp)
+    track = db.add_track(mp3, title="Вдома")
+    assert os.path.isfile(ipod_path_to_os(track.ipod_path, mp))

@@ -93,3 +93,33 @@ def test_hash_info_of_another_device_ignored(tmp_path):
     other.write_bytes(_read("HashInfo"))
     assert read_hash_info(str(other), "0x000A27FFFFFFFFFF") is None
     assert read_hash_info(str(tmp_path / "missing"), GUID) is None
+
+
+def _device_dir(nano):
+    d = nano / "iPod_Control" / "Device"
+    return {p.name: p.read_bytes() for p in d.iterdir()}
+
+
+def test_check_and_dry_run_repair_do_not_write_hash_info(nano):
+    (nano / "iPod_Control" / "Device" / "HashInfo").unlink()
+    before = _device_dir(nano)
+    db = Database(str(nano), recover=False)
+    report = db.check()
+    assert not ({"checksum_mismatch", "checksum_unknown"} & report.kinds()), report.kinds()
+    db.repair(report, dry_run=True)
+    assert _device_dir(nano) == before  # still no HashInfo
+
+    # a broken signature is still found without HashInfo
+    path = nano / "iPod_Control" / "iTunes" / "iTunesDB"
+    data = bytearray(path.read_bytes())
+    data[0x72 + 30] ^= 0xFF  # inside the signature, after the IV and random part
+    path.write_bytes(bytes(data))
+    report = Database(str(nano), recover=False).check()
+    assert "checksum_mismatch" in report.kinds()
+    assert _device_dir(nano) == before
+
+    # a real save still caches it
+    db = Database(str(nano))
+    db.tracks[0].title = "Edited"
+    db.save()
+    assert (nano / "iPod_Control" / "Device" / "HashInfo").read_bytes() == _read("HashInfo")

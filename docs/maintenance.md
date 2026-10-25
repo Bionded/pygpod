@@ -9,6 +9,11 @@
 Open the database with `recover=False` (and `apply_play_counts=False`) for a check that changes
 nothing at all.
 
+When another program saved the database after it was loaded, `check()` reports
+`database_changed` (and no orphan files: they may be that program's new tracks) and `repair()`
+raises `ConflictError` without deleting or saving anything; `pygpod doctor --fix` then exits
+with code 1. Reopen the database and check again.
+
 ```python
 import pygpod
 
@@ -22,6 +27,8 @@ print(report.summary(), db.repair(report, dry_run=True))
 | kind | severity | found | `repair()` |
 |---|---|---|---|
 | `interrupted_commit` | error | a save was interrupted | completes it |
+| `database_changed` | error | another writer saved the database after it was loaded | - (`ConflictError`: reopen, check again) |
+| `database_damaged` | error | the iTunesDB is damaged, only the part before it was read (`partial=True`) | - (restore a backup) |
 | `orphan_file` | warning | a media file no track references | deletes it, only with `delete_orphans` |
 | `missing_file` | error | a track's file is missing | removes the track |
 | `empty_file` | error | a track's file is empty | removes the track |
@@ -31,7 +38,7 @@ print(report.summary(), db.repair(report, dry_run=True))
 | `duplicate_path` | error | several tracks share one file | removes the later tracks, keeps the file |
 | `dangling_playlist_item` | error | a playlist item without its track | removes the item |
 | `not_in_master` | error | a track missing from the master playlist | adds it |
-| `artwork_db_unreadable` | error | the ArtworkDB cannot be parsed | - (the artwork checks are skipped) |
+| `artwork_db_unreadable` | error | the ArtworkDB cannot be parsed | - (the artwork checks are skipped; `Database.reset_artwork()` starts an empty one) |
 | `artwork_missing` | warning | a track points at a cover that does not exist | clears the reference |
 | `artwork_orphan` | warning | a cover no track uses | removes it |
 | `artwork_out_of_range` | warning | a cover points outside its .ithmb file | removes it, clears the reference |
@@ -47,6 +54,7 @@ print(report.summary(), db.repair(report, dry_run=True))
 | `model_unidentified` | warning | a signed database, but SysInfo names no known model | - (create SysInfo) |
 | `low_space` | warning | little free space left | - |
 | `temp_file` | warning | a leftover temporary file of pygpod | deletes it |
+| `interrupted_restore` | warning | a file kept by a restore that did not finish | - (run the restore again) |
 | `stale_lock` | warning | a write lock of a writer that is gone | deletes it |
 | `write_in_progress` | info | another writer holds the lock right now | - |
 
@@ -59,9 +67,17 @@ thumbnails in `<mount>/Photos` (full-resolution photos only with `include_media`
 standard library, writes nothing to the iPod and works on a read-only mount.
 
 `restore()` verifies the whole archive before writing anything, checks free space, writes files
-under temporary names and renames them (the iTunesDB last). A backup of another iPod (another
+under temporary names and renames them (the iTunesDB last). Music files already as archived
+are not rewritten; each one it replaces is kept as `<name>.pygpod-orig` until the database is
+committed, so a failed restore puts the old files back. After an interrupted restore (power
+loss) run it again: it completes and removes the kept files. A backup of another iPod (another
 FirewireGuid) is refused unless `force=True`, which keeps this iPod's SysInfo and re-signs the
-database for it. `dry_run=True` only plans.
+database for it. On an iPod signed with hash72 (nano 5G and later) the signing parameters come
+from its `Device/HashInfo` or, without it, from its current iTunes-signed database; the restore
+creates HashInfo from them together with the re-signed database, and refuses before writing
+anything when neither exists. `dry_run=True` only plans. Every destination must lie inside the mount point:
+a symbolic link on the target (possible on a directory, not on the iPod's FAT) that leads outside
+makes `restore()` refuse with `BackupError` before anything is written.
 
 ```python
 info = pygpod.backup(mountpoint, f"{workdir}/ipod.tar.gz",
@@ -103,16 +119,26 @@ Restore a backup archive onto the iPod at ``mountpoint``.
 The whole archive is verified first (manifest, sizes, SHA-1); a corrupted archive raises
 before anything is written. The target is the same iPod or a freshly initialised one
 (``init_ipod``); an iPod with another FirewireGuid is refused unless ``force=True``, which
-keeps the target's ``Device`` files and re-signs the database for it. Files not in the
+keeps the target's ``Device`` files and re-signs the database for it (a hash72 iPod's
+signing parameters come from its HashInfo or its current iTunes-signed database, which is
+replaced: HashInfo is created with the database; without either the restore is refused
+before anything is written). Files not in the
 archive are left alone, except play count and On-The-Go files (their entries are track
 positions of the database being replaced): those are moved to ``<name>.pre-restore``.
 The writer lock is held while files are replaced; the database files are committed
-together through the same journal as Database.save(). A target with an interrupted
-save is refused. ``include_media=False`` restores the database and artwork only.
+together through the same journal as Database.save(). Media files already as archived
+(same size and SHA-1) are not rewritten; every media file the restore replaces is kept
+as ``<name>.pygpod-orig`` until the database is committed, so a restore that fails puts
+the old files back (the iPod stays as before). If the restore is interrupted (power
+loss), run it again: it completes and removes the kept files. A target with an
+interrupted save is refused. ``include_media=False`` restores the database and artwork only.
 ``dry_run=True`` verifies and plans but writes nothing.
 
 Raises:
-    BackupError: corrupted/unsupported archive, other iPod without force, not enough space.
+    BackupError: corrupted/unsupported archive, other iPod without force, not enough space,
+        a target whose database signature cannot be computed (force), a destination
+        outside the mount point (a symbolic link in place of a folder or
+        file of the target; checked for every file before anything is written).
 ```
 
 ### `pygpod.BackupInfo`

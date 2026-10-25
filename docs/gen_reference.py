@@ -92,6 +92,7 @@ PAGES = {
         pygpod.TrackError,
         pygpod.PlaylistError,
         pygpod.ArtworkError,
+        pygpod.ArtworkDBError,
         pygpod.DependencyError,
         pygpod.UnsupportedFormatError,
         pygpod.UnsafePathError,

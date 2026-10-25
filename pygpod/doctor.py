@@ -8,7 +8,9 @@ playlist, broken artwork references, photo thumbnails in a size the iPod does no
 (written for another format table, e.g. by older pygpod versions: re-add those photos), more
 than one master photo album, photo album members without a photo, a checksum that does not
 match the database, too little free space for the next save, and pygpod's leftover temporary
-files and stale write lock.
+files and stale write lock. When another writer saved the iTunesDB after the database was loaded,
+check() reports that (and no orphan files: they may be the other writer's new tracks) and
+repair() refuses with ConflictError: reopen the database and check again.
 
 repair() fixes what can be fixed in the database and saves it once; orphan media files are only
 deleted with ``delete_orphans=True``. Nothing outside ``iPod_Control`` is ever touched. Open the
@@ -33,6 +35,8 @@ ERROR, WARNING, INFO = "error", "warning", "info"
 # kind -> (severity, fixable)
 KINDS = {
     "interrupted_commit": (ERROR, True),  # completed (rolled forward), then reopen
+    "database_changed": (ERROR, False),  # another writer saved since it was loaded: reopen
+    "database_damaged": (ERROR, False),  # partly readable (partial=True): restore a backup
     "orphan_file": (WARNING, True),  # deleted only with delete_orphans
     "missing_file": (ERROR, True),  # track removed
     "empty_file": (ERROR, True),  # track removed
@@ -58,11 +62,13 @@ KINDS = {
     "model_unidentified": (WARNING, False),  # signed DB, but SysInfo names no known model
     "low_space": (WARNING, False),
     "temp_file": (WARNING, True),  # deleted
+    "interrupted_restore": (WARNING, False),  # run the restore again (it completes)
     "stale_lock": (WARNING, True),  # deleted
     "write_in_progress": (INFO, False),  # a live writer holds the lock
 }
 
 _TEMP_SUFFIXES = (".pygpod-new", ".pygpod-restore")
+_RESTORE_KEPT_SUFFIX = ".pygpod-orig"  # a file an unfinished restore replaced
 _TEMP_NAMES = ("pygpod.journal.tmp",)
 
 
@@ -174,6 +180,26 @@ def check(db: "Database") -> CheckReport:
             )
         )
 
+    for damage in db.damage:
+        issues.append(
+            _issue(
+                "database_damaged",
+                "iPod_Control/iTunes/iTunesDB",
+                f"{damage}; only the part before it was read: restore a backup "
+                "(saving keeps only the readable part)",
+            )
+        )
+
+    changed = _database_changed(db)
+    if changed:
+        issues.append(
+            _issue(
+                "database_changed",
+                _rel(mp, changed),
+                "another writer saved the database after it was loaded: reopen it and check again",
+            )
+        )
+
     # --- tracks and their files ---
     referenced: Dict[str, int] = {}
     for t in db.tracks:
@@ -260,7 +286,16 @@ def check(db: "Database") -> CheckReport:
                 issues.append(
                     _issue("temp_file", _rel(mp, path), "leftover temporary file", path=path)
                 )
-            elif music and os.path.commonpath([music, path]) == music:
+            elif name.endswith(_RESTORE_KEPT_SUFFIX):
+                issues.append(
+                    _issue(
+                        "interrupted_restore",
+                        _rel(mp, path),
+                        "kept by a restore that did not finish: run the restore again",
+                        path=path,
+                    )
+                )
+            elif not changed and music and os.path.commonpath([music, path]) == music:
                 key = os.path.normcase(os.path.realpath(path)).lower()
                 if key not in referenced:
                     issues.append(
@@ -334,7 +369,35 @@ def check(db: "Database") -> CheckReport:
             )
     except Exception:  # noqa: BLE001 - no disk information: nothing to report
         logger.debug("free space check failed", exc_info=True)
+    if db.damage:
+        # repair() refuses a damaged database (saving would keep only the readable part), and
+        # issues judged from the partial track/playlist lists may be caused by the damage
+        issues = [_from_damaged(i) for i in issues]
     return CheckReport(issues)
+
+
+_FROM_PARTIAL_LISTS = ("orphan_file", "dangling_playlist_item", "not_in_master")
+
+
+def _from_damaged(issue: Issue) -> Issue:
+    message = issue.message
+    if issue.kind in _FROM_PARTIAL_LISTS:
+        message += " (may follow from the damage: part of the database was not read)"
+    return issue._replace(message=message, fixable=False)
+
+
+def _database_changed(db: "Database") -> Optional[str]:
+    """The iTunesDB path when it differs on disk from the one ``db`` loaded or last saved."""
+    from .exceptions import ConflictError
+
+    try:
+        db._check_not_modified()
+    except ConflictError:
+        dev = db.device
+        if dev is not None:
+            return str(dev.itunesdb_path())
+        return os.path.join(_ipod_control(db.mountpoint), "iTunes", "iTunesDB")
+    return None
 
 
 def _check_artwork(db: "Database", ctl: str) -> List[Issue]:
@@ -354,7 +417,8 @@ def _check_artwork(db: "Database", ctl: str) -> List[Issue]:
                 _issue(
                     "artwork_db_unreadable",
                     _rel(db.mountpoint, adb),
-                    f"ArtworkDB could not be read ({e}); artwork references not checked",
+                    f"ArtworkDB could not be read ({e}); artwork references not checked "
+                    "(Database.reset_artwork() starts an empty one)",
                 )
             ]
         for mhsd in root.children if root else ():
@@ -553,7 +617,7 @@ def _check_checksum(db: "Database") -> List[Issue]:
             _issue("checksum_unknown", subject, "no FirewireGuid: checksum not verifiable")
         ]
     try:
-        params = db._hash72_params(guid) if hash_type == "HASH72" else None
+        params = db._hash72_params(guid, persist=False) if hash_type == "HASH72" else None
         expected = update_checksums(data, guid, hash_type, hash72_params=params)
     except Exception as e:  # noqa: BLE001 - scheme not computable here
         return issues + [_issue("checksum_unknown", subject, f"checksum not verifiable: {e}")]
@@ -574,24 +638,37 @@ def repair(
 
     Orphan media files are only deleted with ``delete_orphans=True`` (otherwise listed as
     not done). ``dry_run=True`` returns the actions without changing anything.
+
+    Raises:
+        ConflictError: another writer holds the lock, or saved the iTunesDB after ``db`` was
+            loaded (its changes would be overwritten, its new files taken for orphans) -
+            nothing is changed: reopen the database and check again.
     """
-    from .db.constants import MHIP_MAGIC
+    from .exceptions import ConflictError
 
     if report is None:
         report = check(db)
+    if db.damage:  # a repair would save only the readable part
+        return [
+            RepairAction(i.kind, i.subject, "not repaired: restore a backup", False)
+            for i in report.by_kind("database_damaged")
+        ]
     if "write_in_progress" in report.kinds():
-        from .exceptions import ConflictError
-
         raise ConflictError(
             "another writer holds the database lock: repair after it has finished "
             "(its staging files must not be touched)"
         )
+    if "database_changed" in report.kinds() or (
+        "interrupted_commit" not in report.kinds() and _database_changed(db)
+    ):
+        raise ConflictError(_CHANGED)
     actions: List[RepairAction] = []
     ctl = os.path.realpath(_ipod_control(db.mountpoint)) if db.mountpoint else ""
     save = False
     remove_tracks: Dict[int, None] = {}
     dangling: Set[int] = set()
     leftovers: List[str] = []
+    unlink: List[str] = []
     stale = False
     photos = False
 
@@ -604,10 +681,12 @@ def repair(
     if "interrupted_commit" in report.kinds():
         # complete the interrupted save first; everything else needs a fresh look afterwards
         from .db.transaction import recover
+        from .db.writelock import writer_lock
 
         issue = report.by_kind("interrupted_commit")[0]
         if not dry_run:
-            recover(db.mountpoint)
+            with writer_lock(db._itunes_dir()):  # the lock save() takes
+                recover(db.mountpoint)
         act(issue, "interrupted save completed: reopen the database and repair again")
         return actions
 
@@ -619,8 +698,7 @@ def repair(
             if not delete_orphans:
                 act(issue, "kept (use delete_orphans to delete it)", done=False)
             elif inside(issue.path):
-                if not dry_run:
-                    os.unlink(issue.path)
+                unlink.append(issue.path)  # deleted below, under the writer lock
                 act(issue, "deleted")
         elif k == "temp_file":
             if inside(issue.path):
@@ -633,8 +711,7 @@ def repair(
             if issue.track_id not in remove_tracks:
                 remove_tracks[issue.track_id] = None
                 if k == "empty_file" and inside(issue.path):  # nothing to keep in it
-                    if not dry_run:
-                        os.unlink(issue.path)
+                    unlink.append(issue.path)
                     act(issue, "track removed from the database, empty file deleted")
                 else:
                     act(issue, "track removed from the database")
@@ -709,14 +786,30 @@ def repair(
         PhotoDB(
             db.mountpoint
         ).save()  # loading merges/completes master albums, drops dangling members
-    if leftovers or stale:
-        # under the lock: no writer can be between staging and committing these files
-        from .db.writelock import writer_lock
+    if not (unlink or leftovers or stale or remove_tracks or dangling or save):
+        return actions
+    # under the lock: no writer can be between staging and committing the leftovers, and none
+    # can save between the check that the database is still the one checked and the deletions
+    with db._writing(check=False):
+        if _database_changed(db):
+            raise ConflictError(_CHANGED)
+        for path in unlink + leftovers:
+            if os.path.isfile(path):
+                os.unlink(path)
+        _apply(db, remove_tracks, dangling, save)
+    return actions
 
-        with writer_lock(os.path.join(ctl, "iTunes")):
-            for path in leftovers:
-                if os.path.isfile(path):
-                    os.unlink(path)
+
+_CHANGED = (
+    "the database on the iPod changed since it was checked (another writer saved): "
+    "nothing repaired - reopen it and run the check again"
+)
+
+
+def _apply(db: "Database", remove_tracks: Dict[int, None], dangling: Set[int], save: bool) -> None:
+    """The in-database part of repair(); runs under the writer lock, saves at the end."""
+    from .db.constants import MHIP_MAGIC
+
     if remove_tracks:
         tracks = [db.get_track(tid) for tid in remove_tracks]
         db.remove_tracks([t for t in tracks if t is not None], delete_files=False)
@@ -738,5 +831,4 @@ def repair(
         db._modified = True
         save = True
     if save:
-        db.save(force=True)
-    return actions
+        db._save_locked(refresh_smart_playlists=True)

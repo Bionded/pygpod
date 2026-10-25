@@ -78,15 +78,16 @@ def test_hole_reused_after_commit_not_before(art, tmp_path):
     freed = _offsets(mgr, ids[3])
     mgr.remove_artwork(ids[3])
     same_session = mgr.add_artwork_data(dbid=50, art_data=_png(tmp_path, 50), save=False)
-    # the on-disk ArtworkDB still references the freed slots: the new image must not overwrite them
-    assert set(_offsets(mgr, same_session).values()).isdisjoint(freed.values())
     mgr.save()
+    # the on-disk ArtworkDB still referenced the freed slots until this commit: the new image
+    # must not have overwritten them
+    assert set(_offsets(mgr, same_session).values()).isdisjoint(freed.values())
     sizes = _sizes(root)
 
     mgr = _mgr(root)
     new_id = mgr.add_artwork_data(dbid=51, art_data=_png(tmp_path, 51), save=False)
-    assert _offsets(mgr, new_id) == freed  # reused the hole in every format
     mgr.save()
+    assert _offsets(mgr, new_id) == freed  # reused the hole in every format
     assert _sizes(root) == sizes
     again = _mgr(root)
     assert _thumbs(again, new_id) and all(_thumbs(again, i) for i in ids if i != ids[3])
