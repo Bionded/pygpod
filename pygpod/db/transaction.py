@@ -246,7 +246,6 @@ def _child_dir(parent: str, name: str) -> Optional[str]:
     return None
 
 
-
 def _staging_dirs(mountpoint: str) -> List[str]:
     """The existing STAGING_DIRS as absolute paths, matched case-insensitively."""
     out = []
