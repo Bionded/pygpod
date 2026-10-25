@@ -12,7 +12,7 @@ import random
 import shutil
 import stat
 import struct
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Set
 
 from ..db.constants import (
     DEFAULT_MHBD_HEADER_LEN,
@@ -56,6 +56,12 @@ from ..db.constants import (
     MHOD_ID_PLAYLIST,
     MHOD_ID_PODCASTRSS,
     MHOD_ID_PODCASTURL,
+    MHOD_ID_SORT_ALBUM,
+    MHOD_ID_SORT_ALBUMARTIST,
+    MHOD_ID_SORT_ARTIST,
+    MHOD_ID_SORT_COMPOSER,
+    MHOD_ID_SORT_TITLE,
+    MHOD_ID_SORT_TVSHOW,
     MHOD_ID_SUBTITLE,
     MHOD_ID_TITLE,
     MHOD_ID_TVEPISODE,
@@ -83,7 +89,8 @@ from ..db.playcounts import (
     sha256_hex,
     write_commit_marker,
 )
-from ..db.transaction import Transaction
+from ..db.sortindex import SortEntry, build_indexes, mhod52_body, mhod53_body
+from ..db.transaction import Transaction, interrupted_commit
 from ..db.transaction import recover as recover_interrupted_commit
 from ..db.writelock import writer_lock
 from ..db.writer import make_string_mhod, write_itunesdb
@@ -101,9 +108,13 @@ from ..exceptions import (
     TrackError,
     UnsupportedFormatError,
 )
+from ..gapless import GAPLESS_FIELDS, apply_gapless_fields
 from ..hash.checksum import update_checksums
 from ..tags import extract_artwork, filetype_marker, read_tags, validate_media
-from ..utils.compat import put8int, put16lint, put32lint, put64lint, put_float
+from ..utils.compat import get64lint, put8int, put16lint, put32lint, put64lint, put_float
+
+if TYPE_CHECKING:  # pragma: no cover
+    from ..doctor import CheckReport, RepairAction
 from ..utils.datetime import now_mac
 from .config import DatabaseConfig
 from .playlist import Playlist
@@ -134,6 +145,10 @@ class Database:
     open; with ``False`` they are only read, see pending_play_counts(),
     merge_play_counts() and clear_play_counts(). The file is deleted only after
     the next successful save(), so a session that does not save loses nothing.
+
+    Opening completes or discards an interrupted save (``recover=True``, default).
+    ``recover=False`` opens read-only-style without touching any file (used by check());
+    save() then refuses while the journal of an interrupted save is still there.
     """
 
     def __init__(
@@ -141,6 +156,7 @@ class Database:
         mountpoint: Optional[str] = None,
         config: Optional[DatabaseConfig] = None,
         apply_play_counts: bool = True,
+        recover: bool = True,
     ) -> None:
         self._mountpoint = mountpoint
         self._config = config or DatabaseConfig()
@@ -161,6 +177,8 @@ class Database:
         self._otg_resolved: Dict[str, List[Track]] = {}
         self._otg_skipped: List[OTGSkippedEntry] = []
         self._ids: Optional[List[Any]] = None
+        self._recover = recover
+        self._tz_shift = self._timezone_shift(mountpoint)
 
         if mountpoint:
             logger.info("Opening database at %s", mountpoint)
@@ -193,6 +211,8 @@ class Database:
         db._otg_resolved = {}
         db._otg_skipped = []
         db._ids = None
+        db._recover = True
+        db._tz_shift = db._timezone_shift(None)
 
         with open(path, "rb") as f:
             data = f.read()
@@ -202,6 +222,26 @@ class Database:
         db._build_model()
         return db
 
+    def _timezone_shift(self, mountpoint: Optional[str]) -> int:
+        mode = self._config.timestamps
+        if mode == "utc":
+            return 0
+        if mode != "local":
+            raise ValueError(f"DatabaseConfig.timestamps must be 'local' or 'utc': {mode!r}")
+        from ..utils.timezone import device_timezone_shift
+
+        return device_timezone_shift(mountpoint)
+
+    @property
+    def timezone_shift(self) -> int:
+        """The UTC offset (seconds east) the iPod's timestamps are read and written in.
+
+        With ``DatabaseConfig.timestamps='local'`` (default) the timezone of the iPod's
+        ``Device/Preferences``, else the host's UTC offset when the database was opened, as
+        libgpod does; 0 with ``timestamps='utc'``.
+        """
+        return self._tz_shift
+
     def _load_from_mountpoint(self, mountpoint: str, apply_play_counts: bool = True) -> None:
         """Load database from iPod mount point."""
         if not validate_mountpoint(mountpoint):
@@ -209,7 +249,8 @@ class Database:
                 f"Not a valid iPod mount point: {mountpoint}\n"
                 f"Expected to find iPod_Control/iTunes/ directory."
             )
-        recover_interrupted_commit(mountpoint)
+        if self._recover:
+            recover_interrupted_commit(mountpoint)
 
         self._device = Device.from_mountpoint(mountpoint)
         db_path = find_itunesdb(mountpoint)
@@ -261,13 +302,14 @@ class Database:
             ):
                 logger.info("Play counts in %s were already merged; finishing cleanup", source.name)
                 source = None
-                if remove_consumed_files(
+                if self._recover and remove_consumed_files(
                     itunes_dir, marker["file"], marker["file_sha256"], marker["others"]
                 ):
                     remove_file(os.path.join(itunes_dir, PLAY_COUNTS_COMMIT_FILE))
-            else:
+            elif self._recover:
                 # Either the save never committed (old iTunesDB still in place) or
                 # the play count file was rewritten since: the counts are not applied yet.
+                # (recover=False: an interrupted save may still commit - leave the marker.)
                 remove_file(os.path.join(itunes_dir, PLAY_COUNTS_COMMIT_FILE))
 
         if source is None:
@@ -371,6 +413,56 @@ class Database:
             self._modified = True
         return created
 
+    def _otg_before_save(self) -> list:
+        """Apply DatabaseConfig.otg_on_save to the pending OTG files: import or clear them,
+        or ("keep") return (path, new bytes, file) for each file whose entries must follow
+        the tracks to their new positions in the database being written."""
+        mode = self._config.otg_on_save
+        if mode not in ("keep", "import", "clear"):
+            raise ValueError(f"DatabaseConfig.otg_on_save must be keep/import/clear: {mode!r}")
+        if not self._otg_files or not self._mountpoint:
+            return []
+        if mode == "import":
+            self.import_otg_playlists()
+            return []
+        if mode == "clear":
+            self.clear_otg_playlists()
+            return []
+        from ..db.playcounts import remap_otg_data
+
+        now = {id(t): i for i, t in enumerate(self._tracks)}
+        mapping = {i: now.get(id(t)) for i, t in enumerate(self._otg_tracks)}
+        out = []
+        for f in self._otg_files:
+            if all(mapping.get(i) == i for i in f.indices):
+                continue  # every entry still points at its track
+            path = os.path.join(self._itunes_dir(), f.name)
+            try:
+                with open(path, "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                continue
+            if sha256_hex(data) != f.sha256:  # changed on the iPod since we read it
+                continue
+            out.append((path, remap_otg_data(data, mapping), f))
+        return out
+
+    def _otg_after_save(self, rewrites: list) -> None:
+        """After a save in "keep" mode: OTG entries now refer to the saved track order."""
+        from ..db.playcounts import OTGFile, parse_otg_playlists
+
+        new = {f.name: data for _, data, f in rewrites}
+        files = []
+        for f in self._otg_files:
+            if f.name in new:
+                lists = parse_otg_playlists(new[f.name])
+                f = OTGFile(f.name, sha256_hex(new[f.name]), lists[0] if lists else [])
+            files.append(f)
+        self._otg_files = files
+        self._otg_tracks = list(self._tracks)
+        self._otg_resolved = {}
+        self._otg_skipped = []
+
     def clear_otg_playlists(self) -> None:
         """Drop the On-The-Go playlists without importing them (deleted by the next save())."""
         self._otg_consume += self._otg_files
@@ -460,6 +552,7 @@ class Database:
                 mhlt = mhsd.children[0]
                 for mhit_rec in mhlt.children:
                     track = Track.from_record(mhit_rec)
+                    track._tz_shift = self._tz_shift
                     track._on_change = self._mark_modified
                     self._tracks.append(track)
                     self._track_lookup[track.track_id] = track
@@ -473,6 +566,7 @@ class Database:
                     pl = Playlist.from_record(mhyp_rec, self._track_lookup)
                     pl._on_change = self._mark_modified
                     self._playlists.append(pl)
+        self._remember_derived_inputs()
 
     # ---- Public Properties ----
 
@@ -540,10 +634,19 @@ class Database:
         "remember_position",
         "skip_when_shuffling",
         "mark_unplayed",
+        "bpm",
+        "explicit_flag",
+        "time_released",
     )
 
     def add_track(
-        self, filepath: str, copy: bool = True, convert: bool = False, **kwargs: Any
+        self,
+        filepath: str,
+        copy: bool = True,
+        convert: bool = False,
+        *,
+        video_size: str = "small",
+        **kwargs: Any,
     ) -> Track:
         """Add a track to the iPod.
 
@@ -560,14 +663,40 @@ class Database:
                 > 48 kHz, > 2 channels ...) with ffmpeg instead of refusing it:
                 lossless sources become Apple Lossless where the iPod plays it,
                 everything else AAC (see pygpod.convert). Tags and artwork come
-                from the original file. Needs copy=True.
+                from the original file. Needs copy=True. Video (on iPods that play
+                it) that does not fit the iPod's H.264 profile (checked with
+                ffprobe) becomes an .m4v with H.264 Baseline + AAC; video that fits
+                is copied unchanged.
+            video_size: Target of video conversion: "small" (inside 320x240,
+                plays on every video iPod, default) or "large" (inside 640x480
+                where the model plays it: 5.5G, nano 3G-5G, Classic).
             **kwargs: Metadata overrides: title, artist, album, albumartist
                 (alias album_artist), genre, composer, comment, grouping, year,
                 track_number, total_tracks, cd_number, total_cds, compilation,
                 media_type, category, description, podcast_url, podcast_rss,
-                rating (0-100), play_count, skip_count, bookmark_time (ms),
+                rating (0-100), bpm, explicit_flag (1 explicit, 2 clean),
+                time_released (datetime), sort_title, sort_artist, sort_album,
+                sort_albumartist, sort_composer, sort_tvshow, keywords,
+                play_count, skip_count, bookmark_time (ms),
                 time_played (datetime), remember_position, skip_when_shuffling,
-                mark_unplayed, cover_art (image path or bytes).
+                mark_unplayed, soundcheck (MHIT value; default from the file's
+                iTunNORM / ReplayGain tags, see tags.read_soundcheck; 'analyze'
+                measures the audio with ffmpeg (the converted file with convert=True),
+                'auto' measures only files without gain tags), pregap,
+                postgap, sample_count, gapless_data, gapless_track_flag,
+                gapless_album_flag (default from the LAME tag / iTunSMPB, see
+                pygpod.gapless); gapless='estimate' (or 'auto') estimates them for
+                MP3s without a LAME/Info tag and AAC without iTunSMPB or edit list
+                (experimental, see pygpod.gapless.estimate_gapless), gapless={...}
+                sets them,
+                chapters (list of (start_ms, title) tuples or a ChapterData;
+                default from the file: MP4 chapter track / Nero chpl, ID3 CHAP,
+                see pygpod.chapters.read_chapters; [] = no chapters),
+                cover_art (image path or bytes); for videos also
+                tvshow, tvepisode, tvnetwork, season_number, episode_number.
+                A video file (an MP4 with a video track) added without
+                media_type becomes MEDIATYPE_VIDEO, or MUSICVIDEO/TVSHOW from its
+                iTunes media kind atom; video tracks get movie_flag set.
 
         Returns:
             The new Track object.
@@ -581,11 +710,28 @@ class Database:
         if not self._mountpoint:
             raise TrackError("Cannot add tracks without a mount point")
 
+        soundcheck_mode = kwargs.get("soundcheck")
+        if isinstance(soundcheck_mode, str):
+            if soundcheck_mode not in ("auto", "analyze"):
+                raise TrackError(
+                    f"soundcheck must be an int, 'auto' or 'analyze', not {soundcheck_mode!r}"
+                )
+            if soundcheck_mode == "analyze":
+                from ..convert import find_ffmpeg
+
+                find_ffmpeg()  # UnsupportedFormatError before anything is copied
+        gapless = kwargs.get("gapless")
+        if isinstance(gapless, str) and gapless not in ("auto", "estimate"):
+            raise TrackError(f"gapless must be a dict, 'auto' or 'estimate', not {gapless!r}")
+        if isinstance(gapless, dict) and not set(gapless) <= set(GAPLESS_FIELDS):
+            unknown = sorted(set(gapless) - set(GAPLESS_FIELDS))
+            raise TrackError(f"unknown gapless fields: {unknown}")
+
         # Check the content plays on this iPod before anything is copied or added
         generation = self._device.generation if self._device else None
         converted = None
         try:
-            validate_media(filepath, generation)
+            info = validate_media(filepath, generation)
         except UnsupportedFormatError:
             if not convert:
                 raise
@@ -593,7 +739,13 @@ class Database:
                 raise TrackError(f"convert=True needs copy=True: {filepath}") from None
             from ..convert import convert_for_ipod
 
-            converted = convert_for_ipod(filepath, generation)
+            converted = convert_for_ipod(filepath, generation, video_size=video_size)
+        else:
+            if convert and copy and info.is_video:
+                from ..convert import convert_video_for_ipod, video_needs_conversion
+
+                if video_needs_conversion(filepath, generation):
+                    converted = convert_video_for_ipod(filepath, generation, video_size)
         try:
             return self._add_track_file(filepath, converted, copy, kwargs)
         finally:
@@ -612,11 +764,39 @@ class Database:
         # Read tags (the converted file's audio properties, the original's text tags)
         tags = read_tags(filepath)
         if converted is not None:
-            tags.update({k: v for k, v in read_tags(converted).items() if k in _AUDIO_PROPERTIES})
+            converted_tags = read_tags(converted)
+            tags.update({k: v for k, v in converted_tags.items() if k in _AUDIO_PROPERTIES})
+            if "media_type" in converted_tags:  # e.g. .mkv -> .m4v: a video now
+                tags.setdefault("media_type", converted_tags["media_type"])
+            # gapless sample data belongs to the converted file (its own encoder delay)
+            for key in GAPLESS_FIELDS:
+                if key != "gapless_album_flag":
+                    tags.pop(key, None)
+                    if key in converted_tags:
+                        tags[key] = converted_tags[key]
+        if isinstance(kwargs.get("soundcheck"), str):
+            self._measure_soundcheck(kwargs.pop("soundcheck"), source, tags)
+        gapless = kwargs.pop("gapless", None)
+        if isinstance(gapless, dict):
+            kwargs.update(gapless)  # explicit values, like the separate kwargs
+        elif gapless and "sample_count" not in tags:  # 'auto' / 'estimate': exact data wins
+            from ..gapless import estimate_gapless
+
+            tags.update(estimate_gapless(source) or {})
         if "album_artist" in kwargs:
             kwargs["albumartist"] = kwargs.pop("album_artist")
+        # explicit chapters win (chapters=[] or None: none); else the original file's chapters
+        if "chapters" in kwargs:
+            chapters = kwargs.pop("chapters")
+        else:
+            from ..chapters import read_chapters
+
+            chapters = read_chapters(filepath)
         post = {k: kwargs.pop(k) for k in self._POST_SETTERS if k in kwargs}
         tags.update(kwargs)  # User overrides
+        for key in self._POST_SETTERS:  # rating, bpm ... read from the file
+            if key not in post and key in tags:
+                post[key] = tags[key]
 
         num_dirs = self._device.music_dirs if self._device else 50
         cfg = self._config
@@ -652,6 +832,9 @@ class Database:
 
         # Create Track model object
         track = Track.from_record(mhit)
+        track._tz_shift = self._tz_shift
+        if chapters:
+            track.chapters = chapters
         for key, value in post.items():
             setattr(track, key, value)
         track._on_change = self._mark_modified
@@ -678,6 +861,26 @@ class Database:
         logger.info("Track added: %s", track)
         return track
 
+    @staticmethod
+    def _measure_soundcheck(mode: str, source: str, tags: Dict[str, Any]) -> None:
+        """soundcheck='analyze' (always measure) or 'auto' (measure only without gain tags)."""
+        if mode == "auto" and tags.get("soundcheck"):
+            return
+        from ..exceptions import UnsupportedFormatError
+        from ..tags import analyze_soundcheck
+
+        try:
+            value = analyze_soundcheck(source)
+        except UnsupportedFormatError:
+            if mode == "analyze":
+                raise
+            logger.warning("No ffmpeg for the Sound Check analysis of %s: none set", source)
+            value = None
+        if value is not None:
+            tags["soundcheck"] = value
+        elif mode == "auto":
+            tags["soundcheck"] = 0
+
     def _get_artwork_manager(self):
         """Lazily create and return the ArtworkManager instance."""
         if not hasattr(self, "_artwork_manager") or self._artwork_manager is None:
@@ -688,7 +891,14 @@ class Database:
             if generation is None:
                 generation = IpodGeneration.UNKNOWN
 
-            self._artwork_manager = ArtworkManager(self._mountpoint, generation=generation)
+            # the device's own cover formats (SysInfoExtended AlbumArt) win over the table;
+            # libgpod writes them in reverse order
+            formats = self._device.get_sysinfo_cover_art_formats() if self._device else None
+            self._artwork_manager = ArtworkManager(
+                self._mountpoint,
+                generation=generation,
+                formats=list(reversed(formats)) if formats else None,
+            )
         return self._artwork_manager
 
     def _add_artwork_for_track(
@@ -707,6 +917,9 @@ class Database:
             cover_art: Optional fallback image path if no embedded artwork.
         """
         if not self._mountpoint:
+            return
+        if not self._shows_cover_art():
+            logger.debug("%s shows no cover art: none added", self._device.model)
             return
 
         try:
@@ -743,6 +956,17 @@ class Database:
         mhit.fields["has_artwork"] = 1 if count else 0
         mhit.fields["mhii_link"] = image_id
 
+    def _shows_cover_art(self) -> bool:
+        """False for identified iPods without cover art (1G-4G, mini, shuffles): no
+        ArtworkDB/thumbnails for them, like libgpod. Unidentified models get artwork (the
+        artwork manager falls back to the Classic formats)."""
+        from ..device.models import IpodGeneration
+
+        generation = self._device.generation if self._device else None
+        if generation is None or generation is IpodGeneration.UNKNOWN:
+            return True
+        return bool(self._device.get_cover_art_formats())
+
     def _attach_artwork(self, mhit: Record, dbid: int, art_data: bytes) -> bool:
         image_id = self._get_artwork_manager().add_artwork_data(dbid, art_data, save=False)
         if image_id is None:
@@ -753,7 +977,8 @@ class Database:
     def set_artwork(self, track: Track, image: Optional[bytes]) -> None:
         """Replace a track's cover art with ``image`` (JPEG/PNG bytes); None removes it.
 
-        Written with the next save().
+        Written with the next save(). On iPods without cover art (1G-4G, mini, shuffles)
+        an image is ignored.
 
         Raises:
             ArtworkError: the image could not be converted (e.g. Pillow missing).
@@ -764,7 +989,9 @@ class Database:
         if track.has_artwork and track.mhii_link:
             mgr.remove_artwork(track.mhii_link)
         self._set_artwork_fields(track.record, 0, 0, 0)
-        if image:
+        if image and not self._shows_cover_art():
+            logger.info("%s shows no cover art: image ignored", self._device.model)
+        elif image:
             if not self._attach_artwork(track.record, track.dbid, image):
                 raise ArtworkError("could not create artwork thumbnails (is Pillow installed?)")
         self._modified = True
@@ -861,6 +1088,27 @@ class Database:
     # string MHODs, master playlist entries in MHSD 2 and 3, sort indexes,
     # album list). Used when the database has no tracks to measure yet.
     DEFAULT_BYTES_PER_TRACK = 1450
+
+    def check(self) -> "CheckReport":
+        """Read-only consistency check of the database and its iPod (see pygpod.doctor):
+        orphan/missing/empty/resized media files, duplicate paths, dangling playlist items,
+        tracks missing from the master playlist, broken artwork references, checksum,
+        free space, leftover temporary files and a stale write lock."""
+        from ..doctor import check
+
+        return check(self)
+
+    def repair(
+        self,
+        report: "Optional[CheckReport]" = None,
+        delete_orphans: bool = False,
+        dry_run: bool = False,
+    ) -> "List[RepairAction]":
+        """Fix the issues of ``report`` (default: check()) and save once; orphan media files
+        are deleted only with ``delete_orphans``. ``dry_run`` returns the actions only."""
+        from ..doctor import repair
+
+        return repair(self, report, delete_orphans=delete_orphans, dry_run=dry_run)
 
     def estimate_db_size(self, extra_tracks: int = 0, extra_playlist_entries: int = 0) -> int:
         """Estimated iTunesDB size in bytes after adding tracks.
@@ -1043,6 +1291,51 @@ class Database:
         self._playlists = [p for p in self._playlists if p.playlist_id != pid]
         self._modified = True
 
+    def analyze_soundcheck(
+        self,
+        tracks: Optional[Iterable[Track]] = None,
+        only_missing: bool = True,
+        progress: Optional[Callable[[int, int, Track], None]] = None,
+    ) -> int:
+        """Measure Sound Check for tracks already on the iPod (ffmpeg ``replaygain``).
+
+        Args:
+            tracks: Tracks to analyse (default: all audio tracks of the database).
+            only_missing: Skip tracks that already have a Sound Check value.
+            progress: Called as ``progress(done, total, track)`` after each track.
+
+        Returns:
+            Number of tracks that got a new value (call save() to write them).
+
+        Raises:
+            UnsupportedFormatError: ffmpeg is not installed.
+        """
+        from ..convert import find_ffmpeg
+        from ..exceptions import UnsafePathError
+        from ..tags import analyze_soundcheck
+        from ..utils.encoding import ipod_path_to_os
+
+        if not self._mountpoint:
+            raise TrackError("Cannot analyse tracks without a mount point")
+        find_ffmpeg()
+        if tracks is None:
+            tracks = [t for t in self._tracks if not t.is_video]
+        todo = [t for t in tracks if not (only_missing and t.soundcheck)]
+        changed = 0
+        for done, track in enumerate(todo, 1):
+            try:
+                path = ipod_path_to_os(track.ipod_path, self._mountpoint)
+            except UnsafePathError:
+                logger.warning("Skipping %s: unsafe path %r", track, track.ipod_path)
+                path = None
+            value = analyze_soundcheck(path) if path and os.path.isfile(path) else None
+            if value is not None and value != track.soundcheck:
+                track.soundcheck = value
+                changed += 1
+            if progress is not None:
+                progress(done, len(todo), track)
+        return changed
+
     def add_track_to_playlist(self, playlist: Playlist, track: Track) -> None:
         """Add a track to a playlist."""
         if not playlist.record:
@@ -1117,9 +1410,18 @@ class Database:
         # Ensure MHBD has required fields
         header = bytearray(self._root.raw_header)
         changed = False
-        if len(header) > 0x34 and header[0x30] == 0:
-            put32lint(header, 0x30, 1)
-            changed = True
+        # 0x30: hashing scheme. libgpod writes 0 for models without a signature (5G/5.5G,
+        # nano 1G/2G, shuffles ...); signed and unidentified models keep pygpod's 1.
+        dev = self._device
+        unsigned = dev is not None and dev.checksum_known and not dev.requires_hash
+        if len(header) > 0x34:
+            if unsigned:
+                if header[0x30:0x32] != b"\x00\x00":
+                    put16lint(header, 0x30, 0)
+                    changed = True
+            elif header[0x30] == 0:
+                put32lint(header, 0x30, 1)
+                changed = True
         if len(header) > 0x50:
             pid = struct.unpack_from("<Q", header, 0x48)[0]
             if pid == 0:
@@ -1370,131 +1672,118 @@ class Database:
 
     # ---- Sort Index Generation ----
 
+    def _master_mhyps(self) -> List[Record]:
+        """The master playlist records of MHSD 2 and 3."""
+        found = []
+        for mhsd in self._root.children:
+            if mhsd.fields.get("mhsd_type") in (2, 3) and mhsd.children:
+                for mhyp in mhsd.children[0].children:
+                    if mhyp.fields.get("playlist_type") == 1:
+                        found.append(mhyp)
+        return found
+
+    def _sort_entries(self, mhyp: Record) -> List[SortEntry]:
+        """What the sort indexes of a master playlist are built from, in member order."""
+        entries = []
+        for child in mhyp.children:
+            if child.magic != MHIP_MAGIC or child.fields.get("track_id") is None:
+                continue
+            t = self._track_lookup.get(child.fields["track_id"])
+            if t is None:
+                entries.append(SortEntry("", "", "", "", "", "", "", "", "", 0, 0))
+                continue
+            entries.append(
+                SortEntry(
+                    t.title or "",
+                    t.artist or "",
+                    t.album or "",
+                    t.genre or "",
+                    t.composer or "",
+                    t.sort_title or "",
+                    t.sort_artist or "",
+                    t.sort_album or "",
+                    t.sort_composer or "",
+                    t.track_number or 0,
+                    t.cd_number or 0,
+                )
+            )
+        return entries
+
+    @staticmethod
+    def _has_sort_mhods(mhyp: Record) -> bool:
+        return any(
+            c.magic == MHOD_MAGIC and c.fields.get("mhod_type") == MHOD_ID_LIBPLAYLISTINDEX
+            for c in mhyp.children
+        )
+
+    def _index_inputs(self) -> Optional[tuple]:
+        """Everything the sort indexes depend on, or None when a master playlist with
+        members has none (they must be built)."""
+        inputs = []
+        for mhyp in self._master_mhyps():
+            entries = self._sort_entries(mhyp)
+            if entries and not self._has_sort_mhods(mhyp):
+                return None
+            inputs.append(tuple(entries))
+        return tuple(inputs)
+
+    def _list_inputs(self) -> tuple:
+        """Everything the album and artist lists (and the tracks' links to them) depend on.
+
+        Holds the MHIT records themselves (compared with ``is``): the id() of a removed
+        track's record can be reused by a new track's record."""
+        return tuple((self._album_key(t), t.artist or "", t.record) for t in self._tracks)
+
+    def _remember_derived_inputs(self) -> None:
+        """After load or save: the sort indexes and album/artist lists in the records match
+        the tracks. A save that changes none of their inputs keeps them byte for byte (also
+        when another writer built them differently, e.g. libgpod's locale order)."""
+        if not self._root:
+            return
+        self._saved_index_inputs = self._index_inputs()
+        self._saved_list_inputs = self._list_inputs()
+
     def _rebuild_sort_indexes(self) -> None:
         """Rebuild sort index MHODs (type 52+53) on master playlists.
 
         Generates sorted track index and letter jump table for each sort key
-        (artist, album, genre, composer, title). These are required by iPod
-        firmware for browsing by category.
+        (title, artist, album, genre, composer; see db/sortindex.py). These are
+        required by iPod firmware for browsing by category. Kept as they are when
+        nothing they depend on changed since load or the last save.
         """
-        sort_keys = [
-            (3, "title"),
-            (5, "artist"),
-            (4, "album"),
-            (7, "genre"),
-            (18, "composer"),
-        ]
+        current = self._index_inputs()
+        if current is not None and current == getattr(self, "_saved_index_inputs", None):
+            return
+        for mhyp in self._master_mhyps():
+            mhyp.children = [
+                c
+                for c in mhyp.children
+                if not (
+                    c.magic == MHOD_MAGIC
+                    and c.fields.get("mhod_type")
+                    in (MHOD_ID_LIBPLAYLISTINDEX, MHOD_ID_LIBPLAYLISTJUMPTABLE)
+                )
+            ]
+            entries = self._sort_entries(mhyp)
+            if not entries:
+                continue
 
-        for mhsd in self._root.children:
-            mhsd_type = mhsd.fields.get("mhsd_type")
-            if mhsd_type in (2, 3) and mhsd.children:
-                mhlp = mhsd.children[0]
-                for mhyp in mhlp.children:
-                    if mhyp.fields.get("playlist_type") != 1:
-                        continue
-
-                    # Remove existing sort MHODs
-                    mhyp.children = [
-                        c
-                        for c in mhyp.children
-                        if not (
-                            c.magic == MHOD_MAGIC
-                            and c.fields.get("mhod_type")
-                            in (MHOD_ID_LIBPLAYLISTINDEX, MHOD_ID_LIBPLAYLISTJUMPTABLE)
-                        )
-                    ]
-
-                    # Collect tracks in playlist order
-                    track_ids = []
-                    for child in mhyp.children:
-                        if child.magic == MHIP_MAGIC:
-                            tid = child.fields.get("track_id")
-                            if tid is not None:
-                                track_ids.append(tid)
-
-                    if not track_ids:
-                        continue
-
-                    # Build metadata list
-                    _empty = {"artist": "", "album": "", "genre": "", "composer": "", "title": ""}
-                    tracks_meta = []
-                    for i, tid in enumerate(track_ids):
-                        track = self._track_lookup.get(tid)
-                        if track:
-                            meta = {
-                                "index": i,
-                                "artist": track.artist or "",
-                                "album": track.album or "",
-                                "genre": track.genre or "",
-                                "composer": getattr(track, "composer", "") or "",
-                                "title": track.title or "",
-                            }
-                        else:
-                            meta = {"index": i, **_empty}
-                        tracks_meta.append(meta)
-
-                    # Insert sort MHODs BEFORE the first MHIP
-                    insert_idx = next(
-                        (i for i, c in enumerate(mhyp.children) if c.magic == MHIP_MAGIC),
-                        len(mhyp.children),
-                    )
-
-                    for sort_key_num, field_name in sort_keys:
-                        sort_mhods = self._build_sort_pair(sort_key_num, field_name, tracks_meta)
-                        for mhod in sort_mhods:
-                            mhyp.children.insert(insert_idx, mhod)
-                            insert_idx += 1
-
-    def _build_sort_pair(self, sort_key: int, field_name: str, tracks_meta: list) -> list:
-        """Build a type 52 (sort index) + type 53 (jump table) MHOD pair."""
-
-        def sort_val(meta):
-            val = meta[field_name].upper()
-            if val.startswith("THE "):
-                val = val[4:]
-            return val
-
-        sorted_meta = sorted(tracks_meta, key=sort_val)
-        sorted_indices = [m["index"] for m in sorted_meta]
-
-        # Type 52: sort index
-        body52 = bytearray(48 + len(sorted_indices) * 4)
-        struct.pack_into("<I", body52, 0, sort_key)
-        struct.pack_into("<I", body52, 4, len(sorted_indices))
-        for j, idx in enumerate(sorted_indices):
-            struct.pack_into("<I", body52, 48 + j * 4, idx)
-        mhod52 = self._make_raw_mhod(MHOD_ID_LIBPLAYLISTINDEX, bytes(body52))
-
-        # Type 53: letter jump table
-        groups = []
-        current_letter = None
-        current_start = 0
-        current_count = 0
-        for i, m in enumerate(sorted_meta):
-            val = sort_val(m)
-            letter = ord(val[0]) if val else 0
-            if letter != current_letter:
-                if current_letter is not None:
-                    groups.append((current_letter, current_start, current_count))
-                current_letter = letter
-                current_start = i
-                current_count = 1
-            else:
-                current_count += 1
-        if current_letter is not None:
-            groups.append((current_letter, current_start, current_count))
-
-        body53 = bytearray(16 + len(groups) * 12)
-        struct.pack_into("<I", body53, 0, sort_key)
-        struct.pack_into("<I", body53, 4, len(groups))
-        for j, (letter, start, count) in enumerate(groups):
-            off = 16 + j * 12
-            struct.pack_into("<I", body53, off, letter)
-            struct.pack_into("<I", body53, off + 4, start)
-            struct.pack_into("<I", body53, off + 8, count)
-        mhod53 = self._make_raw_mhod(MHOD_ID_LIBPLAYLISTJUMPTABLE, bytes(body53))
-
-        return [mhod52, mhod53]
+            # Insert sort MHODs BEFORE the first MHIP
+            insert_idx = next(
+                (i for i, c in enumerate(mhyp.children) if c.magic == MHIP_MAGIC),
+                len(mhyp.children),
+            )
+            for sort_type, positions, jumps in build_indexes(entries):
+                for mhod in (
+                    self._make_raw_mhod(
+                        MHOD_ID_LIBPLAYLISTINDEX, mhod52_body(sort_type, positions)
+                    ),
+                    self._make_raw_mhod(
+                        MHOD_ID_LIBPLAYLISTJUMPTABLE, mhod53_body(sort_type, jumps)
+                    ),
+                ):
+                    mhyp.children.insert(insert_idx, mhod)
+                    insert_idx += 1
 
     # ---- Album / Artist List Generation ----
 
@@ -1509,6 +1798,34 @@ class Database:
             return (album, "", True)
         return (album, track.artist or "", False)
 
+    def _derived_list_kept(self, mhsd_type: int) -> bool:
+        """The loaded album (4) / artist (8) list stays as it is: it exists and nothing it
+        depends on changed since load or the last save."""
+        saved = getattr(self, "_saved_list_inputs", None)
+        current = self._list_inputs()
+        if saved is None or len(saved) != len(current):
+            return False
+        if any(a[:2] != b[:2] or a[2] is not b[2] for a, b in zip(current, saved)):
+            return False
+        return any(
+            m.fields.get("mhsd_type") == mhsd_type and m.children for m in self._root.children
+        )
+
+    @staticmethod
+    def _loaded_sql_ids(mhsd: Record, magic: bytes, name_mhod: int, artist_mhod) -> dict:
+        """(name, artist) -> the SQLite id of the album/artist items in a loaded list."""
+        ids = {}
+        for lst in mhsd.children:
+            for item in lst.children:
+                if item.magic != magic or len(item.raw_header) < 0x1C:
+                    continue
+                sql_id = get64lint(item.raw_header, 0x14)
+                if sql_id:
+                    name = item.get_mhod(name_mhod) or ""
+                    artist = (item.get_mhod(artist_mhod) or "") if artist_mhod else ""
+                    ids.setdefault((name, artist), sql_id)
+        return ids
+
     def _rebuild_album_list(self) -> None:
         """Rebuild MHSD type 4 album list from track metadata.
 
@@ -1516,6 +1833,8 @@ class Database:
         201 (album artist) for each album (see _album_key).
         Also updates MHIT offset 0x120 with album_id links.
         """
+        if self._derived_list_kept(4):
+            return
         enc = self._config.string_encoding
 
         albums: Dict[tuple, int] = {}  # album key -> 1-based album_id
@@ -1528,6 +1847,7 @@ class Database:
                 track_album[id(track.record)] = albums[key]
 
         mhsd4 = self._get_or_create_mhsd(4)
+        sql_ids = self._loaded_sql_ids(mhsd4, MHIA_MAGIC, MHOD_ID_ALBUM_ALBUM, MHOD_ID_ALBUM_ARTIST)
 
         # Create MHLA with MHIA children
         mhla = Record(MHLA_MAGIC, DEFAULT_MHLA_HEADER_LEN, 0)
@@ -1543,6 +1863,9 @@ class Database:
             header[0:4] = MHIA_MAGIC
             put32lint(header, 4, ALBUM_MHIA_HEADER_LEN)
             put32lint(header, 0x10, album_id)
+            # 64-bit id of the SQLite databases (libgpod: random per album); kept when loaded
+            put64lint(header, 0x14, sql_ids.get((album, artist), 0))
+            put32lint(header, 0x1C, 2)  # unknown, 2 in libgpod and iTunes
             mhia.raw_header = bytes(header)
             mhia.fields["album_id"] = album_id
 
@@ -1576,6 +1899,8 @@ class Database:
         Creates MHII records with MHOD type 300 (artist name) for each
         unique artist. Also updates MHIT offset 0x160 with artist_id links.
         """
+        if self._derived_list_kept(8):
+            return
         enc = self._config.string_encoding
 
         # Collect unique artists: artist -> artist_id
@@ -1586,6 +1911,7 @@ class Database:
                 artists[artist] = len(artists) + 1  # 1-based IDs
 
         mhsd8 = self._get_or_create_mhsd(8)
+        sql_ids = self._loaded_sql_ids(mhsd8, MHII_MAGIC, MHOD_ID_ALBUM_ARTIST_MHII, None)
 
         # Create MHLI with MHII children
         mhli = Record(MHLI_MAGIC, DEFAULT_MHLI_HEADER_LEN, 0)
@@ -1598,6 +1924,8 @@ class Database:
             header[0:4] = MHII_MAGIC
             put32lint(header, 4, DEFAULT_MHII_HEADER_LEN)
             put32lint(header, 0x10, artist_id)
+            put64lint(header, 0x14, sql_ids.get((artist_name, ""), 0))
+            put32lint(header, 0x1C, 2)  # unknown, 2 in libgpod and iTunes
             mhii.raw_header = bytes(header)
             mhii.fields["artist_id"] = artist_id
 
@@ -1640,6 +1968,7 @@ class Database:
             self._rebuild_album_list()
         if self._config.generate_artist_list:
             self._rebuild_artist_list()
+        self._remember_derived_inputs()
 
         # Update db_version to match device requirements
         if self._device and self._root:
@@ -1673,6 +2002,19 @@ class Database:
         logger.info("Saving database")
         if not self._mountpoint:
             raise DatabaseError("No mount point - use save_to_file() instead")
+        if self._device is not None and self._device.sqlite_db:
+            if not getattr(self, "_sqlite_warned", False):
+                self._sqlite_warned = True
+                logger.warning(
+                    "%s reads its library from the SQLite databases (iTunesCDB, iTunes "
+                    "Library.itlp), which pygpod does not write: new tracks may not show up",
+                    self._device.model,
+                )
+        if not self._recover and interrupted_commit(self._mountpoint):
+            raise DatabaseError(
+                "an interrupted save is not recovered yet: reopen the database with "
+                "recover=True (the default) before saving"
+            )
         with writer_lock(self._itunes_dir()):
             if not force:
                 self._check_not_modified()
@@ -1696,13 +2038,29 @@ class Database:
             raise ConflictError(f"{path} was changed by another writer since it was loaded")
 
     def _save_locked(self, refresh_smart_playlists: bool) -> None:
+        otg_rewrites = self._otg_before_save()
         if refresh_smart_playlists:
             self.refresh_smart_playlists(live_only=True)
 
         data = self._prepare_for_save()
 
         # Update checksums if needed
+        hash_type = None
         if self._device and self._device.requires_hash:
+            hash_type = self._device.checksum_type.name
+        elif self._device and not self._device.checksum_known:
+            # Model not identified (SysInfo missing or incomplete): sign like the database
+            # on the iPod, so a signed iPod (e.g. a Classic) does not get a DB it rejects
+            from ..hash.checksum import detect_checksum_type
+
+            hash_type = detect_checksum_type(self._raw_data or b"")
+            if hash_type:
+                logger.warning(
+                    "iPod model not identified (SysInfo without ModelNumStr); the iTunesDB on "
+                    "it is signed with %s, signing the new one the same way",
+                    hash_type,
+                )
+        if self._device and hash_type:
             guid = self._device.firewire_guid
             if not guid:
                 guid = self._try_resolve_guid()
@@ -1723,9 +2081,16 @@ class Database:
                     "Or install pyusb for automatic detection:\n"
                     "  pip install pygpod[usb]"
                 )
-            hash_type = self._device.checksum_type.name
             params = self._hash72_params(guid) if hash_type == "HASH72" else None
             data = update_checksums(data, guid, hash_type, hash72_params=params)
+        elif self._device and self._device.checksum_known and len(data) >= 0x72 + 46:
+            # Unsigned model: no signature, like libgpod (pygpod <= 0.1.0 left a hash58 on
+            # 5G/nano 1G-2G databases, which would go stale here). Only for identified
+            # models: an unidentified one may be a signed iPod with an incomplete SysInfo.
+            buf = bytearray(data)
+            buf[0x58:0x6C] = bytes(20)  # hash58
+            buf[0x72 : 0x72 + 46] = bytes(46)  # hash72
+            data = bytes(buf)
 
         db_path = (
             self._device.itunesdb_path()
@@ -1750,6 +2115,8 @@ class Database:
                 path = os.path.join(self._itunes_dir(), f.name)
                 if file_sha256(path) == f.sha256:  # rewritten by the iPod since: keep it
                     tx.delete_on_commit(path)
+            for path, new_data, _ in otg_rewrites:
+                tx.stage_bytes(path, new_data)
             tx.commit()
         except BaseException:
             tx.abort()
@@ -1758,6 +2125,8 @@ class Database:
         self._raw_data = data
         self._modified = False
         self._otg_consume = []
+        if otg_rewrites or self._otg_files:
+            self._otg_after_save(otg_rewrites)
         logger.debug("Database saved to %s", db_path)
         if consume:
             self._finish_play_count_cleanup()
@@ -1768,24 +2137,25 @@ class Database:
             f.write(data)
 
     def _shuffle_db(self) -> Optional[bytes]:
-        """The iTunesSD for an iPod shuffle 1G/2G (written with the iTunesDB, like libgpod);
-        None for other iPods.
+        """The iTunesSD for an iPod shuffle (written with the iTunesDB, like libgpod):
+        version 1 for the shuffle 1G/2G, version 2 for the 3G/4G; None for other iPods.
 
         Raises:
-            DeviceError: shuffle 3G/4G (iTunesSD format not supported) - nothing is written.
+            DeviceError: a shuffle of unknown generation - nothing is written.
         """
-        from ..db.itunessd import ITunesSD
+        from ..db.itunessd import ITunesSD, ITunesSDV2
         from ..device.models import IpodGeneration
 
         if not self._device or not self._device.is_shuffle:
             return None
         gen = self._device.generation
-        if gen not in (IpodGeneration.SHUFFLE_1, IpodGeneration.SHUFFLE_2):
-            raise DeviceError(
-                f"{gen.name}: the iPod shuffle 3G/4G iTunesSD format is not supported; "
-                "the shuffle would not see the changes"
-            )
-        return ITunesSD.from_tracks(self._tracks).write()
+        if gen in (IpodGeneration.SHUFFLE_1, IpodGeneration.SHUFFLE_2):
+            return ITunesSD.from_tracks(self._tracks).write()
+        if gen in (IpodGeneration.SHUFFLE_3, IpodGeneration.SHUFFLE_4):
+            return ITunesSDV2.from_database(self._tracks, self._playlists).write()
+        raise DeviceError(
+            f"{gen.name}: unknown iPod shuffle generation; the iTunesSD format is not known"
+        )
 
     def _hash72_params(self, guid: str) -> tuple:
         """The device's hash72 IV and random part: from iPod_Control/Device/HashInfo, else
@@ -1822,23 +2192,26 @@ class Database:
             logger.info("ArtworkDB saved")
 
     def _try_resolve_guid(self) -> Optional[str]:
-        """Try to get FirewireGuid from USB and write SysInfo for future use."""
-        if not self._device:
+        """Try to get FirewireGuid from USB and write SysInfo for future use.
+
+        Only the iPod backing this mountpoint is used: with several iPods connected and no
+        way to tell which one is mounted here, nothing is guessed (save() then raises).
+        """
+        if not self._device or not self._device.mountpoint:
             return None
         try:
-            from ..device.usb import detect_ipod_usb
+            from ..device.usb import detect_ipod_usb_for_mountpoint
 
-            usb_devices = detect_ipod_usb()
-            for usb_dev in usb_devices:
-                if usb_dev.firewire_guid:
-                    # Store in sysinfo for future use
-                    self._device._sysinfo.raw["FirewireGuid"] = usb_dev.firewire_guid
-                    try:
-                        self._device.write_sysinfo()
-                        logger.info("Auto-wrote SysInfo with GUID %s", usb_dev.firewire_guid)
-                    except Exception:
-                        logger.debug("Failed to write SysInfo", exc_info=True)
-                    return usb_dev.firewire_guid
+            usb_dev = detect_ipod_usb_for_mountpoint(self._device.mountpoint)
+            if usb_dev is not None and usb_dev.firewire_guid:
+                # Store in sysinfo for future use
+                self._device._sysinfo.raw["FirewireGuid"] = usb_dev.firewire_guid
+                try:
+                    self._device.write_sysinfo()
+                    logger.info("Auto-wrote SysInfo with GUID %s", usb_dev.firewire_guid)
+                except Exception:
+                    logger.debug("Failed to write SysInfo", exc_info=True)
+                return usb_dev.firewire_guid
         except ImportError:
             logger.debug("pyusb not available for GUID resolution")
         except Exception:
@@ -2006,7 +2379,7 @@ class Database:
         if cfg.set_time_fields_zero:
             now = 0
         else:
-            now = now_mac()
+            now = now_mac(self._tz_shift)
 
         put32lint(header, 0x20, now)  # time_modified
         put32lint(header, 0x24, file_size)
@@ -2020,6 +2393,8 @@ class Database:
         sr = tags.get("samplerate", 44100)
         put32lint(header, 0x3C, (sr << 16) & 0xFFFFFFFF)
 
+        put32lint(header, 0x4C, tags.get("soundcheck", 0))
+        apply_gapless_fields(header, tags)
         put32lint(header, 0x5C, tags.get("cd_number", 0))
         put32lint(header, 0x60, tags.get("total_cds", 0))
         put32lint(header, 0x68, now)  # time_added
@@ -2048,6 +2423,11 @@ class Database:
                 put8int(header, 0xA5, 1)  # skip when shuffling
                 put8int(header, 0xA6, 1)  # remember playback position
                 put8int(header, 0xA7, 1)  # flag4: podcast display format
+
+        # movie_flag (0xB1): set for video files, like iTunes and gtkpod
+        is_video = bool(media_type & _video_types)
+        if header_len > 0xB1:
+            put8int(header, 0xB1, 1 if is_video else 0)
 
         # mark_unplayed at offset 0xB2
         if header_len > 0xB2:
@@ -2104,10 +2484,15 @@ class Database:
         rec.fields["time_added"] = now
         rec.fields["time_modified"] = now
         rec.fields["media_type"] = media_type
+        if header_len > 0xB1:
+            rec.fields["movie_flag"] = 1 if is_video else 0
         rec.fields["play_count"] = 0
         rec.fields["rating"] = 0
         rec.fields["season_number"] = tags.get("season_number", 0)
         rec.fields["episode_number"] = tags.get("episode_number", 0)
+        rec.fields["soundcheck"] = tags.get("soundcheck", 0)
+        for key in GAPLESS_FIELDS:
+            rec.fields[key] = int(tags.get(key, 0))
         rec.fields["cd_number"] = tags.get("cd_number", 0)
         rec.fields["total_cds"] = tags.get("total_cds", 0)
 
@@ -2136,6 +2521,12 @@ class Database:
             ("tvshow", MHOD_ID_TVSHOW),
             ("tvepisode", MHOD_ID_TVEPISODE),
             ("tvnetwork", MHOD_ID_TVNETWORK),
+            ("sort_artist", MHOD_ID_SORT_ARTIST),
+            ("sort_title", MHOD_ID_SORT_TITLE),
+            ("sort_album", MHOD_ID_SORT_ALBUM),
+            ("sort_albumartist", MHOD_ID_SORT_ALBUMARTIST),
+            ("sort_composer", MHOD_ID_SORT_COMPOSER),
+            ("sort_tvshow", MHOD_ID_SORT_TVSHOW),
         ]
         for tag_key, mhod_id in _optional_mhods:
             val = tags.get(tag_key)
@@ -2229,7 +2620,7 @@ class Database:
         put32lint(header, 4, header_len)
 
         put8int(header, 0x14, 1 if is_master else 0)
-        put32lint(header, 0x18, now_mac())
+        put32lint(header, 0x18, now_mac(self._tz_shift))
         put64lint(header, 0x1C, playlist_id)
 
         # Config-driven MHYP fields
@@ -2247,7 +2638,7 @@ class Database:
         rec.fields["playlist_id"] = playlist_id
         rec.fields["num_mhods"] = 0
         rec.fields["num_mhips"] = 0
-        rec.fields["timestamp"] = now_mac()
+        rec.fields["timestamp"] = now_mac(self._tz_shift)
 
         # Add name MHOD
         name_mhod = make_string_mhod(MHOD_ID_TITLE, name, encoding=cfg.string_encoding)

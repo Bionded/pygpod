@@ -31,6 +31,7 @@ class Playlist:
 
     @property
     def record(self) -> Optional[Record]:
+        """The playlist's MHYP record (low-level)."""
         return self._record
 
     @property
@@ -59,6 +60,7 @@ class Playlist:
 
     @property
     def playlist_id(self) -> int:
+        """64-bit playlist id."""
         if self._record:
             return self._record.fields.get("playlist_id", 0)
         return 0
@@ -115,6 +117,7 @@ class Playlist:
 
     @property
     def sort_order(self) -> int:
+        """Sort order code of the playlist (MHYP; 1 = manual)."""
         if self._record:
             return self._record.fields.get("sort_order", 0)
         return 0
@@ -138,6 +141,7 @@ class Playlist:
 
     @property
     def track_count(self) -> int:
+        """Number of items in the playlist."""
         return len(self.track_ids)
 
     def __repr__(self) -> str:

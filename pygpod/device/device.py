@@ -14,9 +14,6 @@ from ..model.sysinfo import SysInfo, read_sysinfo
 from .models import (
     ARTWORK_GENERATIONS,
     GENERATION_NAMES,
-    HASH58_GENERATIONS,
-    HASH72_GENERATIONS,
-    HASHAB_GENERATIONS,
     PODCAST_GENERATIONS,
     SHUFFLE_GENERATIONS,
     VIDEO_GENERATIONS,
@@ -83,7 +80,7 @@ class Device:
         # Fallback: try USB detection
         usb_enriched = False
         if ipod_info is None or ipod_info.model_number == "Unknown":
-            usb_result = cls._try_usb_fallback(sysinfo)
+            usb_result = cls._try_usb_fallback(sysinfo, mountpoint)
             if usb_result is not None:
                 ipod_info, updates = usb_result
                 for key, val in updates.items():
@@ -129,25 +126,32 @@ class Device:
         return dev
 
     @staticmethod
-    def _try_usb_fallback(sysinfo: SysInfo):
+    def _try_usb_fallback(sysinfo: SysInfo, mountpoint: Optional[str] = None):
         """Try USB detection as fallback for device identification.
+
+        Only the iPod backing ``mountpoint`` is used; when it cannot be told apart from
+        other connected iPods, there is no fallback (see detect_ipod_usb_for_mountpoint).
 
         Returns:
             Tuple of (IpodInfo, dict of sysinfo key-value updates) or None.
         """
         try:
-            from .usb import detect_ipod_usb
+            from .usb import detect_ipod_usb, detect_ipod_usb_for_mountpoint
         except ImportError:
             logger.debug("USB detection unavailable (pyusb not installed)")
             return None
 
         try:
-            usb_devices = detect_ipod_usb()
+            if mountpoint:
+                usb_dev = detect_ipod_usb_for_mountpoint(mountpoint)
+                usb_devices = [usb_dev] if usb_dev else []
+            else:
+                usb_devices = detect_ipod_usb()
+                if len(usb_devices) > 1:
+                    logger.debug("%d iPods connected, no USB fallback", len(usb_devices))
+                    return None
         except Exception:
             logger.debug("USB device detection failed", exc_info=True)
-            return None
-
-        if not usb_devices:
             return None
 
         for usb_dev in usb_devices:
@@ -214,18 +218,55 @@ class Device:
 
     @property
     def requires_hash(self) -> bool:
-        """Whether this iPod requires database hashing."""
-        return self.generation in (HASH58_GENERATIONS | HASH72_GENERATIONS | HASHAB_GENERATIONS)
+        """Whether this iPod requires database hashing (``checksum_type`` is not NONE)."""
+        return self.checksum_type is not ChecksumType.NONE
+
+    def _sysinfo_db_version(self) -> Optional[int]:
+        """The SysInfoExtended ``DBVersion`` (or ``DatabaseVersion``) as int, if usable."""
+        ext = self.sysinfo.extended
+        sysinfo_dbver = ext.get("DBVersion")
+        if sysinfo_dbver is None:
+            sysinfo_dbver = ext.get("DatabaseVersion")
+        try:
+            return None if sysinfo_dbver is None else int(sysinfo_dbver)
+        except (TypeError, ValueError):
+            return None
 
     @property
     def checksum_type(self) -> ChecksumType:
         """Determine the checksum type for this device.
 
-        Uses SysInfoExtended db_version if available, falls back to
+        Uses the SysInfoExtended ``DBVersion`` if available (the key real iPods and
+        libgpod use; ``DatabaseVersion`` is still accepted), falls back to the
         generation-based mapping from libgpod.
         """
-        sysinfo_dbver = self.sysinfo.extended.get("DatabaseVersion")
-        return get_checksum_type(self.generation, sysinfo_dbver)
+        return get_checksum_type(self.generation, self._sysinfo_db_version())
+
+    @property
+    def sqlite_db(self) -> bool:
+        """Whether the iPod reads its library from the SQLite databases (``iTunesCDB`` and
+        ``iTunes Library.itlp``) as libgpod decides it: the SysInfoExtended ``SQLiteDB`` key,
+        else the model (nano 5G and newer). pygpod writes only the iTunesDB, so tracks it
+        adds may not show up on such an iPod.
+        """
+        value = self.sysinfo.extended.get("SQLiteDB")
+        if value is not None:
+            return value is True or str(value).strip().lower() in ("1", "true", "yes")
+        if self.sysinfo.extended:
+            return False
+        return self.generation in (IpodGeneration.NANO_5, IpodGeneration.NANO_6)
+
+    @property
+    def checksum_known(self) -> bool:
+        """Whether ``checksum_type`` is known (model identified or SysInfoExtended DBVersion).
+
+        False means the model could not be identified (SysInfo missing or incomplete) and
+        ``checksum_type`` is only a NONE default; ``save()`` then signs like the database on
+        the iPod (hash58/hash72) and ``check()`` reports ``model_unidentified``.
+        """
+        return (
+            self.generation is not IpodGeneration.UNKNOWN or self._sysinfo_db_version() is not None
+        )
 
     @property
     def db_version(self) -> int:
@@ -241,13 +282,37 @@ class Device:
         return self.generation in ARTWORK_GENERATIONS
 
     def get_cover_art_formats(self):
-        """Get cover art format table for this device.
+        """Cover art thumbnail formats for this device (list of ArtworkFormatInfo, or None if
+        unsupported).
 
-        Returns list of ArtworkFormatInfo, or None if unsupported.
+        Like libgpod: the ``AlbumArt`` specifications of the device's SysInfoExtended when it
+        has them (the firmware's own list, e.g. a Classic's 1069 142x142 and 55x55 1061), else
+        the generation's table.
         """
         from .artwork_formats import get_cover_art_formats
 
-        return get_cover_art_formats(self.generation)
+        return self.get_sysinfo_cover_art_formats() or get_cover_art_formats(self.generation)
+
+    def get_sysinfo_cover_art_formats(self):
+        """The cover art formats the device's SysInfoExtended lists (``AlbumArt``), or None."""
+        from .artwork_formats import SPEC_KEY_COVER_ART, formats_from_sysinfo_extended
+
+        return formats_from_sysinfo_extended(self.sysinfo.extended, SPEC_KEY_COVER_ART)
+
+    def get_photo_formats(self):
+        """Photo thumbnail formats for this device (list of ArtworkFormatInfo, or None).
+
+        Like libgpod: the ``ImageSpecifications`` of the device's SysInfoExtended when it has
+        them (the firmware shows only photos in those sizes), else the generation's table.
+        """
+        from .artwork_formats import (
+            SPEC_KEY_PHOTOS,
+            formats_from_sysinfo_extended,
+            get_photo_formats,
+        )
+
+        formats = formats_from_sysinfo_extended(self.sysinfo.extended, SPEC_KEY_PHOTOS)
+        return formats or get_photo_formats(self.generation)
 
     @property
     def supports_video(self) -> bool:
@@ -291,9 +356,20 @@ class Device:
 
     @property
     def music_dirs(self) -> int:
-        """Number of Fxx music directories this iPod uses."""
-        if self._info:
+        """Number of Fxx music directories this iPod uses.
+
+        From the model table; for an unknown model (no table entry) the consecutive
+        ``F00``, ``F01``, ... directories on disk are counted like libgpod does, and
+        50 is the default when there are none.
+        """
+        if self._info and self._info.musicdirs > 0:
             return self._info.musicdirs
+        if self.mountpoint:
+            n = 0
+            while (self.music_dir / f"F{n:02d}").is_dir():
+                n += 1
+            if n:
+                return n
         return 50  # Default
 
     @property

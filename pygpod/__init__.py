@@ -24,14 +24,16 @@ from __future__ import annotations
 
 import logging
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 logger = logging.getLogger(__name__)
 
+from .backup_archive import BackupError, BackupInfo, RestoreResult, backup, restore
 from .db.photodb import Photo, PhotoAlbum, PhotoDB
 from .db.playcounts import OTGSkippedEntry, PendingPlayCount, read_otg_playlists, read_play_counts
 from .device.device import Device
 from .device.mountpoint import init_ipod, validate_mountpoint
+from .doctor import CheckReport, Issue, RepairAction
 from .exceptions import (
     ArtworkError,
     ConflictError,
@@ -314,6 +316,14 @@ __all__ = [
     "init_ipod",
     "validate_mountpoint",
     "discover",
+    "backup",
+    "restore",
+    "BackupInfo",
+    "RestoreResult",
+    "BackupError",
+    "CheckReport",
+    "Issue",
+    "RepairAction",
     "PyGpodError",
     "DatabaseError",
     "ParseError",

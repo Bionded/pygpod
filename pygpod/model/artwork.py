@@ -9,10 +9,12 @@ Ported from libgpod's itdb_thumb.c and ithumb-writer.c.
 
 from __future__ import annotations
 
+import io
 import logging
+import math
 import struct
 from enum import IntEnum
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -242,6 +244,106 @@ def create_thumbnail(
     return render_thumbnail(image_path, w, h, fmt[2])
 
 
+class FittedThumbnail:
+    """A letterboxed thumbnail: pixel data of the whole ``w`` x ``h`` slot plus its geometry.
+
+    ``scaled_width`` x ``scaled_height`` is the image inside the slot, centred with
+    ``horizontal_padding`` / ``vertical_padding`` pixels on the left / top (the rest of the
+    slot is black). ``width`` / ``height`` are the values libgpod records in the database:
+    the scaled size plus the left/top padding.
+    """
+
+    def __init__(
+        self, data: bytes, scaled_width: int, scaled_height: int, slot_width: int, slot_height: int
+    ) -> None:
+        self.data = data
+        self.scaled_width = scaled_width
+        self.scaled_height = scaled_height
+        self.horizontal_padding = (slot_width - scaled_width) // 2
+        self.vertical_padding = (slot_height - scaled_height) // 2
+
+    @property
+    def width(self) -> int:
+        return self.scaled_width + self.horizontal_padding
+
+    @property
+    def height(self) -> int:
+        return self.scaled_height + self.vertical_padding
+
+
+def fit_size(src_width: int, src_height: int, width: int, height: int) -> Tuple[int, int]:
+    """Size of a ``src_width`` x ``src_height`` image scaled to fit ``width`` x ``height``.
+
+    The aspect ratio is kept; the limiting side gets the full slot size, the other side is
+    scaled in floating point and rounded up, but not past the slot (libgpod's rule for photo
+    thumbnails and cover art: 400x300 in 56x56 is 56x43). Images smaller than the slot are
+    scaled up.
+    """
+    if src_width <= 0 or src_height <= 0:
+        return width, height
+    if src_width * height > src_height * width:  # wider than the slot
+        return width, min(height, math.ceil(src_height * (width / src_width)))
+    return min(width, math.ceil(src_width * (height / src_height))), height
+
+
+def _open_rgb(image: Union[str, bytes]) -> Any:
+    from PIL import Image  # type: ignore
+
+    if isinstance(image, (bytes, bytearray)):
+        return Image.open(io.BytesIO(bytes(image))).convert("RGB")
+    return Image.open(image).convert("RGB")
+
+
+def render_fitted_thumbnail(
+    image: Union[str, bytes],
+    w: int,
+    h: int,
+    pixel_fmt: PixelFormat,
+    *,
+    crop: bool = False,
+    back_color: Tuple[int, int, int] = (0, 0, 0),
+    row_width: int = 0,
+) -> Optional[FittedThumbnail]:
+    """Scale an image (path or encoded bytes) to fit ``w`` x ``h`` like libgpod does for photos.
+
+    The image keeps its aspect ratio (:func:`fit_size`) and is centred on a ``w`` x ``h`` slot
+    of ``back_color``, which is encoded as ``pixel_fmt``. With ``crop`` it is scaled to fill
+    the whole slot and the overhang cut off (centred; no padding). ``row_width`` (> ``w``)
+    stores each row that many pixels wide, the extra pixels in ``back_color`` (libgpod's
+    RowBytesAlignment). None without Pillow.
+    """
+    try:
+        from PIL import Image  # type: ignore
+    except ImportError:
+        logger.debug("Pillow not installed, cannot create a thumbnail")
+        return None
+
+    img = _open_rgb(image)
+    slot = Image.new("RGB", (max(w, row_width), h), tuple(back_color))
+    if crop:
+        sw, sh = w, h
+        slot.paste(_scale_and_crop(img, w, h), (0, 0))
+    else:
+        sw, sh = fit_size(img.width, img.height, w, h)
+        slot.paste(img.resize((sw, sh), Image.LANCZOS), ((w - sw) // 2, (h - sh) // 2))
+    data = _encode(slot, pixel_fmt)
+    if data is None:
+        return None
+    return FittedThumbnail(data, sw, sh, w, h)
+
+
+def _scale_and_crop(img: Any, w: int, h: int) -> Any:
+    """``img`` scaled to cover ``w`` x ``h`` (aspect ratio kept), centre cut to ``w`` x ``h``."""
+    from PIL import Image  # type: ignore
+
+    scale = max(w / img.width, h / img.height)
+    new_w = max(w, round(img.width * scale))
+    new_h = max(h, round(img.height * scale))
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+    left, top = (new_w - w) // 2, (new_h - h) // 2
+    return img.crop((left, top, left + w, top + h))
+
+
 def render_thumbnail(image_path: str, w: int, h: int, pixel_fmt: PixelFormat) -> Optional[bytes]:
     """Scale/crop an image to ``w`` x ``h``, encode it as ``pixel_fmt`` (None without Pillow)."""
     try:
@@ -271,8 +373,11 @@ def render_thumbnail(image_path: str, w: int, h: int, pixel_fmt: PixelFormat) ->
     left = (new_w - w) // 2
     top = (new_h - h) // 2
     img = img.crop((left, top, left + w, top + h))
+    return _encode(img, pixel_fmt)
 
-    # Convert to pixel format
+
+def _encode(img: Any, pixel_fmt: PixelFormat) -> Optional[bytes]:
+    """Encode an RGB Pillow image as ``pixel_fmt``."""
     if pixel_fmt in (PixelFormat.RGB565_LE, PixelFormat.RGB565_BE):
         return _pack_rgb565(img, big_endian=(pixel_fmt == PixelFormat.RGB565_BE))
     elif pixel_fmt in (PixelFormat.RGB555_LE, PixelFormat.RGB555_BE):
@@ -285,6 +390,31 @@ def render_thumbnail(image_path: str, w: int, h: int, pixel_fmt: PixelFormat) ->
         return _pack_rgb888(img, bgr=(pixel_fmt == PixelFormat.RGB888_LE))
 
     return None
+
+
+# ============================================================================
+# YCbCr conversion: limited-range BT.601 in integer arithmetic, as libgpod does it
+# (black Y=16, white Y=235, neutral chroma 128)
+# ============================================================================
+def _rgb_to_y(r: int, g: int, b: int) -> int:
+    return ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16
+
+
+def _rgb_to_yuv(r: int, g: int, b: int) -> Tuple[int, int, int]:
+    return (
+        ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16,
+        ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128,
+        ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128,
+    )
+
+
+def _yuv_to_rgb(y: int, u: int, v: int) -> Tuple[int, int, int]:
+    c, d, e = 298 * (y - 16) + 128, u - 128, v - 128
+    return (
+        max(0, min(255, (c + 409 * e) >> 8)),
+        max(0, min(255, (c - 100 * d - 208 * e) >> 8)),
+        max(0, min(255, (c + 516 * d) >> 8)),
+    )
 
 
 # ============================================================================
@@ -332,30 +462,29 @@ def _unpack_rgb888(data: bytes, w: int, h: int, bgr: bool = False) -> bytes:
     return bytes(result)
 
 
-def _unpack_uyvy(data: bytes, w: int, h: int) -> bytes:
-    """Unpack UYVY (YCbCr 4:2:2) to RGB888."""
-    result = bytearray(w * h * 3)
-    for i in range(0, min(w * h * 2, len(data)), 4):
-        u = data[i] - 128
-        y0 = data[i + 1]
-        v = data[i + 2] - 128
-        y1 = data[i + 3]
+def _field_rows(h: int) -> List[int]:
+    """Source row of each stored row in TV field order: even rows, then odd rows."""
+    return list(range(0, h, 2)) + list(range(1, h, 2))
 
-        px = (i // 4) * 2
-        for j, y in enumerate((y0, y1)):
-            r = max(0, min(255, int(y + 1.402 * v)))
-            g = max(0, min(255, int(y - 0.344136 * u - 0.714136 * v)))
-            b = max(0, min(255, int(y + 1.772 * u)))
-            idx = (px + j) * 3
-            if idx + 2 < len(result):
-                result[idx] = r
-                result[idx + 1] = g
-                result[idx + 2] = b
+
+def _unpack_uyvy(data: bytes, w: int, h: int) -> bytes:
+    """Unpack UYVY (YCbCr 4:2:2, limited-range BT.601, rows in field order) to RGB888."""
+    result = bytearray(w * h * 3)
+    stride = w * 2
+    for stored, row in enumerate(_field_rows(h)):
+        line = data[stored * stride : (stored + 1) * stride]
+        for i in range(0, len(line) - 3, 4):
+            u, v = line[i], line[i + 2]
+            for j, y in enumerate((line[i + 1], line[i + 3])):
+                col = i // 2 + j
+                if col < w:
+                    idx = (row * w + col) * 3
+                    result[idx : idx + 3] = bytes(_yuv_to_rgb(y, u, v))
     return bytes(result)
 
 
 def _unpack_i420(data: bytes, w: int, h: int) -> bytes:
-    """Unpack I420 (YCbCr 4:2:0 planar) to RGB888."""
+    """Unpack I420 (YCbCr 4:2:0 planar, limited-range BT.601) to RGB888."""
     y_size = w * h
     uv_size = (w // 2) * (h // 2)
 
@@ -365,19 +494,14 @@ def _unpack_i420(data: bytes, w: int, h: int) -> bytes:
     y_plane = data[:y_size]
     u_plane = data[y_size : y_size + uv_size]
     v_plane = data[y_size + uv_size : y_size + 2 * uv_size]
+    cw = w // 2
 
     result = bytearray(w * h * 3)
     for row in range(h):
+        uv_row = min(row // 2, h // 2 - 1) * cw
         for col in range(w):
-            y = y_plane[row * w + col]
-            uv_idx = (row // 2) * (w // 2) + (col // 2)
-            u = u_plane[uv_idx] - 128
-            v = v_plane[uv_idx] - 128
-
-            r = max(0, min(255, int(y + 1.402 * v)))
-            g = max(0, min(255, int(y - 0.344136 * u - 0.714136 * v)))
-            b = max(0, min(255, int(y + 1.772 * u)))
-
+            uv_idx = uv_row + min(col // 2, cw - 1)
+            r, g, b = _yuv_to_rgb(y_plane[row * w + col], u_plane[uv_idx], v_plane[uv_idx])
             idx = (row * w + col) * 3
             result[idx] = r
             result[idx + 1] = g
@@ -433,58 +557,53 @@ def _pack_rgb888(img: Any, bgr: bool = False) -> bytes:
 
 
 def _pack_uyvy(img: Any) -> bytes:
-    """Pack PIL Image to UYVY (YCbCr 4:2:2)."""
+    """Pack PIL Image to UYVY (YCbCr 4:2:2) for TV out, the same bytes as libgpod.
+
+    Limited-range BT.601 (``_rgb_to_yuv``), the chroma of each pixel pair taken from its left
+    pixel, rows in TV field order (even rows, then odd rows).
+    """
     w, h = img.size
+    if w % 2:
+        raise ValueError(f"UYVY needs an even width, got {w}")
     pixels = img.tobytes()
     result = bytearray(w * h * 2)
-
-    for row in range(h):
+    out = 0
+    for row in _field_rows(h):
         for col in range(0, w, 2):
             idx0 = (row * w + col) * 3
-            idx1 = (row * w + col + 1) * 3 if col + 1 < w else idx0
-
-            r0, g0, b0 = pixels[idx0], pixels[idx0 + 1], pixels[idx0 + 2]
-            r1, g1, b1 = pixels[idx1], pixels[idx1 + 1], pixels[idx1 + 2]
-
-            y0 = int(0.299 * r0 + 0.587 * g0 + 0.114 * b0)
-            y1 = int(0.299 * r1 + 0.587 * g1 + 0.114 * b1)
-            avg_r = (r0 + r1) / 2
-            avg_g = (g0 + g1) / 2
-            avg_b = (b0 + b1) / 2
-            u = int(-0.169 * avg_r - 0.331 * avg_g + 0.5 * avg_b + 128)
-            v = int(0.5 * avg_r - 0.419 * avg_g - 0.081 * avg_b + 128)
-
-            out_idx = (row * w + col) * 2
-            result[out_idx] = max(0, min(255, u))
-            result[out_idx + 1] = max(0, min(255, y0))
-            result[out_idx + 2] = max(0, min(255, v))
-            result[out_idx + 3] = max(0, min(255, y1))
-
+            idx1 = idx0 + 3
+            y0, u, v = _rgb_to_yuv(pixels[idx0], pixels[idx0 + 1], pixels[idx0 + 2])
+            y1 = _rgb_to_y(pixels[idx1], pixels[idx1 + 1], pixels[idx1 + 2])
+            result[out : out + 4] = bytes((u, y0, v, y1))
+            out += 4
     return bytes(result)
 
 
 def _pack_i420(img: Any) -> bytes:
-    """Pack PIL Image to I420 (YCbCr 4:2:0 planar)."""
+    """Pack PIL Image to I420 (YCbCr 4:2:0 planar), zero-padded to 2 bytes per pixel.
+
+    Same bytes as libgpod: limited-range BT.601 (``_rgb_to_yuv``), the chroma of each 2x2
+    block taken from its bottom-right pixel.
+    """
     w, h = img.size
     pixels = img.tobytes()
+    cw, ch = w // 2, h // 2
 
     y_plane = bytearray(w * h)
-    u_plane = bytearray((w // 2) * (h // 2))
-    v_plane = bytearray((w // 2) * (h // 2))
+    u_plane = bytearray(cw * ch)
+    v_plane = bytearray(cw * ch)
 
     for row in range(h):
         for col in range(w):
             idx = (row * w + col) * 3
-            r, g, b = pixels[idx], pixels[idx + 1], pixels[idx + 2]
+            y_plane[row * w + col] = _rgb_to_y(pixels[idx], pixels[idx + 1], pixels[idx + 2])
+    for row in range(ch):
+        for col in range(cw):
+            idx = ((2 * row + 1) * w + 2 * col + 1) * 3
+            _, u, v = _rgb_to_yuv(pixels[idx], pixels[idx + 1], pixels[idx + 2])
+            u_plane[row * cw + col] = u
+            v_plane[row * cw + col] = v
 
-            y = int(0.299 * r + 0.587 * g + 0.114 * b)
-            y_plane[row * w + col] = max(0, min(255, y))
-
-            if row % 2 == 0 and col % 2 == 0:
-                u = int(-0.169 * r - 0.331 * g + 0.5 * b + 128)
-                v = int(0.5 * r - 0.419 * g - 0.081 * b + 128)
-                uv_idx = (row // 2) * (w // 2) + (col // 2)
-                u_plane[uv_idx] = max(0, min(255, u))
-                v_plane[uv_idx] = max(0, min(255, v))
-
-    return bytes(y_plane) + bytes(u_plane) + bytes(v_plane)
+    # libgpod stores I420 thumbnails in w*h*2 bytes: the Y, U and V planes, then zeros
+    planes = bytes(y_plane) + bytes(u_plane) + bytes(v_plane)
+    return planes + bytes(w * h * 2 - len(planes))

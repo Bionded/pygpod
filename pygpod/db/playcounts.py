@@ -656,6 +656,26 @@ class OTGSkippedEntry(NamedTuple):
     reason: str
 
 
+def remap_otg_data(data: bytes, mapping: Dict[int, Optional[int]]) -> bytes:
+    """An OTGPlaylistInfo file with each entry's track position replaced by ``mapping[old]``
+    (entries mapped to None, or not in ``mapping``, are dropped). Header bytes, byte order
+    and any extra bytes of the entries are kept."""
+    magic = data[0:4]
+    order = "<" if magic == b"mhpo" else ">"
+    header_length, entry_length, count = struct.unpack_from(f"{order}III", data, 4)
+    entries = []
+    for i in range(count):
+        off = header_length + entry_length * i
+        if off + entry_length > len(data):
+            break
+        new = mapping.get(struct.unpack_from(f"{order}I", data, off)[0])
+        if new is not None:
+            entries.append(struct.pack(f"{order}I", new) + data[off + 4 : off + entry_length])
+    header = bytearray(data[:header_length])
+    struct.pack_into(f"{order}I", header, 12, len(entries))
+    return bytes(header) + b"".join(entries)
+
+
 def read_otg_files(mountpoint: str) -> List[OTGFile]:
     """OTGPlaylistInfo, then OTGPlaylistInfo_1, _2, ... until one is missing.
 

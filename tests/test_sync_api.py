@@ -1,4 +1,4 @@
-"""APIs for driving an iPod from already processed files (syncDirector, docs/13 item 7)."""
+"""APIs for driving an iPod from already processed files (a sync tool on top of pygpod)."""
 
 import datetime
 import os
@@ -190,3 +190,32 @@ def test_removing_last_image_empties_artworkdb(tmp_path):
         root = parse_artworkdb(f.read())
     mhli = next(c for c in root.children if c.fields.get("mhsd_type") == 1).children[0]
     assert mhli.children == [] and mhli.total_len == 0
+
+
+@pytest.mark.parametrize("model", ["M9282", "M9800", "xC584"])  # 4G, mini 2G, shuffle 4G
+def test_no_cover_art_on_models_without_it(tmp_path, model):
+    """iPods without cover art get none: add_track and set_artwork leave the track alone."""
+    mp = str(tmp_path / "ipod")
+    os.makedirs(mp)
+    init_ipod(mp, name="iPod", sysinfo_files={"SysInfo": f"ModelNumStr: {model}\n".encode()})
+    mp3 = str(tmp_path / "a.mp3")
+    _make_minimal_mp3(mp3)
+    db = Database(mp)
+    track = db.add_track(mp3, title="Обійми", cover_art=_png(tmp_path, (200, 40, 60)))
+    db.set_artwork(track, _png(tmp_path, (20, 40, 160)))
+    assert not track.has_artwork
+    db.save()
+    art = os.path.join(mp, "iPod_Control", "Artwork")
+    assert not os.path.isdir(art) or not [f for f in os.listdir(art) if f.endswith(".ithmb")]
+
+
+def test_unidentified_model_still_gets_cover_art(tmp_path):
+    """No ModelNumStr: the model is unknown, artwork uses the Classic formats as before."""
+    mp = str(tmp_path / "ipod")
+    os.makedirs(mp)
+    init_ipod(mp, name="iPod", sysinfo_files={"SysInfo": b"FirewireGuid: 0x000A270012345678\n"})
+    mp3 = str(tmp_path / "a.mp3")
+    _make_minimal_mp3(mp3)
+    db = Database(mp)
+    track = db.add_track(mp3, title="Ґанок", cover_art=_png(tmp_path, (90, 70, 50)))
+    assert track.has_artwork

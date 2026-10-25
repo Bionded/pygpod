@@ -107,7 +107,10 @@ def init_ipod(
 
     Creates all necessary directories and writes a minimal iTunesDB
     containing only a master playlist named ``name`` (the device name shown
-    by the iPod and iTunes), plus an empty ArtworkDB.
+    by the iPod and iTunes), plus an empty ArtworkDB. Like libgpod, the new
+    iTunesDB is signed for the device in the SysInfo files (hash58 with the
+    FirewireGuid, hash72 with HashInfo); without them it stays unsigned until
+    the first save().
 
     Never formats or partitions anything: to start from a fresh filesystem the
     caller formats the data partition first and passes the SysInfo files read
@@ -119,8 +122,8 @@ def init_ipod(
         music_dirs: Number of Fxx music directories to create.
         name: Device name (master playlist name) for a newly written iTunesDB.
         reset: Start from zero: delete iPod_Control/iTunes, Artwork and Music
-            contents (tracks, databases, play counts) and write a new empty
-            database. iPod_Control/Device is kept (SysInfo files subject to
+            contents (tracks, databases, play counts, also iTunes' IC-Info.sidb)
+            and write a new empty database. iPod_Control/Device is kept (SysInfo files subject to
             ``keep_sysinfo``). Without ``reset`` an existing iTunesDB is kept.
         keep_sysinfo: Keep existing SysInfo/SysInfoExtended (with ``reset``);
             False deletes them.
@@ -203,13 +206,66 @@ def init_ipod(
         elif action.op == "write":
             path.parent.mkdir(parents=True, exist_ok=True)
             if path.name == "iTunesDB":
-                path.write_bytes(_build_empty_itunesdb(name))
+                path.write_bytes(
+                    _sign_new_itunesdb(str(mp), _build_empty_itunesdb(name, _tz_shift(str(mp))))
+                )
                 logger.info("Created empty iTunesDB at %s (name %r)", path, name)
             elif path.name == "ArtworkDB":
                 path.write_bytes(_build_empty_artworkdb(str(mp)))
             else:
                 path.write_bytes((sysinfo_files or {})[path.name])
     return actions
+
+
+def _sign_new_itunesdb(mountpoint: str, data: bytes) -> bytes:
+    """Sign a newly built iTunesDB for the device described by the SysInfo files at
+    ``mountpoint``, like libgpod's itdb_init_ipod does: hash58 with the FirewireGuid, hash72
+    with the device's HashInfo. Left unsigned (as before) when the device needs no hash or the
+    hash cannot be computed here; the first save() signs it then. No USB lookup.
+    """
+    from ..exceptions import HashError
+    from ..hash.checksum import update_checksums
+    from ..model.sysinfo import read_sysinfo
+    from .device import Device
+    from .models import ChecksumType, lookup_model, lookup_model_by_serial
+
+    try:
+        sysinfo = read_sysinfo(mountpoint)
+    except Exception:  # noqa: BLE001 - unreadable SysInfo: no hash, as before
+        logger.debug("SysInfo not readable at %s", mountpoint, exc_info=True)
+        return data
+    info = lookup_model(sysinfo.model_number) if sysinfo.model_number else None
+    if (info is None or info.model_number == "Unknown") and sysinfo.serial_number:
+        info = lookup_model_by_serial(sysinfo.serial_number) or info
+    dev = Device(mountpoint, sysinfo, info)
+    ctype = dev.checksum_type
+    guid = dev.firewire_guid
+    if ctype is ChecksumType.NONE:
+        return data
+    params = None
+    if ctype is ChecksumType.HASH72:
+        from ..hash.hash72 import read_hash_info
+
+        params = read_hash_info(str(dev.device_dir / "HashInfo"), guid)
+    missing = (
+        "no FirewireGuid"
+        if not guid
+        else "not supported"
+        if ctype is ChecksumType.HASHAB
+        else "no HashInfo"
+        if ctype is ChecksumType.HASH72 and not params
+        else None
+    )
+    if missing:
+        logger.warning(
+            "New iTunesDB left unsigned: %s needs %s (%s)", dev.model, ctype.name, missing
+        )
+        return data
+    try:
+        return update_checksums(data, guid, ctype.name, hash72_params=params)
+    except HashError:
+        logger.warning("New iTunesDB left unsigned: %s", ctype.name, exc_info=True)
+        return data
 
 
 def _build_empty_artworkdb(mountpoint: str) -> bytes:
@@ -219,7 +275,13 @@ def _build_empty_artworkdb(mountpoint: str) -> bytes:
     return write_artworkdb(ArtworkManager(mountpoint)._create_empty_artworkdb())
 
 
-def _build_empty_itunesdb(name: str = "iPod") -> bytes:
+def _tz_shift(mountpoint: str) -> int:
+    from ..utils.timezone import device_timezone_shift
+
+    return device_timezone_shift(mountpoint)
+
+
+def _build_empty_itunesdb(name: str = "iPod", tz_shift: int = 0) -> bytes:
     """Build a minimal valid iTunesDB with an empty master playlist.
 
     Uses header sizes matching libgpod / iPod firmware expectations:
@@ -231,6 +293,8 @@ def _build_empty_itunesdb(name: str = "iPod") -> bytes:
     Structure: MHBD -> MHSD(type=1) -> MHLT (0 tracks)
                     -> MHSD(type=3) -> MHLP -> MHYP (master, podcast mirror)
                     -> MHSD(type=2) -> MHLP -> MHYP (master playlist)
+
+    ``tz_shift``: the iPod's UTC offset (seconds east) for the playlists' creation time.
     """
     import os
     import struct
@@ -263,7 +327,7 @@ def _build_empty_itunesdb(name: str = "iPod") -> bytes:
 
         # Mac epoch timestamp (seconds since 1904-01-01)
         mac_epoch_offset = 2082844800
-        timestamp = int(time.time()) + mac_epoch_offset
+        timestamp = int(time.time()) + mac_epoch_offset + tz_shift
 
         mhyp_header_len = 0x6C  # 108 bytes
         mhyp_total = mhyp_header_len + len(mhod_data)

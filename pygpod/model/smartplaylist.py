@@ -449,7 +449,7 @@ def _eval_date_rule(rule: SPLRule, track: "Track") -> bool:
 
     val = _get_track_date(track, rule.field)
     action = rule.action
-    now_mac = int(time.time()) + MAC_EPOCH_OFFSET
+    now_mac = int(time.time()) + MAC_EPOCH_OFFSET + track._tz_shift  # the iPod's local time
 
     if action == SPLAction.IS_IN_THE_LAST:
         # fromvalue is the duration in seconds

@@ -1,4 +1,4 @@
-"""Big databases stay linear (syncDirector task 98)."""
+"""Big databases stay linear."""
 
 import os
 import time
@@ -63,10 +63,11 @@ def test_remove_tracks_from_playlists_and_files(writable_ipod):
 def _populate(writable_ipod, n):
     db = Database(writable_ipod)
     src = _src(writable_ipod)
-    t = time.perf_counter()
+    # CPU time of this process: other processes on a loaded machine barely change it
+    t = time.process_time()
     tracks = [db.add_track(src, copy=False, title=f"T{i}", album=f"A{i % 300}") for i in range(n)]
     db.save()
-    return db, tracks, time.perf_counter() - t
+    return db, tracks, time.process_time() - t
 
 
 @pytest.mark.slow
@@ -83,9 +84,11 @@ def test_add_and_remove_scale_linearly(tmp_path):
     db, tracks, big = _populate(fresh("big"), 8000)
     assert big / small < 6, (small, big)
     db2, tracks2, t10k = _populate(fresh("ten"), 10000)
-    assert t10k < 30, t10k
-    t = time.perf_counter()
+    # Relative to the 2000-track run, not seconds: the suite runs in parallel on shared
+    # machines; linear growth gives ~5x, quadratic ~25x.
+    assert t10k / small < 10, (small, t10k)
+    t = time.process_time()
     db2.remove_tracks(tracks2[:2500])
     db2.save()
-    assert time.perf_counter() - t < 10
+    assert time.process_time() - t < t10k, t10k
     assert len(Database(db2._mountpoint).tracks) == 7500

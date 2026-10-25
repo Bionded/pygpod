@@ -1,4 +1,4 @@
-"""Concurrent writers never overwrite each other silently (syncDirector task 49)."""
+"""Concurrent writers never overwrite each other silently."""
 
 import json
 import os
@@ -96,7 +96,7 @@ def _dead_lock(path):
 
 
 def test_two_takers_of_a_stale_lock_only_one_wins(tmp_path):
-    """syncDirector task 110: B judged the dead writer's lock stale, A took it over meanwhile;
+    """B judged the dead writer's lock stale, A took it over meanwhile;
     B's takeover must not remove A's fresh lock."""
     path = str(tmp_path / writelock.LOCK_NAME)
     seen_by_b = _dead_lock(path)

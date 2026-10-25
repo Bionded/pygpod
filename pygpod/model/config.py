@@ -16,7 +16,18 @@ logger = logging.getLogger(__name__)
 class DatabaseConfig:
     """Configuration for iPod database generation.
 
-    Defaults match libgpod for maximum device compatibility.
+    Defaults match libgpod for maximum device compatibility. The fields most callers change:
+
+    - ``otg_on_save``: what save() does with On-The-Go playlists made on the iPod:
+      "import" (default, like iTunes and libgpod: playlists "OTG Playlist n", files removed),
+      "keep" (files kept, positions rewritten) or "clear" (files removed).
+    - ``timestamps``: "local" (default, the iPod's local time like iTunes and libgpod) or
+      "utc" (pygpod 0.1.0's behaviour).
+    - ``random_seed``: an int makes database/track/playlist ids and file names reproducible.
+    - ``master_playlist_name``: name of the library playlist in a new database ("iPod").
+    - ``set_time_fields_zero``: leave time_added/time_modified of new tracks 0 instead of now.
+
+    The other fields are header values of the binary format, set to what libgpod writes.
     """
 
     # -- String encoding --
@@ -41,6 +52,12 @@ class DatabaseConfig:
     # When False, time_modified and time_added are set to current time.
     # When True, they are left as 0 (original libgpod behavior).
     set_time_fields_zero: bool = False
+
+    # -- Timestamp zone --
+    # "local": iTunesDB times are the iPod's local wall time, like libgpod and iTunes: the
+    #   timezone from iPod_Control/Device/Preferences, else the host's current UTC offset
+    #   (Database.timezone_shift). "utc": read and write them as UTC (pygpod 0.1.0).
+    timestamps: str = "local"
 
     # -- MHYP (playlist) header fields --
     mhyp_unk_0x28: int = 1
@@ -77,3 +94,14 @@ class DatabaseConfig:
     # Set to an int seed for reproducible random values (DBIDs, playlist IDs).
     # None means use system randomness.
     random_seed: Optional[int] = None
+
+    # -- On-The-Go playlists made on the iPod, when save() writes a new database --
+    # "import" (default): import them as playlists ("OTG Playlist n") and remove the files,
+    #   like iTunes and libgpod (which imports on parse and removes OTGPlaylistInfo on write);
+    #   the iPod's On-The-Go list is empty afterwards
+    # "keep": the OTG files stay; their entries (track positions) are rewritten to the
+    #   tracks' new positions when the save moved them (entries of removed tracks dropped).
+    #   The iPod Classic firmware empties such a list anyway once the iTunesDB changed.
+    # "clear": remove the files without importing
+    # import_otg_playlists() / clear_otg_playlists() called explicitly always win.
+    otg_on_save: str = "import"

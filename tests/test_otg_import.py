@@ -1,4 +1,4 @@
-"""On-The-Go playlists: numbered files, import, cleanup with the save (syncDirector task 51)."""
+"""On-The-Go playlists: numbered files, import, cleanup with the save."""
 
 import os
 import struct
@@ -73,7 +73,7 @@ def _file(mp, track):
 
 
 def test_bad_entries_left_out_valid_ones_imported(ipod, caplog):
-    """Owner decision (task 109): drop missing/broken entries, log them, keep the rest."""
+    """Design: drop missing/broken entries, log them, keep the rest."""
     mp, titles = ipod
     db = Database(mp)
     t = db.tracks

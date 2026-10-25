@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 import struct
-from typing import List, Optional
+from typing import Any, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +121,33 @@ class ChapterData:
     def __iter__(self):
         return iter(self.chapters)
 
+    def to_list(self) -> List[tuple]:
+        """The chapters as ``[(startpos_ms, title), ...]``."""
+        return [(ch.startpos, ch.title) for ch in self.chapters]
+
+
+def chapter_data_from(value: Any) -> Optional[ChapterData]:
+    """A ChapterData from a ChapterData (copied), an iterable of ``(start_ms, title)``
+    tuples or Chapter objects, or None (-> None).
+
+    Chapters are kept in the given order; a first chapter at 0 ms moves to 1 ms.
+    """
+    if value is None:
+        return None
+    if isinstance(value, ChapterData):
+        cd = value.duplicate()
+        if cd.chapters and cd.chapters[0].startpos == 0:
+            cd.chapters[0].startpos = 1
+        return cd
+    cd = ChapterData()
+    for item in value:
+        if isinstance(item, Chapter):
+            cd.add_chapter(item.title, item.startpos)
+        else:
+            start, title = item
+            cd.add_chapter(str(title), int(start))
+    return cd
+
 
 def parse_chapter_data(data: bytes) -> Optional[ChapterData]:
     """Parse chapter data from MHOD type 17 body.
@@ -198,11 +225,11 @@ def write_chapter_data_atom(cd: ChapterData) -> bytes:
     chapter title as UTF-16BE with version/length fields.
 
     Atom layout:
-        sean: size(4BE) + "sean" + version(4) + unk(4) + pad(4)
+        sean: size(4BE) + "sean" + version(4) + child count(4) + pad(4)
           chap: size(4BE) + "chap" + startpos(4BE) + version(4) + pad(4)
             name: size(4BE) + "name" + version(4) + pad(4) + pad(4) + strlen(2BE) + UTF-16BE
           ...
-          hedr: size(4BE) + "hedr" + version(4) + 16 zero bytes
+          hedr: size(4BE) + "hedr" + version(4) + 0(4) + 0(4) + 0(4) + 1(4)
 
     Args:
         cd: ChapterData to serialize.
@@ -234,14 +261,14 @@ def write_chapter_data_atom(cd: ChapterData) -> bytes:
         chap_atom = struct.pack(">I", 8 + len(chap_payload)) + b"chap" + chap_payload
         chap_atoms.extend(chap_atom)
 
-    # hedr atom: size(4BE) + "hedr" + version(4) + 16 zero bytes
-    hedr_payload = struct.pack(">I", 1) + b"\x00" * 16
+    # hedr atom: size(4BE) + "hedr" + version(4) + 3 zero words + 1 (as libgpod writes it)
+    hedr_payload = struct.pack(">IIIII", 1, 0, 0, 0, 1)
     hedr_atom = struct.pack(">I", 8 + len(hedr_payload)) + b"hedr" + hedr_payload
 
-    # sean atom: size(4BE) + "sean" + version(4) + unk(4) + pad(4) + chaps + hedr
+    # sean atom: size(4BE) + "sean" + version(4) + children(4) + pad(4) + chaps + hedr
     sean_inner = (
         struct.pack(">I", 1)  # version = 1
-        + struct.pack(">I", 4)  # unk = 4
+        + struct.pack(">I", len(cd.chapters) + 1)  # child atoms: chapters + hedr
         + struct.pack(">I", 0)  # pad = 0
         + bytes(chap_atoms)
         + hedr_atom
@@ -252,3 +279,39 @@ def write_chapter_data_atom(cd: ChapterData) -> bytes:
     header = struct.pack("<III", cd.unk024, cd.unk028, cd.unk032)
 
     return header + sean_atom
+
+
+def parse_chapter_data_atom(data: bytes) -> Optional[ChapterData]:
+    """Parse the QuickTime atom format of an MHOD type 17 body (libgpod/iTunes).
+
+    Layout as written by :func:`write_chapter_data_atom`; chapter titles are UTF-16BE.
+
+    Returns:
+        ChapterData, or None if the body is not in the atom format.
+    """
+    if len(data) < 32 or data[16:20] != b"sean":
+        return None
+    cd = ChapterData()
+    cd.unk024, cd.unk028, cd.unk032 = struct.unpack_from("<III", data, 0)
+    sean_end = min(len(data), 12 + struct.unpack_from(">I", data, 12)[0])
+    pos = 12 + 20  # sean header: size, type, version, children, pad
+    while pos + 8 <= sean_end:
+        size = struct.unpack_from(">I", data, pos)[0]
+        if size < 8 or pos + size > sean_end:
+            break
+        if data[pos + 4 : pos + 8] == b"chap" and size >= 20:
+            startpos = struct.unpack_from(">I", data, pos + 8)[0]
+            title = ""
+            name = pos + 20
+            if pos + size >= name + 22 and data[name + 4 : name + 8] == b"name":
+                chars = struct.unpack_from(">H", data, name + 20)[0]
+                raw = data[name + 22 : min(name + 22 + 2 * chars, pos + size)]
+                title = raw.decode("utf-16-be", errors="replace")
+            cd.chapters.append(Chapter(title=title, startpos=startpos))
+        pos += size
+    return cd
+
+
+def parse_chapter_data_any(data: bytes) -> Optional[ChapterData]:
+    """Parse an MHOD type 17 body in either format (atom format first, else compact)."""
+    return parse_chapter_data_atom(data) or parse_chapter_data(data)

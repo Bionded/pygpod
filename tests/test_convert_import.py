@@ -1,4 +1,4 @@
-"""add_track(convert=True): unplayable audio is converted with ffmpeg (syncDirector task 58)."""
+"""add_track(convert=True): unplayable audio is converted with ffmpeg."""
 
 import os
 import re
@@ -142,3 +142,26 @@ def test_target_codec():
     assert convert.target_codec("flac", None) == convert.target_codec(
         "flac", IpodGeneration.UNKNOWN
     )
+
+
+def test_alac_m4a_gets_the_gtkpod_filetype(tmp_path, monkeypatch):
+    """gtkpod/libgpod write 'AAC audio file' for every .m4a (ALAC too); the
+    shuffle iTunesSD derives its AAC file type (2) from that string."""
+    from pygpod.db.itunessd import filetype_from_description
+
+    monkeypatch.setattr(convert.tempfile, "tempdir", str(tmp_path))
+    mp = _ipod(tmp_path, "B029")  # Classic
+    db = Database(mp)
+    alac = db.add_track(_make(tmp_path / "Обійми.m4a", "alac", title="Обійми"))
+    flac = db.add_track(_make(tmp_path / "Ґанок.flac", "flac", title="Ґанок"), convert=True)
+    aac = db.add_track(_make(tmp_path / "Човен.m4a", "aac", title="Човен"))
+    db.save()
+    for track in (alac, flac, aac):
+        assert track.filetype_str == "AAC audio file"
+        assert track.filetype_marker == b" A4M"
+        assert filetype_from_description(track.filetype_str) == 2
+    assert {t.title: t.filetype_str for t in Database(mp).tracks} == {
+        "Обійми": "AAC audio file",
+        "Ґанок": "AAC audio file",
+        "Човен": "AAC audio file",
+    }

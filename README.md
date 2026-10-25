@@ -1,415 +1,249 @@
 # pygpod
 
-> **Beta release.** This project is under active development. APIs may change, bugs are expected, and not all features are implemented yet. Use at your own risk.
-
-Pure Python library for iPod database management - a spiritual successor to [libgpod](https://sourceforge.net/projects/gtkpod/).
+Pure-Python library and command line tool for iPods that mount as USB mass storage: it reads and
+writes the iPod's music database (iTunesDB), cover art (ArtworkDB), photos (Photo Database) and the
+shuffle's iTunesSD. A spiritual successor to [libgpod](https://sourceforge.net/projects/gtkpod/):
+same file formats, same output, no C code.
 
 [![License: LGPL v2.1+](https://img.shields.io/badge/License-LGPL_v2.1+-blue.svg)](https://www.gnu.org/licenses/lgpl-2.1.html)
 [![Python 3.8+](https://img.shields.io/badge/Python-3.8+-green.svg)](https://www.python.org)
 
+> **Beta.** The file formats are checked against libgpod and on real iPods (see
+> [Supported iPods](#supported-ipods)), but not every model has been tried on hardware. Keep a
+> backup (`pygpod backup`) before writing to an iPod you care about.
+
 ## Features
 
-- **Pure Python** - no C dependencies, no compilation step
-- **Round-trip binary fidelity** - parse and re-write iTunesDB byte-identically
-- **Full CLI** - 12 commands for managing tracks, playlists, and devices
-- **Smart playlists** - rule evaluation engine with 40+ fields and 20+ operators
-- **Artwork support** - read/write .ithmb cover art thumbnails (with Pillow)
-- **Tag reading** - automatic metadata extraction from audio files (with mutagen)
-- **USB detection** - discover connected iPods (with pyusb)
-- **DatabaseConfig** - fine-grained control over binary output, including libgpod-compatible mode
+**Database**
+- Parse and re-write iTunesDB and ArtworkDB byte-identically (also those written by iTunes or
+  libgpod); new data is written the way libgpod writes it (checked against libgpod itself in the
+  test suite). A Photo Database written by pygpod round-trips byte-identically too; one written by
+  iTunes or libgpod is rewritten in pygpod's (libgpod-readable) layout on its first save.
+- Checksums per model like libgpod: hash58 (Classic, nano 3G/4G), hash72, unsigned databases for
+  older models; an unidentified iPod is signed like the database already on it.
+- Crash-safe saves (all database files are committed together through a journal), one writer at a
+  time (lock file, `ConflictError` when someone else saved meanwhile).
+- iTunesSD for the iPod shuffle: version 1 (1G/2G) and version 2 (3G/4G), written on every save.
+
+**Tracks**
+- Tags read from MP3, AAC/ALAC (M4A/M4B), FLAC, Ogg and others (mutagen): titles, sort fields,
+  compilation, rating, BPM, grouping, explicit/clean, release date, podcast fields, embedded cover.
+  Keyword arguments of `add_track()` always win over the tags.
+- The file's *content* is checked against what the model plays; `convert=True` converts the rest
+  with ffmpeg (Apple Lossless where the iPod plays it, else AAC; video to H.264 Baseline + AAC).
+- Sound Check from iTunNORM / ReplayGain tags, or measured with ffmpeg.
+- Gapless playback data from LAME/Info tags, iTunSMPB and MP4 edit lists; an estimate for files
+  without them (experimental).
+- Chapters of audiobooks and podcasts (MP4 chapter track, Nero `chpl`, ID3 `CHAP`).
+- Video: movies, music videos, TV shows (with show/season/episode fields).
+
+**Playlists, play counts, artwork, photos**
+- Playlists, podcast playlists and smart playlists (rules evaluated like libgpod, live ones
+  refreshed on save).
+- Play counts, skips, ratings and bookmarks recorded on the iPod are merged on open.
+- On-The-Go playlists made on the iPod are imported as "OTG Playlist n" on save, like iTunes.
+- Cover art and photos in the iPod's own formats (from its SysInfoExtended, else a per-model
+  table), letterboxed like libgpod.
+- Timestamps are the iPod's local time, like iTunes and libgpod.
+
+**Maintenance**
+- `doctor`: a read-only consistency check (missing/orphan files, broken artwork or playlist
+  references, wrong lengths, photo database problems, checksum, free space ...) and a repair.
+- Backup and restore of the whole iPod (database, artwork, photos, optionally the media) to a tar
+  archive, verified before anything is written.
+- `init_ipod()`: create the folder structure and an empty, correctly signed database.
+
+Documentation: [docs/](docs/README.md) has one page per area with runnable examples and an API
+reference generated from the docstrings. Changes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Installation
 
-pygpod is not yet published on PyPI - a PyPI release is planned once the API stabilizes (0.1.0+). For now, install directly from GitHub:
-
 ```bash
-pip install "pygpod[all] @ git+https://github.com/Bionded/pygpod.git"
+pip install "pygpod[all]"
 ```
 
-Or add to your `requirements.txt`:
+| extra | package | needed for |
+|---|---|---|
+| `tags` | [mutagen](https://mutagen.readthedocs.io/) | reading tags, cover art, chapters and gapless data from files |
+| `artwork` | [Pillow](https://pillow.readthedocs.io/) | cover art and photos |
+| `usb` | [pyusb](https://pyusb.github.io/pyusb/) | finding iPods on USB (`discover`, model/GUID when SysInfo lacks them) |
+| `all` | all of the above | |
 
-```
-pygpod[all] @ git+https://github.com/Bionded/pygpod.git
-```
+Without the extras pygpod still reads and writes databases; you pass the metadata yourself and
+artwork is not available (pygpod warns on import about what is missing). `ffmpeg` and `ffprobe`
+are needed only for conversion (`convert=True`), Sound Check analysis and the gapless estimate.
+Python 3.8 or newer; Linux, macOS and Windows.
 
-Available extras: `tags` (mutagen), `artwork` (Pillow), `usb` (pyusb), or `all` for everything.
-
-## Quick Start
-
-### Open a database and list tracks
+## Quick start
 
 ```python
 import pygpod
 
-db = pygpod.Database("/mnt/ipod")
+db = pygpod.Database("/mnt/ipod")             # the iPod's mount point
 
 for track in db.tracks:
-    print(f"{track.artist} - {track.title} ({track.album})")
+    print(track.artist, "-", track.title, f"({track.album})")
+
+# Tags are read from the file; keyword arguments override them.
+track = db.add_track("/path/to/song.mp3", artist="Океан Ельзи", album="Земля", year=2013)
+track.rating = 80                             # 0-100, 20 per star
+
+road_trip = db.create_playlist("У дорогу")
+db.add_track_to_playlist(road_trip, track)
+db.set_playlist("Обране", [track])            # create or replace a playlist's members
+
+db.save()                                     # nothing is written before save()
 ```
 
-### Add tracks
-
-```python
-db = pygpod.Database("/mnt/ipod")
-
-track = db.add_track("/path/to/song.mp3")
-print(f"Added: {track}")
-
-# With metadata overrides
-db.add_track("/path/to/other.mp3", artist="Custom Artist", title="Custom Title")
-
-# FLAC, Ogg, Opus, hi-res ... converted with ffmpeg (ALAC where the iPod plays it, else AAC)
-db.add_track("/path/to/song.flac", convert=True)
-
-db.save()
-```
-
-### Work with playlists
-
-```python
-db = pygpod.Database("/mnt/ipod")
-
-# Create a playlist and add tracks
-playlist = db.create_playlist("Road Trip")
-for track in db.tracks:
-    if "rock" in track.genre.lower():
-        db.add_track_to_playlist(playlist, track)
-
-db.save()
-```
-
-### Context manager (auto-saves on exit)
+The context manager saves on a clean exit:
 
 ```python
 with pygpod.Database("/mnt/ipod") as db:
-    db.add_track("/path/to/song.mp3")
-    # saved automatically
+    db.tracks[0].play_count = 3
 ```
 
-## CLI
+Files the iPod cannot play, Sound Check measured with ffmpeg, the gapless estimate, explicit
+chapters and video fields (these need ffmpeg or real media files):
 
-```bash
-pygpod -m /mnt/ipod <command>          # specify mountpoint with -m flag
-export PYGPOD_MOUNTPOINT=/mnt/ipod     # or set it via environment variable
+```py
+db.add_track("/path/to/song.flac", convert=True)                      # -> ALAC or AAC
+db.add_track("/path/to/movie.mkv", convert=True, video_size="large")  # -> H.264 .m4v
+db.add_track("/path/to/live.mp3", soundcheck="auto", gapless="estimate", gapless_album_flag=True)
+db.add_track("/path/to/book.m4b", chapters=[(0, "Вступ"), (90000, "Розділ 1")])
+db.add_track("/path/to/episode.m4v", tvshow="Show", season_number=1, episode_number=3)
 ```
 
-### Commands
-
-```
-pygpod info                            # device info and database summary (alias: i)
-pygpod track list                      # list all tracks (aliases: tr ls)
-pygpod track add file1.mp3 file2.mp3   # add audio files to iPod
-pygpod track remove <id>               # remove track by ID (aliases: tr rm)
-pygpod track export <id> dest/         # export track to local path
-pygpod track info <id>                 # show full track details
-pygpod playlist list                   # list all playlists (aliases: pl ls)
-pygpod playlist create "Name"          # create a new playlist
-pygpod playlist add "Name" <id> ...    # add tracks to playlist by ID
-pygpod playlist remove "Name" <id>     # remove track from playlist (aliases: pl rm)
-pygpod playlist delete "Name"          # delete a playlist
-pygpod init --model classic_6g         # initialize iPod directory structure
-pygpod dump                            # dump raw iTunesDB record tree
-pygpod fix-checksums                   # recalculate database checksums
-pygpod purge --yes                     # delete all data from iPod
-pygpod discover                        # auto-detect connected iPods
-```
-
-### Examples
-
-```bash
-# Add an album and create a playlist for it
-pygpod -m /mnt/ipod track add ~/Music/album/*.mp3
-pygpod -m /mnt/ipod playlist create "Road Trip"
-pygpod -m /mnt/ipod playlist add "Road Trip" 1 2 3
-
-# Initialize a fresh iPod volume
-pygpod -m /mnt/ipod init --model classic_6g
-```
-
-## API Overview
-
-### Database
-
-The main entry point. Opens an iPod mount point, parses the iTunesDB, and provides methods for managing tracks and playlists.
+Cover art, photos, smart playlists, check and backup:
 
 ```python
+from pygpod import SPLAction, SPLField, SPLRule
+
 db = pygpod.Database("/mnt/ipod")
-db.tracks          # list of Track objects
-db.playlists       # list of Playlist objects
-db.master_playlist # the library playlist
-db.device          # Device info (model, capabilities)
-db.add_track(path, convert=False, **metadata_overrides)
-db.remove_track(track, delete_file=False)
-db.create_playlist(name)
-db.delete_playlist(playlist)
-db.add_track_to_playlist(playlist, track)
-db.remove_track_from_playlist(playlist, track)
+db.set_artwork(db.tracks[0], open("/path/to/cover.png", "rb").read())
+db.create_smart_playlist("Rock", [SPLRule(field=SPLField.GENRE, action=SPLAction.CONTAINS,
+                                          string="Rock")])
 db.save()
-db.save_to_file(path)
+
+photos = pygpod.PhotoDB("/mnt/ipod")
+album = photos.create_album("Літо")
+photos.add_photo_to_album(album, photos.add_photo("/path/to/cover.png"))
+photos.save()
+
+report = pygpod.Database("/mnt/ipod").check()  # read-only; repair() fixes and saves
+print(report.summary())
+pygpod.backup("/mnt/ipod", "ipod.tar.gz", include_media=False)
 ```
 
-Use `Database.from_file(path)` to parse a standalone iTunesDB file without a mount point.
+More in [docs/](docs/README.md): [database](docs/database.md), [tracks](docs/tracks.md),
+[playlists](docs/playlists.md), [device and models](docs/device.md),
+[play counts and On-The-Go](docs/playcounts.md), [artwork and photos](docs/artwork.md),
+[tags and conversion](docs/media.md), [check, backup, restore](docs/maintenance.md),
+[errors](docs/errors.md), [command line](docs/cli.md).
 
-### Track
+## Command line
 
-Properties on a parsed MHIT record - covers 100+ fields. Most metadata fields have setters.
+```bash
+export PYGPOD_MOUNTPOINT=/mnt/ipod     # or pass -m /mnt/ipod to every command
 
-#### Editable string properties
-
-```python
-track.title = "New Title"
-track.artist = "New Artist"
-track.album = "New Album"
-track.genre = "Rock"
-track.composer = "Someone"
-track.comment = "My note"
-track.albumartist = "Various Artists"
-track.grouping = "Group"
-track.description = "Desc"
-track.subtitle = "Sub"
-track.category = "Category"
-track.keywords = "tag1 tag2"
-track.podcast_url = "https://..."
-track.podcast_rss = "https://..."
-track.tvshow = "Show Name"
-track.tvepisode = "S01E01"
-track.tvnetwork = "Network"
-# Sort keys (override default sort order)
-track.sort_title = "title for sorting"
-track.sort_artist = "artist for sorting"
-track.sort_album = "album for sorting"
-track.sort_albumartist = "albumartist for sorting"
-track.sort_composer = "composer for sorting"
-track.sort_tvshow = "tvshow for sorting"
+pygpod info                            # device and database summary
+pygpod track list                      # list tracks (track info <id>: every field)
+pygpod track add ~/Music/album/*.mp3   # add files (tags read; --title, --artist ... override)
+pygpod track remove <id>               # remove a track
+pygpod track export <id> dest/         # copy a track's file off the iPod
+pygpod playlist create "У дорогу"      # playlist list / add / remove / delete
+pygpod playlist add "У дорогу" 1 2 3
+pygpod doctor                          # read-only check (exit 1 = issues found)
+pygpod doctor --fix                    # repair; --delete-orphans also deletes unreferenced files
+pygpod backup ipod.tar.gz              # --no-media: database, artwork and photos only
+pygpod restore ipod.tar.gz --dry-run   # verify and plan; without --dry-run: restore
+pygpod init --model classic_6g         # create the folder structure and an empty database
+pygpod discover                        # find connected iPods
+pygpod dump                            # raw iTunesDB record tree
+pygpod fix-checksums                   # re-sign the database
+pygpod purge --yes                     # delete all music and the database
 ```
 
-#### Editable numeric properties
-
-```python
-track.rating = 80             # 0-100 (each star = 20)
-track.rating_stars = 4        # 0-5 (convenience setter)
-track.play_count = 10
-track.track_number = 3
-track.total_tracks = 12
-track.year = 2024
-track.cd_number = 1
-track.total_cds = 2
-track.bpm = 120
-track.volume = 50             # -255 to 255
-track.start_time = 5000       # ms (partial playback start)
-track.stop_time = 180000      # ms (partial playback end)
-track.season_number = 1
-track.episode_number = 5
-track.media_type = 0x0004     # auto-updates type1/type2/podcast flags
-track.compilation = True
-track.skip_when_shuffling = True
-track.remember_position = True
-track.mark_unplayed = True
-```
-
-#### Read-only properties (structural)
-
-```python
-track.track_id       # unique ID assigned on add
-track.dbid           # database ID
-track.ipod_path      # colon-separated iPod path
-track.filetype_marker # 4-byte file type code
-track.filetype_str   # "MPEG audio file" etc.
-track.file_size      # bytes
-track.bitrate        # kbps
-track.samplerate     # Hz
-track.duration       # seconds (float)
-track.duration_ms    # milliseconds (int)
-track.is_podcast     # bool (derived from media_type)
-track.is_audiobook   # bool
-track.is_video       # bool
-track.has_artwork    # bool
-track.time_added     # datetime
-track.time_modified  # datetime
-track.time_played    # datetime
-```
-
-### Playlist
-
-```python
-playlist.name = "New Name"  # editable
-playlist.tracks             # list of Track objects
-playlist.track_count        # number of tracks
-playlist.track_ids          # list of track IDs
-playlist.is_master          # True for the library playlist (read-only)
-playlist.is_podcast         # bool (read-only)
-playlist.is_smart           # bool (read-only)
-```
-
-### Device
-
-Detected automatically from the iPod mount point.
-
-```python
-device = pygpod.Device.from_mountpoint("/mnt/ipod")
-device.model            # "iPod Classic 6G (160GB)"
-device.generation       # IpodGeneration enum
-device.supports_artwork # bool
-device.supports_video   # bool
-device.requires_hash    # bool
-device.checksum_type    # ChecksumType enum
-device.firewire_guid    # GUID for hash computation
-```
-
-#### Storage info
-
-```python
-# Quick check (no filesystem scan)
-si = device.storage_info(full=False)
-print(f"Free: {si.free / 1e9:.1f} GB of {si.total / 1e9:.1f} GB")
-
-# Full breakdown (scans Music, Artwork, etc.)
-si = device.storage_info()  # full=True by default
-print(si)
-# Total:              74.4 GB
-# Used:               35.2 GB
-# Free:               39.2 GB
-#
-#   Music files:      28.5 GB
-#   Artwork (.ithmb): 1.9 GB
-#   ArtworkDB:        5.9 MB
-#   iTunesDB:         61.0 MB
-#   Other/System:     4.8 GB
-
-# Or scan later
-si = device.storage_info(full=False)
-si.scan(device.mountpoint)  # populate categories on demand
-```
-
-### DatabaseConfig
-
-Fine-grained control over binary output format.
-
-```python
-# Default config - libgpod-compatible with auto date_added
-config = pygpod.DatabaseConfig()
-
-# Custom config
-config = pygpod.DatabaseConfig(random_seed=42, track_id_start=1000)
-
-db = pygpod.Database("/mnt/ipod", config=config)
-```
-
-### Smart Playlists
-
-Build and evaluate smart playlist rules programmatically.
-
-```python
-from pygpod import SPLRule, SPLField, SPLAction, SPLMatch, evaluate_smart_playlist
-
-rule = SPLRule(
-    field=SPLField.GENRE,
-    action=SPLAction.CONTAINS,
-    string="Rock",
-)
-
-matches = evaluate_smart_playlist([rule], SPLMatch.AND, db.tracks)
-```
-
-### Artwork
-
-Requires `Pillow` (`pip install pygpod[artwork]`).
-
-```python
-artwork = pygpod.Artwork.from_image("/path/to/cover.jpg")
-```
-
-### Auto-discovery
-
-```python
-for mountpoint, device in pygpod.discover():
-    print(f"{device.model} at {mountpoint}")
-```
-
-## Optional Dependencies
-
-| Package | Extra | What it enables |
-|---------|-------|-----------------|
-| [mutagen](https://mutagen.readthedocs.io/) | `tags` | Read ID3/MP4/Vorbis tags when adding tracks |
-| [Pillow](https://pillow.readthedocs.io/) | `artwork` | Cover art thumbnail encoding/decoding |
-| [pyusb](https://pyusb.github.io/pyusb/) | `usb` | USB device detection for `discover` |
-
-Without these, pygpod still works - you just need to provide metadata manually and artwork features are unavailable.
+Every command and option: [docs/cli.md](docs/cli.md).
 
 ## Supported iPods
 
-pygpod supports iPods that mount as **USB mass storage** devices:
+pygpod works with iPods that mount as USB mass storage. iPod touch, iPhone and iPad are not
+supported (they do not expose the database as files).
 
-- **iPod 1G-4G** - original through 4th gen click-wheel
-- **iPod Photo** - color display model
-- **iPod Mini** - 1G and 2G
-- **iPod Shuffle** - 1G through 4G (uses iTunesSD)
-- **iPod Video** - 5G and 5.5G
-- **iPod Nano** - 1G through 5G
-- **iPod Classic** - 1G through 3G (6G-7G overall)
+| model | database | checksum | cover art / photos / video |
+|---|---|---|---|
+| iPod 1G-4G, mini 1G/2G | read, write | none | - / - / - |
+| iPod Photo (4G color) | read, write | none | yes / yes / - |
+| iPod Video 5G/5.5G | read, write | none (like libgpod and iTunes) | yes / yes (incl. TV-out) / yes |
+| nano 1G/2G | read, write | none (like libgpod and iTunes) | yes / yes / - |
+| nano 3G/4G | read, write | hash58 | yes / yes / yes |
+| Classic 6G/6.5G/7G | read, write | hash58 | yes / yes / yes |
+| shuffle 1G/2G, 3G/4G | read, write + iTunesSD v1 / v2 | none | - / - / - |
+| nano 5G | **not supported** (see below) | hash72 | |
+| nano 6G/7G | **not supported** | hashAB (nano 7G: unidentified model) | |
 
-Hash/checksum support:
+hash58 needs the iPod's FirewireGuid, which pygpod reads from `iPod_Control/Device/SysInfo` or,
+when that file lacks it, from USB (`usb` extra). The model comes from SysInfo/SysInfoExtended the
+same way; an iPod pygpod cannot identify is signed like the database already on it.
 
-| Checksum | Models |
-|----------|--------|
-| None | iPod 1G-4G, Photo, Mini, Shuffle 1G |
-| hash58 (HMAC-SHA1) | iPod Video, Nano 1-4, Classic 1-3 |
-| hash72 (AES-CBC) | Nano 5G |
+**Tested on real hardware:** iPod Classic 6G 80 GB and Classic 7G 160 GB (modded), on Linux. The
+other models are tested on emulated volumes against libgpod. macOS and Windows support (mount
+points, USB lookups) is implemented but little tested. Reports for other models are welcome at the
+[issue tracker](https://github.com/Bionded/pygpod/issues).
 
-### Tested Hardware
+## Known limitations
 
-So far, pygpod has been tested only on **iPod Classic 1st Gen (6G) 80GB** and **iPod Classic 3st Gen (7G) 160GB (Modded)** running on **Linux**. macOS and Windows support is implemented but not tested well. If you have other iPod models and can test, please report any issues at the [issue tracker](https://github.com/Bionded/pygpod/issues).
-
-## Known Issues
-
-- **OTG playlists don't respond to clicks** - On-The-Go playlists created on the iPod itself (`OTGPlaylistInfo`) can be parsed via `pygpod.read_otg_playlists(mountpoint)`, but they are not fully functional. The menu items appear but clicking them does nothing on the iPod.
-- **Photo management is not stable** - PhotoDB (ArtworkDB) writing works for basic cases but may produce incorrect results on some iPod models. Photos may not display correctly or at all. This feature is experimental.
-- **macOS/Windows USB detection is simplified** - When pyusb is unavailable, `discover` falls back to `system_profiler` (macOS) or WMI (Windows). These parsers are simplified and may miss some devices.
-- **Real serial number detection requires block device access** - The SCSI VPD page 0x80 method for reading the actual device serial (as opposed to the FireWire GUID exposed via USB descriptors) requires read access to the block device (e.g., `/dev/sdb`). You can either run `pygpod discover` as root, or add your user to the `disk` group for persistent access:
-  ```bash
-  sudo usermod -aG disk $USER
-  # Log out and back in for the change to take effect
-  ```
-  This method is tested and confirmed working on Linux. macOS (`ioreg`/`diskutil`) and Windows (`wmic`/PowerShell) implementations are provided but untested - they may not return the correct serial on all devices.
-- **Optional dependency warnings** - On import, pygpod warns about missing optional dependencies (mutagen, Pillow, pyusb).
+- **nano 5G**: the firmware reads its library from SQLite databases (`iTunesCDB`, `*.itdb`), which
+  pygpod does not write; `save()` warns. The hash72 signature itself is implemented and needs
+  `iPod_Control/Device/HashInfo` or a database signed by iTunes once.
+- **nano 6G/7G** need the hashAB signature (and SQLite databases), which pygpod does not write.
+  On a nano 6G `save()` raises `HashError`; pygpod has no model entry for the nano 7G, so it is
+  handled like any unidentified iPod (signed like the database on it, else `HashError`).
+- **Gapless estimate** (`gapless="estimate"`) is experimental; files with exact gapless data always
+  use it.
+- **On-The-Go**: by default a save imports the iPod's On-The-Go lists and deletes them from the
+  iPod, like iTunes (`DatabaseConfig(otg_on_save="keep")` keeps them; the Classic empties a kept
+  list anyway once the database changed).
+- **Several iPods connected**: when SysInfo lacks the model or FirewireGuid, pygpod asks USB only
+  for the iPod behind the mount point. If that mapping fails and several iPods are connected,
+  nothing is guessed: a signed iPod's `save()` raises `HashError` (create SysInfo, or connect one
+  iPod at a time). The macOS/Windows mapping is untested on real systems.
+- **Real serial number**: reading it over SCSI (VPD page 0x80) needs read access to the block
+  device (root, or the `disk` group on Linux). Tested on Linux only.
+- **`init_ipod(reset=True)`** deletes everything under `iPod_Control/iTunes`, including iTunes'
+  `IC-Info.sidb`; the SysInfo files are kept unless `keep_sysinfo=False`.
 
 ## Roadmap
 
-- [ ] Stabilize photo/artwork management
-- [ ] Expand hardware testing to more iPod models
-- [ ] Improve tag reading for edge cases
-- [ ] Fix OTG playlist support (make them clickable and functional on device)
-- [ ] Backup and restore - full database + media backup/restore to/from archive
-- [ ] Auto-encode media files to iPod-compatible formats (MP3, AAC, ALAC)
-- [ ] iTunesSD support improvements for Shuffle models
-- [ ] Config manager - persistent per-device settings (default playlist, sync rules)
-- [ ] Stable API with no breaking changes
-- [ ] Comprehensive documentation
-- [ ] Publish to PyPI
-- [ ] *Probably* add support of apps\games, but that may be a post-1.0 feature depending on demand and complexity.
+- Confirm more models on real hardware (iPod Video, nano 3G/4G, shuffles, iPod Photo).
+- iPod nano 5G-7G: the SQLite databases and the hashAB signature - see
+  [docs/research/hashab-hash72.md](docs/research/hashab-hash72.md).
+- *Maybe* games: only copying a user's own purchased games looks possible - see
+  [docs/research/ipod-games.md](docs/research/ipod-games.md).
 
 ## Development
 
 ```bash
 git clone https://github.com/Bionded/pygpod.git
 cd pygpod
+pip install -e ".[all]" pytest pytest-xdist ruff
 
-# Install in development mode
-pip install -e ".[all]"
-
-# Run tests
-python -m pytest tests/
-
-# Lint and format
-ruff check pygpod/ tests/
-ruff format pygpod/ tests/
+python -m pytest tests -n 3              # tests (-m "not slow" skips the benchmarks)
+PYGPOD_REQUIRE_LIBGPOD=1 python -m pytest tests -m libgpod   # libgpod interop: fail, not skip
+ruff check pygpod tests && ruff format --check pygpod tests
+python docs/gen_reference.py             # regenerate the API reference in docs/
 ```
 
-Contributing guide and bug report templates will be added in a future release.
+The libgpod interop tests (marker `libgpod`) build a small C tool against libgpod
+(`integration_tests/libgpod_tool.c`; needs gcc, pkg-config and libgpod-dev) and compare what
+both libraries write and read; they are skipped when libgpod is missing.
 
 ## Acknowledgments
 
-pygpod is a spiritual successor to [libgpod](https://sourceforge.net/projects/gtkpod/), originally written by Jörg Schuler and made into a standalone library by Christophe Fergeau. The iPod model database, hash algorithms, and binary format knowledge are all derived from libgpod's C implementation.
+pygpod is a spiritual successor to [libgpod](https://sourceforge.net/projects/gtkpod/), originally
+written by Jörg Schuler and made into a standalone library by Christophe Fergeau. The iPod model
+database, hash algorithms, and binary format knowledge are all derived from libgpod's C
+implementation.
 
 ## AI Disclosure
 
@@ -418,4 +252,3 @@ This project was developed with assistance from Claude (Anthropic) and ChatGPT (
 ## License
 
 pygpod is licensed under the [GNU Lesser General Public License v2.1 or later (LGPL-2.1-or-later)](https://www.gnu.org/licenses/lgpl-2.1.html).
-

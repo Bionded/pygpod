@@ -12,6 +12,19 @@ from .hash72 import compute_hash72
 logger = logging.getLogger(__name__)
 
 
+def detect_checksum_type(db_data: bytes) -> Optional[str]:
+    """The signature scheme an iTunesDB carries: "HASH72" (signature marker 0x01 at 0x72),
+    "HASH58" (non-zero hash58 area 0x58..0x6C) or None (unsigned or too short).
+    """
+    if len(db_data) < 0x72 + 46:
+        return None
+    if db_data[0x72] == 0x01:
+        return "HASH72"
+    if any(db_data[0x58:0x6C]):
+        return "HASH58"
+    return None
+
+
 def update_checksums(
     db_data: bytes,
     firewire_guid: Optional[str] = None,

@@ -16,6 +16,7 @@ from pygpod.utils.timezone import (
     _parse_tz_6g,
     _parse_zoneinfo_file,
     _validate_tz,
+    device_timezone_shift,
     get_local_tz_offset,
     mac_timestamp_with_tz,
     read_timezone_from_device,
@@ -28,37 +29,31 @@ from pygpod.utils.timezone import (
 
 
 class TestGetLocalTzOffset:
-    """Tests for get_local_tz_offset()."""
+    """Tests for get_local_tz_offset(): the host's current offset (tm_gmtoff), like libgpod."""
 
-    def test_non_dst(self):
-        """When DST is not active, returns -time.timezone."""
-        lt = time.struct_time((2025, 1, 15, 12, 0, 0, 2, 15, 0))
-        with mock.patch("pygpod.utils.timezone.time") as mock_time:
-            mock_time.daylight = 0
-            mock_time.timezone = -3600  # UTC+1
-            mock_time.localtime.return_value = lt
-            result = get_local_tz_offset()
-        assert result == 3600
+    def test_uses_tm_gmtoff(self):
+        lt = mock.Mock(tm_gmtoff=7200)
+        with mock.patch("pygpod.utils.timezone.time.localtime", return_value=lt):
+            assert get_local_tz_offset() == 7200
 
-    def test_dst_active(self):
-        """When DST is active and daylight flag is set, returns -time.altzone (line 32)."""
+    def test_matches_the_host(self):
+        assert get_local_tz_offset() == time.localtime().tm_gmtoff
+
+    def test_without_tm_gmtoff_dst_active(self):
         lt = time.struct_time((2025, 7, 15, 12, 0, 0, 1, 196, 1))
         with mock.patch("pygpod.utils.timezone.time") as mock_time:
             mock_time.daylight = 1
             mock_time.altzone = -7200  # UTC+2
             mock_time.localtime.return_value = lt
-            result = get_local_tz_offset()
-        assert result == 7200
+            assert get_local_tz_offset() == 7200
 
-    def test_daylight_flag_but_not_dst(self):
-        """Daylight flag set but localtime says DST is not active."""
+    def test_without_tm_gmtoff_no_dst(self):
         lt = time.struct_time((2025, 1, 15, 12, 0, 0, 2, 15, 0))
         with mock.patch("pygpod.utils.timezone.time") as mock_time:
             mock_time.daylight = 1
             mock_time.timezone = -3600
             mock_time.localtime.return_value = lt
-            result = get_local_tz_offset()
-        assert result == 3600
+            assert get_local_tz_offset() == 3600
 
 
 # ---------------------------------------------------------------------------
@@ -66,209 +61,102 @@ class TestGetLocalTzOffset:
 # ---------------------------------------------------------------------------
 
 
-class TestReadTimezoneFromPrefs:
-    """Tests for read_timezone_from_prefs() - lines 51-70."""
+def _prefs(size, offset, value):
+    data = bytearray(size)
+    struct.pack_into("<h", data, offset, value)
+    return bytes(data)
 
-    def test_file_not_found(self):
-        """Returns None when prefs file does not exist."""
-        with mock.patch("pygpod.utils.timezone.os.path.isfile", return_value=False):
-            assert read_timezone_from_prefs("/fake/Preferences") is None
+
+def _write(tmp_path, data):
+    path = tmp_path / "Preferences"
+    path.write_bytes(data)
+    return str(path)
+
+
+class TestReadTimezoneFromPrefs:
+    """Tests for read_timezone_from_prefs(): format by file size, as libgpod."""
+
+    def test_file_not_found(self, tmp_path):
+        assert read_timezone_from_prefs(str(tmp_path / "Preferences")) is None
 
     def test_file_read_error(self):
-        """Returns None on OSError when reading."""
         with mock.patch("pygpod.utils.timezone.os.path.isfile", return_value=True):
             with mock.patch("builtins.open", side_effect=OSError("disk error")):
                 assert read_timezone_from_prefs("/fake/Preferences") is None
 
-    def test_dispatch_4g(self):
-        """Dispatches to _parse_tz_4g for 2892-byte file."""
-        data = b"\x00" * 2892
-        with mock.patch("pygpod.utils.timezone.os.path.isfile", return_value=True):
-            with mock.patch("builtins.open", mock.mock_open(read_data=data)):
-                with mock.patch("pygpod.utils.timezone._parse_tz_4g", return_value=3600) as m:
-                    result = read_timezone_from_prefs("/fake/Preferences")
-                    m.assert_called_once_with(data)
-                    assert result == 3600
+    @pytest.mark.parametrize(
+        "size,offset,value,expected",
+        [
+            (2892, 0xB10, 0x19 + 4, 7200),  # iPod 4G: UTC+2
+            (2924, 0xB22, 660, 10800),  # iPod Video: 660 min - 8 h = UTC+3
+            (2952, 0xB70, 0xC2, 32400),  # Classic: Tokyo
+            (2960, 0xB70, 0xC2, 32400),  # nano 4G: Tokyo
+        ],
+    )
+    def test_formats(self, tmp_path, size, offset, value, expected):
+        assert read_timezone_from_prefs(_write(tmp_path, _prefs(size, offset, value))) == expected
 
-    def test_dispatch_5g(self):
-        """Dispatches to _parse_tz_5g for 2924-byte file."""
-        data = b"\x00" * 2924
-        with mock.patch("pygpod.utils.timezone.os.path.isfile", return_value=True):
-            with mock.patch("builtins.open", mock.mock_open(read_data=data)):
-                with mock.patch("pygpod.utils.timezone._parse_tz_5g", return_value=-18000) as m:
-                    result = read_timezone_from_prefs("/fake/Preferences")
-                    m.assert_called_once_with(data)
-                    assert result == -18000
+    @pytest.mark.parametrize("size", [1000, 2956, 2893])
+    def test_unknown_size(self, tmp_path, size):
+        assert read_timezone_from_prefs(_write(tmp_path, _prefs(size, 0, 0xC2))) is None
 
-    def test_dispatch_6g(self):
-        """Dispatches to _parse_tz_6g for 2952-byte file."""
-        data = b"\x00" * 2952
-        with mock.patch("pygpod.utils.timezone.os.path.isfile", return_value=True):
-            with mock.patch("builtins.open", mock.mock_open(read_data=data)):
-                with mock.patch("pygpod.utils.timezone._parse_tz_6g", return_value=7200) as m:
-                    result = read_timezone_from_prefs("/fake/Preferences")
-                    m.assert_called_once_with(data)
-                    assert result == 7200
-
-    def test_dispatch_6g_upper_bound(self):
-        """Dispatches to _parse_tz_6g for 2960-byte file (upper bound)."""
-        data = b"\x00" * 2960
-        with mock.patch("pygpod.utils.timezone.os.path.isfile", return_value=True):
-            with mock.patch("builtins.open", mock.mock_open(read_data=data)):
-                with mock.patch("pygpod.utils.timezone._parse_tz_6g", return_value=0) as m:
-                    result = read_timezone_from_prefs("/fake/Preferences")
-                    m.assert_called_once_with(data)
-                    assert result == 0
-
-    def test_unknown_size(self):
-        """Returns None for unrecognised file size."""
-        data = b"\x00" * 1000
-        with mock.patch("pygpod.utils.timezone.os.path.isfile", return_value=True):
-            with mock.patch("builtins.open", mock.mock_open(read_data=data)):
-                assert read_timezone_from_prefs("/fake/Preferences") is None
-
-
-# ---------------------------------------------------------------------------
-# _parse_tz_4g - lines 85-101
-# ---------------------------------------------------------------------------
+    def test_beyond_12_hours_is_ignored(self, tmp_path):
+        # iPod Video: 1300 min - 8 h = +13 h 40 min
+        assert read_timezone_from_prefs(_write(tmp_path, _prefs(2924, 0xB22, 1300))) is None
 
 
 class TestParseTz4g:
-    """Tests for _parse_tz_4g()."""
-
     def test_data_too_short(self):
-        """Returns None if data shorter than 0xB10 + 1."""
-        assert _parse_tz_4g(b"\x00" * 0xB10) is None
-
-    def test_raw_zero(self):
-        """Returns None if raw byte at 0xB10 is zero."""
-        data = bytearray(0xB11)
-        data[0xB10] = 0
-        assert _parse_tz_4g(bytes(data)) is None
+        assert _parse_tz_4g(b"\x00" * 0xB11) is None
 
     def test_utc(self):
-        """Raw = 0x19 means UTC (adjusted=0, hours=0, no DST)."""
-        data = bytearray(0xB11)
-        data[0xB10] = 0x19
-        assert _parse_tz_4g(bytes(data)) == 0
+        assert _parse_tz_4g(_prefs(2892, 0xB10, 0x19)) == 0
 
     def test_positive_offset_no_dst(self):
-        """UTC+5 without DST: adjusted = 0x0A, hours = 5, dst = 0."""
-        data = bytearray(0xB11)
-        # adjusted = raw - 0x19 = 0x0A => hours = 5, dst = 0
-        data[0xB10] = 0x19 + 0x0A
-        assert _parse_tz_4g(bytes(data)) == 5 * 3600
+        assert _parse_tz_4g(_prefs(2892, 0xB10, 0x19 + 10)) == 5 * 3600
 
     def test_positive_offset_with_dst(self):
-        """UTC+2 with DST: adjusted = 0x05, hours = 2, dst = 1."""
-        data = bytearray(0xB11)
-        # adjusted = 0x05 => hours = 2, dst = 1
-        data[0xB10] = 0x19 + 0x05
-        assert _parse_tz_4g(bytes(data)) == 2 * 3600 + 3600
+        assert _parse_tz_4g(_prefs(2892, 0xB10, 0x19 + 5)) == 3 * 3600
 
-    def test_offset_out_of_range(self):
-        """Returns None when calculated offset exceeds ±14 hours."""
-        data = bytearray(0xB11)
-        # Need adjusted >> 1 > 14 => adjusted >= 30 => 0x1E
-        # adjusted = 0x1E => hours = 15, offset = 54000 > 50400
-        data[0xB10] = 0x19 + 0x1E
-        assert _parse_tz_4g(bytes(data)) is None
+    def test_west_of_utc(self):
+        assert _parse_tz_4g(_prefs(2892, 0xB10, 0x19 - 10)) == -5 * 3600
 
-
-# ---------------------------------------------------------------------------
-# _parse_tz_5g - lines 115-127
-# ---------------------------------------------------------------------------
+    @pytest.mark.parametrize("raw", [-1, 49, 0x7FFF])
+    def test_invalid(self, raw):
+        assert _parse_tz_4g(_prefs(2892, 0xB10, raw)) is None
 
 
 class TestParseTz5g:
-    """Tests for _parse_tz_5g()."""
-
     def test_data_too_short(self):
-        """Returns None if data shorter than 0xB22 + 2."""
         assert _parse_tz_5g(b"\x00" * 0xB23) is None
 
-    def test_raw_zero(self):
-        """Returns None if the stored minutes value is zero."""
-        data = bytearray(0xB24)
-        struct.pack_into("<h", data, 0xB22, 0)
-        assert _parse_tz_5g(bytes(data)) is None
-
-    def test_tokyo(self):
-        """Tokyo itself: stored 540 minutes => offset 0 (UTC+9 - 9h = 0)."""
-        data = bytearray(0xB24)
-        struct.pack_into("<h", data, 0xB22, 540)
-        assert _parse_tz_5g(bytes(data)) == 0
-
-    def test_new_york(self):
-        """UTC-5 (EST): stored 540 + (-5*60 - 9*60) => 540 + (-14*60)... no.
-
-        Actually, offset_minutes = raw - 540. We want offset_minutes = -300 (UTC-5).
-        So raw = 540 + (-300) = 240.
-        offset_seconds = -300 * 60 = -18000.
-        """
-        data = bytearray(0xB24)
-        struct.pack_into("<h", data, 0xB22, 240)
-        assert _parse_tz_5g(bytes(data)) == -18000
-
-    def test_paris(self):
-        """UTC+1 (CET): offset_minutes = 60, raw = 540 + 60 = 600."""
-        data = bytearray(0xB24)
-        struct.pack_into("<h", data, 0xB22, 600)
-        assert _parse_tz_5g(bytes(data)) == 3600
-
-    def test_offset_out_of_range(self):
-        """Returns None when offset exceeds ±14 hours."""
-        data = bytearray(0xB24)
-        # raw = 540 + 900 = 1440 => offset_minutes = 900 => 54000s > 50400
-        struct.pack_into("<h", data, 0xB22, 1440)
-        assert _parse_tz_5g(bytes(data)) is None
-
-
-# ---------------------------------------------------------------------------
-# _parse_tz_6g - lines 141-155
-# ---------------------------------------------------------------------------
+    @pytest.mark.parametrize(
+        "raw,expected", [(480, 0), (660, 3 * 3600), (180, -5 * 3600), (0, -8 * 3600)]
+    )
+    def test_minutes_minus_8_hours(self, raw, expected):
+        assert _parse_tz_5g(_prefs(2924, 0xB22, raw)) == expected
 
 
 class TestParseTz6g:
-    """Tests for _parse_tz_6g()."""
-
     def test_data_too_short(self):
-        """Returns None if data shorter than 0xB70 + 2."""
         assert _parse_tz_6g(b"\x00" * 0xB71) is None
 
-    def test_city_idx_zero(self):
-        """Returns None when city index is 0 (not set)."""
-        data = bytearray(0xB72)
-        struct.pack_into("<H", data, 0xB70, 0)
-        assert _parse_tz_6g(bytes(data)) is None
-
-    def test_city_idx_ffff(self):
-        """Returns None when city index is 0xFFFF (sentinel)."""
-        data = bytearray(0xB72)
-        struct.pack_into("<H", data, 0xB70, 0xFFFF)
-        assert _parse_tz_6g(bytes(data)) is None
-
     def test_known_city(self):
-        """Returns offset for a known city index (Tokyo = 37)."""
-        data = bytearray(0xB72)
-        struct.pack_into("<H", data, 0xB70, 37)  # Tokyo
         with mock.patch("pygpod.utils.timezone._get_tz_offset", return_value=32400) as m:
-            result = _parse_tz_6g(bytes(data))
+            assert _parse_tz_6g(_prefs(2952, 0xB70, 0xC2)) == 32400
             m.assert_called_once_with("Asia/Tokyo")
-            assert result == 32400
 
     def test_known_city_offset_none(self):
-        """Returns None when _get_tz_offset fails for a known city."""
-        data = bytearray(0xB72)
-        struct.pack_into("<H", data, 0xB70, 37)
         with mock.patch("pygpod.utils.timezone._get_tz_offset", return_value=None):
-            assert _parse_tz_6g(bytes(data)) is None
+            assert _parse_tz_6g(_prefs(2952, 0xB70, 0xC2)) is None
 
-    def test_unknown_city_index(self):
-        """Returns None for a city index not in the lookup table."""
-        data = bytearray(0xB72)
-        struct.pack_into("<H", data, 0xB70, 999)  # not in _CITY_TIMEZONES
-        assert _parse_tz_6g(bytes(data)) is None
+    @pytest.mark.parametrize("raw", [0, 0x100, -1, 999])
+    def test_unknown_city_index(self, raw):
+        assert _parse_tz_6g(_prefs(2952, 0xB70, raw)) is None
+
+    def test_legacy_zone_names_resolve(self):
+        # libgpod's table names e.g. "PST8PDT", which newer tz databases may not ship
+        assert _get_tz_offset("PST8PDT") in (-8 * 3600, -7 * 3600)
 
 
 # ---------------------------------------------------------------------------
@@ -551,23 +439,32 @@ class TestValidateTz:
 
 
 class TestReadTimezoneFromDevice:
-    """Tests for read_timezone_from_device()."""
+    """Tests for read_timezone_from_device() and device_timezone_shift()."""
 
-    def test_constructs_prefs_path(self):
-        """Passes the correct prefs file path to read_timezone_from_prefs."""
-        with mock.patch("pygpod.utils.timezone.read_timezone_from_prefs", return_value=7200) as m:
-            result = read_timezone_from_device("/mnt/ipod")
-            import os
+    def _ipod(self, tmp_path, dirs=("iPod_Control", "Device"), name="Preferences"):
+        d = tmp_path.joinpath(*dirs)
+        d.mkdir(parents=True)
+        (d / name).write_bytes(_prefs(2952, 0xB70, 0xC2))
+        return str(tmp_path)
 
-            expected = os.path.join("/mnt/ipod", "iPod_Control", "Device", "Preferences")
-            m.assert_called_once_with(expected)
-            assert result == 7200
+    def test_reads_the_preferences(self, tmp_path):
+        with mock.patch("pygpod.utils.timezone._get_tz_offset", return_value=32400):
+            assert read_timezone_from_device(self._ipod(tmp_path)) == 32400
 
-    def test_returns_none_on_missing(self):
-        """Returns None when prefs file is missing."""
-        with mock.patch("pygpod.utils.timezone.read_timezone_from_prefs", return_value=None):
-            result = read_timezone_from_device("/mnt/ipod")
-            assert result is None
+    def test_case_insensitive(self, tmp_path):
+        mp = self._ipod(tmp_path, ("IPOD_CONTROL", "device"), "preferences")
+        with mock.patch("pygpod.utils.timezone._get_tz_offset", return_value=32400):
+            assert read_timezone_from_device(mp) == 32400
+
+    def test_returns_none_on_missing(self, tmp_path):
+        assert read_timezone_from_device(str(tmp_path)) is None
+
+    def test_shift_falls_back_to_the_host(self, tmp_path):
+        with mock.patch("pygpod.utils.timezone.get_local_tz_offset", return_value=-14400):
+            assert device_timezone_shift(str(tmp_path)) == -14400
+            assert device_timezone_shift(None) == -14400
+        with mock.patch("pygpod.utils.timezone._get_tz_offset", return_value=32400):
+            assert device_timezone_shift(self._ipod(tmp_path)) == 32400
 
 
 # ---------------------------------------------------------------------------
@@ -598,13 +495,14 @@ class TestMacTimestampWithTz:
 
 
 class TestCityTimezones:
-    """Sanity checks on the city timezone mapping."""
+    """Sanity checks on the city table (libgpod's)."""
 
     def test_has_expected_cities(self):
-        assert _CITY_TIMEZONES[1] == "Pacific/Midway"
-        assert _CITY_TIMEZONES[37] == "Asia/Tokyo"
-        assert _CITY_TIMEZONES[44] == "Pacific/Tongatapu"
+        assert _CITY_TIMEZONES[0xC2] == "Asia/Tokyo"
+        assert _CITY_TIMEZONES[0x4F] == "Europe/London"
+        assert _CITY_TIMEZONES[0x87] == "Asia/Qatar"
+        assert len(_CITY_TIMEZONES) == 204
 
-    def test_all_values_are_iana_format(self):
+    def test_every_zone_resolves(self):
         for idx, name in _CITY_TIMEZONES.items():
-            assert "/" in name, f"City {idx} has invalid tz name: {name}"
+            assert _get_tz_offset(name) is not None, f"city 0x{idx:02x}: {name}"

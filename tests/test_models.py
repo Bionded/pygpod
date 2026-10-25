@@ -109,8 +109,12 @@ class TestChecksumType:
             (IpodGeneration.CLASSIC_1, ChecksumType.HASH58),
             (IpodGeneration.CLASSIC_2, ChecksumType.HASH58),
             (IpodGeneration.CLASSIC_3, ChecksumType.HASH58),
-            (IpodGeneration.VIDEO_1, ChecksumType.HASH58),
-            (IpodGeneration.NANO_1, ChecksumType.HASH58),
+            (IpodGeneration.NANO_3, ChecksumType.HASH58),
+            # libgpod/iTunes leave the 5G/5.5G and nano 1G/2G databases unsigned
+            (IpodGeneration.VIDEO_1, ChecksumType.NONE),
+            (IpodGeneration.VIDEO_2, ChecksumType.NONE),
+            (IpodGeneration.NANO_1, ChecksumType.NONE),
+            (IpodGeneration.NANO_2, ChecksumType.NONE),
             (IpodGeneration.NANO_4, ChecksumType.HASH58),
             (IpodGeneration.NANO_5, ChecksumType.HASH72),
             (IpodGeneration.NANO_6, ChecksumType.HASHAB),
@@ -145,7 +149,8 @@ class TestChecksumType:
         assert ct == ChecksumType.HASH72
 
     def test_sysinfo_db_version_5(self):
-        assert get_checksum_type(IpodGeneration.FIRST, sysinfo_db_version=5) == ChecksumType.HASH72
+        # libgpod: DBVersion 5 = hashAB (nano 6G), not hash72
+        assert get_checksum_type(IpodGeneration.FIRST, sysinfo_db_version=5) == ChecksumType.HASHAB
 
 
 # =========================================================================

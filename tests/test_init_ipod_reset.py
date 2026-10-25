@@ -116,3 +116,72 @@ def test_existing_db_kept_without_reset(tmp_path):
 def test_bad_sysinfo_name_refused(tmp_path):
     with pytest.raises(ValueError):
         init_ipod(str(tmp_path), sysinfo_files={"../evil": b"x"}, dry_run=True)
+
+
+@pytest.mark.parametrize("model", ["xB029", "xC297", "xA978"])
+def test_init_signs_hash58_db(tmp_path, model):
+    """Like libgpod's itdb_init_ipod, the new iTunesDB of a hash58 device is signed."""
+    from pygpod.doctor import check
+    from pygpod.hash.hash58 import compute_hash58
+
+    mp = str(tmp_path)
+    guid = "000A270012345678"
+    init_ipod(
+        mp,
+        name="x",
+        sysinfo_files={"SysInfo": f"ModelNumStr: {model}\nFirewireGuid: 0x{guid}\n".encode()},
+    )
+    data = open(os.path.join(mp, "iPod_Control", "iTunes", "iTunesDB"), "rb").read()
+    assert data[0x58:0x6C] != b"\x00" * 20
+    assert compute_hash58(data, guid) == data
+    assert check(Database(mp)).kinds() == set()
+
+
+def test_init_without_guid_stays_unsigned(tmp_path):
+    mp = str(tmp_path)
+    init_ipod(mp, name="x", sysinfo_files={"SysInfo": b"ModelNumStr: xB029\n"})
+    data = open(os.path.join(mp, "iPod_Control", "iTunes", "iTunesDB"), "rb").read()
+    assert data[0x58:0x6C] == b"\x00" * 20
+    assert Database(mp).master_playlist.name == "x"
+
+
+def test_init_unsigned_device_and_dry_run(tmp_path):
+    mp = str(tmp_path / "a")
+    os.makedirs(mp)
+    init_ipod(
+        mp, sysinfo_files={"SysInfo": b"ModelNumStr: xA003\nFirewireGuid: 0x000A270012345678\n"}
+    )
+    data = open(os.path.join(mp, "iPod_Control", "iTunes", "iTunesDB"), "rb").read()
+    assert data[0x58:0x6C] == b"\x00" * 20  # 5G: no hash
+    dry = str(tmp_path / "b")
+    os.makedirs(dry)
+    init_ipod(dry, sysinfo_files={"SysInfo": SYSINFO}, dry_run=True)
+    assert os.listdir(dry) == []
+
+
+def test_init_signs_hash72_with_hashinfo(tmp_path):
+    """Nano 5G: signed with the device's HashInfo; without HashInfo it stays unsigned."""
+    import shutil
+
+    from pygpod.hash.hash72 import compute_hash72
+
+    from .conftest import PROJECT_ROOT
+
+    guid = "000A270012345678"
+    ext = os.path.join(PROJECT_ROOT, "tests", "data", "hash72_libgpod", "SysInfoExtended")
+    sysinfo = f"ModelNumStr: xC027\nFirewireGuid: 0x{guid}\n".encode()
+    for with_info in (True, False):
+        mp = tmp_path / str(with_info)
+        dev = mp / "iPod_Control" / "Device"
+        dev.mkdir(parents=True)
+        shutil.copy(ext, dev / "SysInfoExtended")
+        iv, rnd = os.urandom(16), os.urandom(12)
+        if with_info:
+            uuid = bytes.fromhex(guid).ljust(20, b"\x00")
+            (dev / "HashInfo").write_bytes(b"HASHv0" + uuid + rnd + iv)
+        init_ipod(str(mp), name="Nano", sysinfo_files={"SysInfo": sysinfo})
+        data = (mp / "iPod_Control" / "iTunes" / "iTunesDB").read_bytes()
+        if with_info:
+            assert data[0x72] == 0x01 and compute_hash72(data, iv=iv, random_bytes=rnd) == data
+        else:
+            assert data[0x72 : 0x72 + 46] == b"\x00" * 46

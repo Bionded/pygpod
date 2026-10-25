@@ -23,6 +23,7 @@ from .constants import (
     MHSD_MAGIC,
     MHYP_MAGIC,
     STRING_MHOD_TYPES,
+    URL_MHOD_TYPES,
 )
 from .parser import Record
 
@@ -133,11 +134,23 @@ def _write_mhod(rec: Record) -> bytes:
     """
     mhod_type = rec.fields.get("mhod_type", 0)
 
+    if rec.fields.get("url_format") and "string" in rec.fields:
+        return _write_url_mhod(rec)
     if mhod_type in STRING_MHOD_TYPES and "string" in rec.fields:
         return _write_string_mhod(rec)
     else:
         # For non-string MHODs or unmodified ones, use raw bytes
         return rec.raw_bytes
+
+
+def _write_url_mhod(rec: Record) -> bytes:
+    """Write a podcast URL MHOD (15/16): UTF-8 bytes right after the header, like libgpod."""
+    body = rec.fields.get("string_raw")
+    if body is None:
+        body = rec.fields["string"].encode("utf-8")
+    header = bytearray(rec.raw_header)
+    put32lint(header, 8, len(header) + len(body))
+    return bytes(header) + body
 
 
 def _write_string_mhod(rec: Record) -> bytes:
@@ -199,6 +212,41 @@ def _write_mhyp(rec: Record) -> bytes:
 # ============================================================================
 
 
+def make_raw_mhod(mhod_type: int, body: bytes, header_len: int = 24) -> Record:
+    """Create an MHOD record with an arbitrary (non-string) body, e.g. chapter data.
+
+    Args:
+        mhod_type: MHOD type identifier.
+        body: Body bytes after the header.
+        header_len: Header length (default 24).
+
+    Returns:
+        New Record object.
+    """
+    total_len = header_len + len(body)
+    header = bytearray(header_len)
+    header[0:4] = MHOD_MAGIC
+    put32lint(header, 4, header_len)
+    put32lint(header, 8, total_len)
+    put32lint(header, 0x0C, mhod_type)
+    rec = Record(MHOD_MAGIC, header_len, total_len)
+    rec.raw_header = bytes(header)
+    rec.raw_bytes = bytes(header) + body
+    rec.fields["mhod_type"] = mhod_type
+    rec.fields["raw_body"] = bytes(body)
+    return rec
+
+
+def _make_url_mhod(mhod_type: int, text: str, header_len: int) -> Record:
+    body = text.encode("utf-8")
+    rec = make_raw_mhod(mhod_type, body, header_len)
+    del rec.fields["raw_body"]
+    rec.fields["url_format"] = True
+    rec.fields["string"] = text
+    rec.fields["string_raw"] = body
+    return rec
+
+
 def make_string_mhod(mhod_type: int, text: str, encoding: int = 0, header_len: int = 24) -> Record:
     """Create a new string MHOD record.
 
@@ -211,6 +259,8 @@ def make_string_mhod(mhod_type: int, text: str, encoding: int = 0, header_len: i
     Returns:
         New Record object.
     """
+    if mhod_type in URL_MHOD_TYPES:
+        return _make_url_mhod(mhod_type, text, header_len)
     str_bytes = encode_mhod_string(text, encoding)
     body_len = 16 + len(str_bytes)
     total_len = header_len + body_len

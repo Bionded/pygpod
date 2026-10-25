@@ -241,6 +241,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             "    pygpod fix-checksums                         Recalculate DB checksums\n"
             "    pygpod dump                                  Dump raw DB structure\n"
             "    pygpod purge --yes                           Wipe all data from iPod\n"
+            "    pygpod doctor                                Check the database (read-only)\n"
+            "    pygpod doctor --fix                          Repair what can be repaired\n"
+            "    pygpod backup ipod.tar.gz                    Back up database + media\n"
+            "    pygpod restore ipod.tar.gz --dry-run         Check a backup, plan a restore\n"
             "    pygpod discover                              Auto-detect connected iPods"
         ),
     )
@@ -271,6 +275,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_tr_add = track_subs.add_parser("add", help="Add track(s) to iPod")
     p_tr_add.add_argument("files", nargs="+", help="Audio/video files to add")
     _add_tag_options(p_tr_add)
+    p_tr_add.add_argument(
+        "--soundcheck",
+        choices=["auto", "analyze"],
+        help="Sound Check by ffmpeg loudness analysis: 'auto' only for files without "
+        "ReplayGain/iTunNORM tags, 'analyze' for every file (default: tags only)",
+    )
 
     p_tr_rm = track_subs.add_parser("remove", aliases=["rm"], help="Remove track by ID")
     p_tr_rm.add_argument("track_id", type=int, help="Track ID to remove")
@@ -325,7 +335,42 @@ def main(argv: Optional[List[str]] = None) -> int:
     # === discover ===
     subs.add_parser("discover", help="Auto-detect connected iPods")
 
+    # === doctor ===
+    p_doctor = subs.add_parser(
+        "doctor", help="Check the database and media for inconsistencies (read-only)"
+    )
+    mode = p_doctor.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--no-verbose", action="store_true", help="Only a one-line summary (analysis only)"
+    )
+    mode.add_argument("--fix", action="store_true", help="Repair and list the actions taken")
+    p_doctor.add_argument(
+        "--delete-orphans",
+        action="store_true",
+        help="With --fix: also delete media files no track references",
+    )
+
+    # === backup / restore ===
+    p_backup = subs.add_parser("backup", help="Back up the iPod to a tar archive")
+    p_backup.add_argument("archive", help="Archive path (.tar, .tar.gz, .tar.bz2, .tar.xz)")
+    p_backup.add_argument(
+        "--no-media", action="store_true", help="Database and artwork only, no music files"
+    )
+    p_restore = subs.add_parser("restore", help="Restore a backup archive onto the iPod")
+    p_restore.add_argument("archive", help="Archive written by 'pygpod backup'")
+    p_restore.add_argument("--no-media", action="store_true", help="Restore the database only")
+    p_restore.add_argument(
+        "--dry-run", action="store_true", help="Verify the archive and show the plan only"
+    )
+    p_restore.add_argument(
+        "--force",
+        action="store_true",
+        help="Restore a backup of another iPod (keeps this iPod's SysInfo, re-signs the DB)",
+    )
+
     args = parser.parse_args(argv)
+    if args.command == "doctor" and args.delete_orphans and not args.fix:
+        p_doctor.error("--delete-orphans needs --fix")
 
     if args.debug:
         logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s: %(message)s")
@@ -366,6 +411,12 @@ def _dispatch(args: argparse.Namespace) -> int:
         return _cmd_purge(args)
     elif cmd == "discover":
         return _cmd_discover(args)
+    elif cmd == "doctor":
+        return _cmd_doctor(args)
+    elif cmd == "backup":
+        return _cmd_backup(args)
+    elif cmd == "restore":
+        return _cmd_restore(args)
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)
         return 1
@@ -529,6 +580,8 @@ def _cmd_track_add(args: argparse.Namespace) -> int:
     mp = _get_mountpoint(args)
     db = Database(mp)
     overrides = _collect_tag_overrides(args)
+    if getattr(args, "soundcheck", None):
+        overrides["soundcheck"] = args.soundcheck
     for filepath in args.files:
         playlists_before = set(p.name for p in db.playlists)
         track = db.add_track(filepath, **overrides)
@@ -851,6 +904,71 @@ def _cmd_init(args: argparse.Namespace) -> int:
     except Exception:
         pass
 
+    return 0
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    from .model.database import Database
+
+    mp = _get_mountpoint(args)
+    db = Database(mp, apply_play_counts=False, recover=False)  # writes nothing
+    report = db.check()
+    if args.no_verbose:
+        print(report.summary())
+        return 1 if report else 0
+    for issue in report:
+        fix = "fixable" if issue.fixable else "not fixable"
+        print(f"{issue.severity:7} {issue.kind:24} {issue.subject}: {issue.message} ({fix})")
+    if not args.fix:
+        print(report.summary())
+        return 1 if report else 0
+    if not report:
+        print(report.summary())
+        return 0
+    print()
+    actions = db.repair(report, delete_orphans=args.delete_orphans)
+    if "interrupted_commit" in report.kinds():  # completed: repair the database as it is now
+        db = Database(mp, apply_play_counts=False)
+        actions += db.repair(delete_orphans=args.delete_orphans)
+    for a in actions:
+        print(f"{'done' if a.done else 'skipped':7} {a.kind:24} {a.subject}: {a.action}")
+    after = Database(mp, apply_play_counts=False).check()
+    print(f"After repair: {after.summary()}")
+    return 1 if after else 0
+
+
+def _cmd_backup(args: argparse.Namespace) -> int:
+    from .backup_archive import backup
+    from .device.device import _fmt_size
+
+    mp = _get_mountpoint(args)
+    info = backup(mp, args.archive, include_media=not args.no_media)
+    what = "database only" if args.no_media else "database + media"
+    print(f"Backup written: {args.archive}")
+    print(f"  {len(info.files)} files, {_fmt_size(info.total_size)} ({what})")
+    if info.firewire_guid:
+        print(f"  FirewireGuid: {info.firewire_guid}")
+    return 0
+
+
+def _cmd_restore(args: argparse.Namespace) -> int:
+    from .backup_archive import restore
+    from .device.device import _fmt_size
+
+    mp = _get_mountpoint(args)
+    result = restore(
+        args.archive, mp, include_media=not args.no_media, dry_run=args.dry_run, force=args.force
+    )
+    info = result.info
+    print(f"Archive OK: {args.archive} (pygpod {info.pygpod_version}, {info.created})")
+    written = set(result.written)
+    size = sum(f.size for f in info.files if f.path in written)
+    verb = "Would restore" if result.dry_run else "Restored"
+    print(f"{verb} {len(result.written)} files ({_fmt_size(size)}) to {mp}")
+    if result.skipped:
+        print(f"  Skipped: {len(result.skipped)} files")
+    if result.resigned:
+        print("  Database re-signed for this iPod")
     return 0
 
 

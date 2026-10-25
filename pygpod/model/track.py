@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import datetime
 import logging
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from ..db.constants import (
     MEDIATYPE_AUDIO,
@@ -18,6 +18,7 @@ from ..db.constants import (
     MHOD_ID_ALBUMARTIST,
     MHOD_ID_ARTIST,
     MHOD_ID_CATEGORY,
+    MHOD_ID_CHAPTERDATA,
     MHOD_ID_COMMENT,
     MHOD_ID_COMPOSER,
     MHOD_ID_DESCRIPTION,
@@ -43,6 +44,9 @@ from ..db.constants import (
 )
 from ..db.parser import Record
 from ..utils.datetime import datetime_to_mac, mac_to_datetime
+
+if TYPE_CHECKING:
+    from .chapterdata import ChapterData
 
 logger = logging.getLogger(__name__)
 
@@ -556,22 +560,27 @@ class Track:
 
     @property
     def track_id(self) -> int:
+        """Track id within this database (MHIP references use it)."""
         return self._get_field("track_id")
 
     @property
     def dbid(self) -> int:
+        """64-bit database id (stable across saves; ArtworkDB links use it)."""
         return self._get_field("dbid")
 
     @property
     def dbid2(self) -> int:
+        """Second copy of the database id (MHIT 0xA8)."""
         return self._get_field("dbid2", 0)
 
     @property
     def visible(self) -> int:
+        """1 if the track is shown on the iPod."""
         return self._get_field("visible", 1)
 
     @property
     def filetype_marker(self) -> bytes:
+        """File extension as the iPod stores it (e.g. b" 3PM" for .mp3, reversed)."""
         return self._get_field("filetype_marker", b"\x00\x00\x00\x00")
 
     @property
@@ -585,10 +594,12 @@ class Track:
 
     @property
     def type1(self) -> int:
+        """MHIT 0x1C (libgpod: CBR MP3 and AAC 0, VBR MP3 1); pygpod: 1 for audiobooks."""
         return self._get_field("type1")
 
     @property
     def type2(self) -> int:
+        """MHIT 0x1D (libgpod: MP3 1, AAC 0); pygpod: 1 for video media types."""
         return self._get_field("type2")
 
     @property
@@ -623,11 +634,22 @@ class Track:
 
     @property
     def soundcheck(self) -> int:
-        """Soundcheck value (for volume normalization)."""
+        """Sound Check value (volume normalisation): 1000 * 10^(-gain_dB / 10); 0 = none.
+
+        See pygpod.tags.soundcheck_from_gain() / read_soundcheck().
+        """
         return self._get_field("soundcheck", 0)
+
+    @soundcheck.setter
+    def soundcheck(self, value: int) -> None:
+        value = int(value)
+        if not 0 <= value <= 0xFFFFFFFF:
+            raise ValueError(f"soundcheck must fit in 32 bits: {value}")
+        self._set_field_and_header_u32("soundcheck", 0x4C, value)
 
     @property
     def play_count2(self) -> int:
+        """Second copy of the play count (MHIT 0x54; libgpod sets it to play_count on sync)."""
         return self._get_field("play_count2", 0)
 
     @property
@@ -640,14 +662,17 @@ class Track:
 
     @property
     def app_rating(self) -> int:
+        """Last rating set by an application; the original when the iPod's rating differs."""
         return self._get_field("app_rating", 0)
 
     @property
     def checked(self) -> bool:
+        """True if the track is checked (iTunes checkbox); stored inverted in MHIT."""
         return not bool(self._get_field("checked", 0))
 
     @property
     def drm_userid(self) -> int:
+        """Apple Store / Audible user id of DRM files, 0 otherwise."""
         return self._get_field("drm_userid", 0)
 
     @property
@@ -663,10 +688,12 @@ class Track:
 
     @property
     def artwork_count(self) -> int:
+        """Number of artwork items (MHIT 0x7C)."""
         return self._get_field("artwork_count", 0)
 
     @property
     def artwork_size(self) -> int:
+        """Size of the original cover image in bytes (MHIT 0x80)."""
         return self._get_field("artwork_size", 0)
 
     @property
@@ -675,12 +702,14 @@ class Track:
 
     @property
     def mhii_link(self) -> int:
+        """ArtworkDB image id (mhii) of the track's cover art, 0 without artwork."""
         return self._get_field("mhii_link", 0)
 
     # ---- Flags (read-only) ----
 
     @property
     def lyrics_flag(self) -> bool:
+        """The track has lyrics."""
         return bool(self._get_field("lyrics_flag", 0))
 
     @property
@@ -692,58 +721,169 @@ class Track:
         """0=none, 1=explicit, 2=clean."""
         return self._get_field("explicit_flag", 0)
 
+    @explicit_flag.setter
+    def explicit_flag(self, value: int) -> None:
+        """Content advisory: 0=none, 1=explicit, 2=clean."""
+        self._set_field_and_header_u16("explicit_flag", 0x92, int(value))
+
     # ---- Gapless (read-only) ----
+
+    # Gapless playback (see pygpod.gapless): settable, written with the next save()
+
+    def _set_gapless(self, key: str, value: int) -> None:
+        from ..gapless import GAPLESS_FIELDS
+
+        offset, size = GAPLESS_FIELDS[key]
+        value = int(value)
+        if not 0 <= value < 1 << (8 * size):
+            raise ValueError(f"{key} must fit in {8 * size} bits: {value}")
+        if not self._record:
+            return
+        self._record.fields[key] = value
+        header = bytearray(self._record.raw_header)
+        if len(header) >= offset + size:
+            header[offset : offset + size] = value.to_bytes(size, "little")
+            self._record.raw_header = bytes(header)
+            self._touch()
 
     @property
     def pregap(self) -> int:
+        """Samples of encoder delay before the music starts."""
         return self._get_field("pregap", 0)
+
+    @pregap.setter
+    def pregap(self, value: int) -> None:
+        self._set_gapless("pregap", value)
 
     @property
     def postgap(self) -> int:
+        """Samples of padding after the music ends."""
         return self._get_field("postgap", 0)
+
+    @postgap.setter
+    def postgap(self, value: int) -> None:
+        self._set_gapless("postgap", value)
 
     @property
     def sample_count(self) -> int:
+        """Samples of music (without pregap/postgap)."""
         return self._get_field("sample_count", 0)
+
+    @sample_count.setter
+    def sample_count(self, value: int) -> None:
+        self._set_gapless("sample_count", value)
 
     @property
     def gapless_data(self) -> int:
+        """MP3: bytes from the first (Xing) frame up to the last eight frames; AAC: 0."""
         return self._get_field("gapless_data", 0)
+
+    @gapless_data.setter
+    def gapless_data(self, value: int) -> None:
+        self._set_gapless("gapless_data", value)
 
     @property
     def gapless_track_flag(self) -> bool:
+        """The track has gapless playback data."""
         return bool(self._get_field("gapless_track_flag", 0))
+
+    @gapless_track_flag.setter
+    def gapless_track_flag(self, value: bool) -> None:
+        self._set_gapless("gapless_track_flag", 1 if value else 0)
 
     @property
     def gapless_album_flag(self) -> bool:
+        """Part of a gapless album (no crossfading)."""
         return bool(self._get_field("gapless_album_flag", 0))
 
-    # ---- Timestamps (read-only) ----
+    @gapless_album_flag.setter
+    def gapless_album_flag(self, value: bool) -> None:
+        self._set_gapless("gapless_album_flag", 1 if value else 0)
+
+    # ---- Chapters (MHOD 17) ----
+
+    @property
+    def chapters(self) -> Optional["ChapterData"]:
+        """Chapter markers (audiobooks, podcasts), or None if the track has none.
+
+        Returns a parsed copy: change it and assign it back to store the change.
+        """
+        if not self._record:
+            return None
+        from .chapterdata import parse_chapter_data_any
+
+        for child in self._record.children:
+            if child.magic == MHOD_MAGIC and child.fields.get("mhod_type") == MHOD_ID_CHAPTERDATA:
+                body = child.fields.get("raw_body")
+                if body is None:
+                    body = child.raw_bytes[child.header_len :]
+                return parse_chapter_data_any(body)
+        return None
+
+    @chapters.setter
+    def chapters(self, value: Any) -> None:
+        """Set the chapters: a ChapterData, a list of (start_ms, title) tuples or Chapter
+        objects, or None / [] to remove them. Written in libgpod's format (MHOD 17); a
+        first chapter at 0 ms is stored at 1 ms like libgpod does."""
+        if not self._record:
+            return
+        from .chapterdata import chapter_data_from, write_chapter_data_atom
+
+        self._record.children = [
+            c
+            for c in self._record.children
+            if not (c.magic == MHOD_MAGIC and c.fields.get("mhod_type") == MHOD_ID_CHAPTERDATA)
+        ]
+        cd = chapter_data_from(value)
+        if cd is not None and len(cd):
+            from ..db.writer import make_raw_mhod
+
+            self._record.children.append(
+                make_raw_mhod(MHOD_ID_CHAPTERDATA, write_chapter_data_atom(cd))
+            )
+        self._touch()
+
+    # ---- Timestamps ----
+    # The iPod stores its local wall time; _tz_shift (seconds east of UTC) is set by the
+    # Database (DatabaseConfig.timestamps). The datetimes returned are aware (UTC).
+    _tz_shift = 0
 
     @property
     def time_added(self) -> datetime.datetime:
-        return mac_to_datetime(self._get_field("time_added"))
+        """When the track was added (UTC; the iPod stores its local time)."""
+        return mac_to_datetime(self._get_field("time_added"), self._tz_shift)
 
     @property
     def time_modified(self) -> datetime.datetime:
-        return mac_to_datetime(self._get_field("time_modified"))
+        """When the track was last modified (UTC; the iPod stores its local time)."""
+        return mac_to_datetime(self._get_field("time_modified"), self._tz_shift)
 
     @property
     def time_played(self) -> datetime.datetime:
-        return mac_to_datetime(self._get_field("time_played"))
+        """When the track was last played (UTC; the iPod stores its local time)."""
+        return mac_to_datetime(self._get_field("time_played"), self._tz_shift)
 
     @time_played.setter
     def time_played(self, value: datetime.datetime) -> None:
         """Last played time (inverse of the getter: aware datetimes recommended)."""
-        self._set_field_and_header_u32("time_played", 0x58, datetime_to_mac(value))
+        self._set_field_and_header_u32("time_played", 0x58, datetime_to_mac(value, self._tz_shift))
 
     @property
     def time_released(self) -> datetime.datetime:
-        return mac_to_datetime(self._get_field("time_released", 0))
+        """Release date (podcasts)."""
+        return mac_to_datetime(self._get_field("time_released", 0), self._tz_shift)
+
+    @time_released.setter
+    def time_released(self, value: datetime.datetime) -> None:
+        """Release date (inverse of the getter: aware datetimes recommended)."""
+        self._set_field_and_header_u32(
+            "time_released", 0x8C, datetime_to_mac(value, self._tz_shift)
+        )
 
     @property
     def time_skipped(self) -> datetime.datetime:
-        return mac_to_datetime(self._get_field("time_skipped", 0))
+        """When the track was last skipped (UTC; the iPod stores its local time)."""
+        return mac_to_datetime(self._get_field("time_skipped", 0), self._tz_shift)
 
     # ---- Convenience ----
 

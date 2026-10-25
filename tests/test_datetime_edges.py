@@ -74,3 +74,26 @@ class TestNowMac:
         mac = now_mac()
         dt = mac_to_datetime(mac)
         assert dt.year >= 2024
+
+
+class TestDatetimeToMacRange:
+    def test_epoch_plus_one_is_the_minimum(self):
+        dt = datetime.datetime(1904, 1, 1, 0, 0, 1, tzinfo=datetime.timezone.utc)
+        assert datetime_to_mac(dt) == 1
+
+    def test_before_1904_is_clamped(self, caplog):
+        dt = datetime.datetime(1903, 12, 31, tzinfo=datetime.timezone.utc)
+        with caplog.at_level("WARNING", logger="pygpod.utils.datetime"):
+            assert datetime_to_mac(dt) == 1
+        assert "outside the iPod's timestamp range" in caplog.text
+
+    def test_tz_shift_pushing_below_1904_is_clamped(self):
+        dt = datetime.datetime(1904, 1, 1, 1, 0, tzinfo=datetime.timezone.utc)
+        assert datetime_to_mac(dt) == 3600
+        assert datetime_to_mac(dt, tz_shift=-4 * 3600) == 1
+
+    def test_after_2040_is_clamped(self):
+        last = datetime.datetime(2040, 2, 6, 6, 28, 15, tzinfo=datetime.timezone.utc)
+        assert datetime_to_mac(last) == 0xFFFFFFFF
+        assert datetime_to_mac(last + datetime.timedelta(seconds=1)) == 0xFFFFFFFF
+        assert datetime_to_mac(last, tz_shift=3600) == 0xFFFFFFFF
