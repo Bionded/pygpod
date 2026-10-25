@@ -231,19 +231,20 @@ def interrupted_commit(mountpoint: str) -> bool:
 
 
 def _child_dir(parent: str, name: str) -> Optional[str]:
-    """``parent/name`` if it is a directory, else a directory of ``parent`` whose name matches
-    case-insensitively (FAT keeps the case it was created with), else None."""
-    exact = os.path.join(parent, name)
-    if os.path.isdir(exact):
-        return exact
+    """The directory of ``parent`` named ``name``, matched case-insensitively (FAT keeps the case it
+    was created with), spelled as it is on disk, else None. The listing comes first: on a
+    case-insensitive file system ``parent/name`` exists in any spelling."""
     try:
         names = os.listdir(parent)
     except OSError:
         return None
+    if name in names and os.path.isdir(os.path.join(parent, name)):
+        return os.path.join(parent, name)
     for n in names:
         if n.lower() == name.lower() and os.path.isdir(os.path.join(parent, n)):
             return os.path.join(parent, n)
     return None
+
 
 
 def _staging_dirs(mountpoint: str) -> List[str]:
