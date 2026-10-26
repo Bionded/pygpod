@@ -222,22 +222,30 @@ class Device:
         return self.checksum_type is not ChecksumType.NONE
 
     def _sysinfo_db_version(self) -> Optional[int]:
-        """The SysInfoExtended ``DBVersion`` (or ``DatabaseVersion``) as int, if usable."""
+        """The SysInfoExtended ``DBVersion`` (or ``DatabaseVersion``) as int, if usable.
+
+        Only 0-5 name a checksum scheme; other values (an iPod Classic 6G has been seen
+        reporting 48) are ignored like a missing key.
+        """
         ext = self.sysinfo.extended
-        sysinfo_dbver = ext.get("DBVersion")
-        if sysinfo_dbver is None:
-            sysinfo_dbver = ext.get("DatabaseVersion")
-        try:
-            return None if sysinfo_dbver is None else int(sysinfo_dbver)
-        except (TypeError, ValueError):
-            return None
+        for key in ("DBVersion", "DatabaseVersion"):
+            value = ext.get(key)
+            if value is None:
+                continue
+            try:
+                version = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= version <= 5:
+                return version
+        return None
 
     @property
     def checksum_type(self) -> ChecksumType:
         """Determine the checksum type for this device.
 
-        Uses the SysInfoExtended ``DBVersion`` if available (the key real iPods and
-        libgpod use; ``DatabaseVersion`` is still accepted), falls back to the
+        Uses the SysInfoExtended ``DBVersion`` if available and 0-5 (the key real iPods
+        and libgpod use; ``DatabaseVersion`` is still accepted), falls back to the
         generation-based mapping from libgpod.
         """
         return get_checksum_type(self.generation, self._sysinfo_db_version())

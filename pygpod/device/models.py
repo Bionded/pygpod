@@ -535,26 +535,29 @@ def get_checksum_type(
     """Determine checksum type for an iPod generation.
 
     Priority:
-    1. SysInfoExtended db_version field (if available)
+    1. SysInfoExtended db_version field (if available and 0-5)
     2. Generation-based fallback mapping
+
+    Only the values 0-5 name a checksum scheme. Any other value (some iPod Classic 6G
+    firmwares report 48) is ignored and the generation decides; libgpod would refuse to
+    write such a database with an unknown checksum type instead.
 
     Args:
         gen: iPod generation.
-        sysinfo_db_version: db_version from SysInfoExtended (0-5), if available.
+        sysinfo_db_version: db_version from SysInfoExtended, if available.
 
     Returns:
         ChecksumType enum value.
     """
     # Priority: SysInfoExtended db_version
-    if sysinfo_db_version is not None:
+    if sysinfo_db_version is not None and 0 <= sysinfo_db_version <= 5:
         if sysinfo_db_version <= 2:
             return ChecksumType.NONE
         elif sysinfo_db_version == 3:
             return ChecksumType.HASH58
         elif sysinfo_db_version == 4:
             return ChecksumType.HASH72
-        else:  # 5 (nano 6G); libgpod knows no later scheme
-            return ChecksumType.HASHAB
+        return ChecksumType.HASHAB  # 5 (nano 6G); libgpod knows no later scheme
 
     # Fallback: generation-based mapping (from libgpod itdb_device.c)
     if gen in HASHAB_GENERATIONS:
