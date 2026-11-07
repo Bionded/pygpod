@@ -509,7 +509,7 @@ Raises:
 
 ### `pygpod.DatabaseConfig`
 
-`DatabaseConfig(string_encoding: 'int' = 1, mhod_order: 'Optional[Tuple[int, ...]]' = (1, 4, 3, 6, 2, 5), unk_0x7e: 'int' = 65535, unk_0x84: 'int' = 0, unk_0x90: 'int' = 12, mark_unplayed: 'int' = 1, unk_0x12c_from_filesize: 'bool' = True, unk_0x134_fill: 'int' = 128, unk_0x168: 'int' = 1, set_time_fields_zero: 'bool' = False, timestamps: 'str' = 'local', mhyp_unk_0x28: 'int' = 1, mhyp_sort_order: 'int' = 1, generate_album_list: 'bool' = True, generate_artist_list: 'bool' = True, chapter_format: 'str' = 'atom', spl_prefs_padded_size: 'int' = 72, master_playlist_name: 'str' = 'iPod', platform: 'int' = 1, language: 'int' = 25966, filename_prefix: 'str' = 'pygpod', filename_rand_len: 'int' = 6, filename_charset: 'str' = 'digits', track_id_start: 'int' = 52, random_seed: 'Optional[int]' = None, otg_on_save: 'str' = 'import') -> None`
+`DatabaseConfig(string_encoding: 'int' = 1, mhod_order: 'Optional[Tuple[int, ...]]' = (1, 4, 3, 6, 2, 5), unk_0x7e: 'int' = 65535, unk_0x84: 'int' = 0, unk_0x90: 'int' = 12, mark_unplayed: 'int' = 1, unk_0x12c_from_filesize: 'bool' = True, unk_0x134_fill: 'int' = 128, unk_0x168: 'int' = 1, set_time_fields_zero: 'bool' = False, timestamps: 'str' = 'local', mhyp_unk_0x28: 'int' = 1, mhyp_sort_order: 'int' = 1, generate_album_list: 'bool' = True, generate_artist_list: 'bool' = True, generate_empty_sections: 'bool' = True, chapter_format: 'str' = 'atom', spl_prefs_padded_size: 'int' = 72, master_playlist_name: 'str' = 'iPod', platform: 'int' = 1, language: 'int' = 25966, filename_prefix: 'str' = 'pygpod', filename_rand_len: 'int' = 6, filename_charset: 'str' = 'digits', track_id_start: 'int' = 52, random_seed: 'Optional[int]' = None, otg_on_save: 'str' = 'import') -> None`
 
 ```text
 Configuration for iPod database generation.
@@ -544,6 +544,7 @@ The other fields are header values of the binary format, set to what libgpod wri
 | `mhyp_sort_order` | `int` | `1` |
 | `generate_album_list` | `bool` | `True` |
 | `generate_artist_list` | `bool` | `True` |
+| `generate_empty_sections` | `bool` | `True` |
 | `chapter_format` | `str` | `'atom'` |
 | `spl_prefs_padded_size` | `int` | `72` |
 | `master_playlist_name` | `str` | `'iPod'` |

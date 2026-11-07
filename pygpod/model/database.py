@@ -2139,6 +2139,60 @@ class Database:
                 put32lint(header, 0x120, album_id)
                 mhit.raw_header = bytes(header)
 
+    def _fill_missing_sql_ids(self) -> None:
+        """Give album (MHIA) and artist (MHII) list items without a SQLite id a random one,
+        unique in its list, like libgpod. Items that have one keep it."""
+        for mhsd in self._root.children:
+            magic = {4: MHIA_MAGIC, 8: MHII_MAGIC}.get(mhsd.fields.get("mhsd_type"))
+            if magic is None:
+                continue
+            items = [
+                item
+                for lst in mhsd.children
+                for item in lst.children
+                if item.magic == magic and len(item.raw_header) >= 0x1C
+            ]
+            used = {get64lint(item.raw_header, 0x14) for item in items}
+            for item in items:
+                if get64lint(item.raw_header, 0x14):
+                    continue
+                sql_id = 0
+                while sql_id in used:
+                    sql_id = self._rng.getrandbits(64)
+                used.add(sql_id)
+                header = bytearray(item.raw_header)
+                put64lint(header, 0x14, sql_id)
+                item.raw_header = bytes(header)
+
+    # libgpod's order of the MHSD sections (itdb_write); type 9 (Genius) follows when present
+    _MHSD_ORDER = (1, 3, 2, 4, 8, 6, 10, 5)
+
+    def _ensure_empty_sections(self) -> None:
+        """Add the sections libgpod always writes when they are missing: empty MHSD types 6
+        and 10 (an empty MHLT each) and type 5 (an empty MHLP), each after the sections that
+        precede it in libgpod's order. Present sections are kept as they are."""
+        present = {m.fields.get("mhsd_type") for m in self._root.children}
+        for mhsd_type, list_magic, list_len in (
+            (6, MHLT_MAGIC, DEFAULT_MHLT_HEADER_LEN),
+            (10, MHLT_MAGIC, DEFAULT_MHLT_HEADER_LEN),
+            (5, MHLP_MAGIC, DEFAULT_MHLP_HEADER_LEN),
+        ):
+            if mhsd_type in present:
+                continue
+            mhsd = self._create_mhsd(mhsd_type)
+            body = self._make_basic_header(list_magic, list_len)  # 0 items
+            header = bytearray(mhsd.raw_header)
+            put32lint(header, 8, len(header) + len(body))
+            mhsd.raw_header = bytes(header)
+            mhsd.raw_bytes = bytes(header) + body
+            before = set(self._MHSD_ORDER[: self._MHSD_ORDER.index(mhsd_type)])
+            pos = 0
+            for i, m in enumerate(self._root.children):
+                if m.fields.get("mhsd_type") in before:
+                    pos = i + 1
+            self._root.children.insert(pos, mhsd)
+            present.add(mhsd_type)
+
     def _rebuild_artist_list(self) -> None:
         """Rebuild MHSD type 8 artist list from track metadata.
 
@@ -2214,6 +2268,9 @@ class Database:
             self._rebuild_album_list()
         if self._config.generate_artist_list:
             self._rebuild_artist_list()
+        self._fill_missing_sql_ids()
+        if self._config.generate_empty_sections:
+            self._ensure_empty_sections()
         self._remember_derived_inputs()
 
         # Update db_version to match device requirements

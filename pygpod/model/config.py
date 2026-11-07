@@ -66,6 +66,9 @@ class DatabaseConfig:
     # -- Album / artist list generation --
     generate_album_list: bool = True  # MHSD type 4
     generate_artist_list: bool = True  # MHSD type 8
+    # Empty MHSD types 6 and 10 and an empty type 5 (the special smart playlists), like
+    # libgpod: the iPod ignores them, iTunes and Finder expect them. Existing ones are kept.
+    generate_empty_sections: bool = True
 
     # -- Chapter data format --
     # "atom" = libgpod's QuickTime atom-box format (sean/chap/name)

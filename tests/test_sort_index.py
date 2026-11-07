@@ -169,7 +169,7 @@ def test_album_and_artist_items_like_libgpod(ipod_volume):
     for magic in (b"mhia", b"mhii"):
         pos = data.find(magic)
         assert pos > 0
-        assert struct.unpack_from("<Q", data, pos + 0x14)[0] == 0  # new: no SQLite id
+        assert struct.unpack_from("<Q", data, pos + 0x14)[0] != 0  # random SQLite id, as libgpod
         assert struct.unpack_from("<I", data, pos + 0x1C)[0] == 2
 
 
